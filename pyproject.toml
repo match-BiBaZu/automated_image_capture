@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "automated-image-capture"
+version = "0.1.0"
+description = "PyQt6 hardware dashboard for automated YOLO image acquisition"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { file = "LICENSE" }
+dependencies = [
+    "PyQt6>=6.8,<7",
+    "bleak>=1.0,<2",
+    "genicam>=1.5.1,<2",
+    "harvesters>=1.4.3,<2",
+    "neewerlite==0.3.3",
+    "numpy>=2.0,<3",
+    "opencv-python-headless>=4.10,<5",
+    "qasync>=0.27,<1",
+    "ur-rtde==1.6.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=0.24,<2",
+    "pytest-qt>=4.4,<5",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+yolo-capture-dashboard = "automated_image_capture.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/automated_image_capture"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "hardware: requires the physical camera, robot, or BLE light",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
