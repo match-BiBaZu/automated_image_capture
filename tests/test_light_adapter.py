@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from automated_image_capture.hardware.light import LightAdapter
-from automated_image_capture.models import ConnectionState, LightStatus
+from automated_image_capture.models import ConnectionState, DiscoveredLight, LightStatus
 from automated_image_capture.settings import AppSettings
 
 
@@ -98,3 +98,33 @@ async def test_light_hsi_values_are_clamped(qtbot, monkeypatch) -> None:
     assert light.commands == [("hsi", 360, 0, 100)]
     await adapter.shutdown()
 
+
+def test_second_light_selection_excludes_first_address() -> None:
+    config = AppSettings(light_address="AA:01", light_2_address="AA:02")
+    second = LightAdapter(
+        config,
+        display_name="Neewer-Licht 2",
+        address_attribute="light_2_address",
+        excluded_addresses=lambda: {config.light_address},
+    )
+    devices = [
+        DiscoveredLight("NEEWER-RGB660 PRO", "AA:01", -30),
+        DiscoveredLight("NEEWER-RGB660 PRO", "AA:02", -60),
+    ]
+
+    assert second._select(devices).address == "AA:02"
+
+
+def test_unconfigured_second_light_does_not_select_first_address() -> None:
+    config = AppSettings(light_address="AA:01")
+    second = LightAdapter(
+        config,
+        address_attribute="light_2_address",
+        excluded_addresses=lambda: {config.light_address},
+    )
+    devices = [
+        DiscoveredLight("NEEWER-RGB660 PRO", "AA:01", -20),
+        DiscoveredLight("NEEWER-RGB660 PRO", "AA:02", -50),
+    ]
+
+    assert second._select(devices).address == "AA:02"

@@ -45,9 +45,19 @@ def _looks_like_neewer(light: DiscoveredLight) -> bool:
 class LightAdapter(DeviceAdapter):
     devices_discovered = pyqtSignal(object)
 
-    def __init__(self, config: AppSettings, parent: QObject | None = None) -> None:
-        super().__init__("Neewer-Licht", parent)
+    def __init__(
+        self,
+        config: AppSettings,
+        parent: QObject | None = None,
+        *,
+        display_name: str = "Neewer-Licht",
+        address_attribute: str = "light_address",
+        excluded_addresses: Callable[[], set[str]] | None = None,
+    ) -> None:
+        super().__init__(display_name, parent)
         self.config = config
+        self.address_attribute = address_attribute
+        self._excluded_addresses = excluded_addresses or set
         self._light: Any = None
         self._status = LightStatus()
         self._desired_connection = False
@@ -88,11 +98,17 @@ class LightAdapter(DeviceAdapter):
         return [_as_discovered(device) for device in raw_devices]
 
     def _select(self, devices: list[DiscoveredLight]) -> DiscoveredLight:
-        if self.config.light_address:
+        preferred_address = str(getattr(self.config, self.address_attribute, ""))
+        if preferred_address:
             for device in devices:
-                if device.address.casefold() == self.config.light_address.casefold():
+                if device.address.casefold() == preferred_address.casefold():
                     return device
-        supported = [device for device in devices if _looks_like_neewer(device)]
+        excluded = {address.casefold() for address in self._excluded_addresses() if address}
+        supported = [
+            device
+            for device in devices
+            if _looks_like_neewer(device) and device.address.casefold() not in excluded
+        ]
         if not supported:
             raise RuntimeError(
                 "Kein RGB660/NEEWER-BLE-Gerät gefunden. Panel einschalten, Bluetooth-Symbol "
@@ -121,7 +137,12 @@ class LightAdapter(DeviceAdapter):
         self._set_state(ConnectionState.CONNECTING)
         self._emit_event(f"Verbinde {selected.name} ({selected.address}) …")
         profile_name = "RGB660" if "660" in selected.name.upper() else selected.name
-        light = NeewerLight(selected.address, name=profile_name)
+        # Passing only the address loses WinRT advertisement metadata. In particular,
+        # Windows may then be unable to resolve a BLE device with a random address even
+        # though it was discovered seconds earlier. Bleak accepts the discovered
+        # BLEDevice and can use its backend-specific details for the connection.
+        connection_target = selected.raw if selected.raw is not None else selected.address
+        light = NeewerLight(connection_target, name=profile_name)
         await light.connect()
         self._light = light
         self._status.name = selected.name

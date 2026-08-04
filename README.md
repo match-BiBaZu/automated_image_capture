@@ -5,10 +5,10 @@ YOLO-Trainingsbildern. Die Anwendung verbindet:
 
 - eine Baumer GigE-Vision-Kamera über den installierten GenTL-Producer,
 - einen Universal Robots UR16e ausschließlich lesend über RTDE und Dashboard Server,
-- ein Neewer RGB660 Pro II über Bluetooth Low Energy.
+- zwei Neewer RGB660 Pro II über Bluetooth Low Energy.
 
-Die aktuelle Version zeigt das Kamera-Livebild und Gerätestatus an und erlaubt eine
-manuelle Lichtsteuerung. Roboterbewegungen, automatische Aufnahmesequenzen,
+Die aktuelle Version zeigt das Kamera-Livebild und Gerätestatus an und erlaubt die
+unabhängige manuelle Steuerung beider Lichtpanels. Roboterbewegungen, automatische Aufnahmesequenzen,
 Bildspeicherung und Annotation sind noch nicht enthalten.
 
 ## Voraussetzungen
@@ -19,7 +19,7 @@ Bildspeicherung und Annotation sind noch nicht enthalten.
   `C:\Program Files\Baumer Camera Explorer\bgapi2_gige.cti`
 - Kamera-Netzwerk `169.254.0.0/16`, hier Kamera `169.254.117.70`
 - UR-Netzwerk `10.10.10.0/24`, hier Roboter `10.10.10.10`
-- Bluetooth-LE-Adapter und eingeschaltetes RGB660 Pro II
+- Bluetooth-LE-Adapter und bis zu zwei eingeschaltete RGB660 Pro II
 
 Der Baumer Camera Explorer muss geschlossen sein, da eine Kamera gewöhnlich nicht von zwei
 GenTL-Clients gleichzeitig geöffnet werden kann. Die Neewer-Smartphone-App muss vom Panel
@@ -45,13 +45,15 @@ Kamera- und Lichtauswahl wird über `QSettings` im Windows-Benutzerprofil gespei
 ## Bedienung
 
 1. Camera Explorer und Neewer-App schließen.
-2. Kamera, Roboter und Licht einschalten.
+2. Kamera, Roboter und beide Lichter einschalten.
 3. **Alle verbinden** oder die einzelnen Schaltflächen verwenden.
 4. Das Kamerabild sowie Modell, Seriennummer, Pixelformat und Bildrate prüfen.
 5. Beim UR die RTDE-/Dashboard-Anzeigen und insbesondere den Safety Mode prüfen.
-6. Das Licht erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
+6. Die Lichter erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
 
-Die Lichtwerte sind als „bestätigter letzter Befehl“ gekennzeichnet. Das BLE-Protokoll liefert
+Die beiden BLE-Adressen werden getrennt gespeichert, sodass „Alle verbinden“ nicht beide
+Adapter demselben Panel zuordnet. Die Lichtwerte sind als „bestätigter letzter Befehl“
+gekennzeichnet. Das BLE-Protokoll liefert
 nicht in jeder Firmware verlässliche physische Istwerte zurück. Beim Beenden wird das Panel
 nicht automatisch ausgeschaltet oder umgestellt.
 

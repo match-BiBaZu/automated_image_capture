@@ -17,6 +17,8 @@ class AppSettings:
     camera_serial: str = ""
     light_address: str = ""
     light_name: str = ""
+    light_2_address: str = ""
+    light_2_name: str = ""
     preview_max_fps: int = 15
     auto_reconnect: bool = True
 
@@ -53,6 +55,8 @@ class SettingsStore:
             camera_serial=str(self._settings.value("camera/serial", "")),
             light_address=str(self._settings.value("light/address", "")),
             light_name=str(self._settings.value("light/name", "")),
+            light_2_address=str(self._settings.value("light_2/address", "")),
+            light_2_name=str(self._settings.value("light_2/name", "")),
             preview_max_fps=int(
                 self._settings.value("camera/preview_max_fps", defaults.preview_max_fps)
             ),
@@ -69,7 +73,8 @@ class SettingsStore:
         self._settings.setValue("camera/serial", config.camera_serial)
         self._settings.setValue("light/address", config.light_address)
         self._settings.setValue("light/name", config.light_name)
+        self._settings.setValue("light_2/address", config.light_2_address)
+        self._settings.setValue("light_2/name", config.light_2_name)
         self._settings.setValue("camera/preview_max_fps", config.preview_max_fps)
         self._settings.setValue("connections/auto_reconnect", config.auto_reconnect)
         self._settings.sync()
-

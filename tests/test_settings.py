@@ -16,6 +16,8 @@ def test_settings_round_trip(tmp_path) -> None:
         camera_serial="1234",
         light_address="AA:BB:CC:DD:EE:FF",
         light_name="RGB660",
+        light_2_address="11:22:33:44:55:66",
+        light_2_name="RGB660-2",
         preview_max_fps=12,
         auto_reconnect=False,
     )
@@ -35,4 +37,3 @@ def test_invalid_ip_is_rejected(field: str) -> None:
 def test_invalid_preview_rate_is_rejected() -> None:
     with pytest.raises(ValueError, match="Bildrate"):
         AppSettings(preview_max_fps=0).validated()
-

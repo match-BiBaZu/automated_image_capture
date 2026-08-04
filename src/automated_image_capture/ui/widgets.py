@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -21,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from automated_image_capture.models import ConnectionState
+from automated_image_capture.models import ConnectionState, LightStatus
 from automated_image_capture.settings import AppSettings
 
 STATE_COLORS = {
@@ -113,9 +114,122 @@ class LabeledSlider(QWidget):
         self.value_label.setText(f"{value}{self._suffix}")
 
 
+class LightControlCard(DeviceCard):
+    power_requested = pyqtSignal(bool)
+    cct_requested = pyqtSignal(int, int)
+    hsi_requested = pyqtSignal(int, int, int)
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(title, parent)
+        self._updating = False
+
+        row = QHBoxLayout()
+        self.power_button = QPushButton("Licht einschalten")
+        self.power_button.setCheckable(True)
+        self.power_button.setEnabled(False)
+        self.power_button.toggled.connect(self._power_toggled)
+        self.mode = QComboBox()
+        self.mode.addItems(["CCT", "HSI"])
+        self.mode.setEnabled(False)
+        self.mode.currentTextChanged.connect(self._values_changed)
+        row.addWidget(self.power_button)
+        row.addWidget(QLabel("Modus"))
+        row.addWidget(self.mode)
+        self.content_layout.addLayout(row)
+
+        self.brightness = LabeledSlider("Helligkeit", 0, 100, 50, " %")
+        self.cct = LabeledSlider("Farbtemperatur", 3200, 5600, 5600, " K")
+        self.hue = LabeledSlider("Farbton", 0, 360, 0, "°")
+        self.saturation = LabeledSlider("Sättigung", 0, 100, 100, " %")
+        for control in (self.brightness, self.cct, self.hue, self.saturation):
+            control.setEnabled(False)
+            control.value_changed.connect(self._values_changed)
+            self.content_layout.addWidget(control)
+
+        self.command_timer = QTimer(self)
+        self.command_timer.setSingleShot(True)
+        self.command_timer.setInterval(150)
+        self.command_timer.timeout.connect(self._send_values)
+        self._update_mode_visibility("CCT")
+
+    def set_connection_state(self, state: ConnectionState) -> None:
+        self.set_state(state)
+        enabled = state is ConnectionState.CONNECTED
+        for control in (
+            self.power_button,
+            self.mode,
+            self.brightness,
+            self.cct,
+            self.hue,
+            self.saturation,
+        ):
+            control.setEnabled(enabled)
+
+    def set_status(self, status: LightStatus) -> None:
+        confirmed = (
+            "bestätigter letzter Befehl"
+            if status.values_are_confirmed_commands
+            else "kein Istwert"
+        )
+        rssi = "–" if status.rssi is None else f"{status.rssi} dBm"
+        power = "–" if status.power is None else ("Ein" if status.power else "Aus")
+        self.details.setText(
+            f"Gerät: {status.name}\nAdresse: {status.address} · RSSI: {rssi}\n"
+            f"Leistung: {power} · Modus: {status.mode}\n"
+            f"Helligkeit: {status.brightness} % · CCT: {status.cct_kelvin} K\n"
+            f"HSI: {status.hue}° / {status.saturation} % · Werte: {confirmed}"
+        )
+        self._updating = True
+        try:
+            self.mode.setCurrentText(status.mode)
+            self.brightness.set_value(status.brightness)
+            self.cct.set_value(status.cct_kelvin)
+            self.hue.set_value(status.hue)
+            self.saturation.set_value(status.saturation)
+            if status.power is not None:
+                blocked = self.power_button.blockSignals(True)
+                self.power_button.setChecked(status.power)
+                self.power_button.blockSignals(blocked)
+                self.power_button.setText(
+                    "Licht ausschalten" if status.power else "Licht einschalten"
+                )
+        finally:
+            self._updating = False
+        self._update_mode_visibility(status.mode)
+
+    def _power_toggled(self, enabled: bool) -> None:
+        self.power_button.setText(
+            "Licht ausschalten" if enabled else "Licht einschalten"
+        )
+        if not self._updating:
+            self.power_requested.emit(enabled)
+
+    def _values_changed(self, *_: object) -> None:
+        mode = self.mode.currentText()
+        self._update_mode_visibility(mode)
+        if not self._updating and self.state is ConnectionState.CONNECTED:
+            self.command_timer.start()
+
+    def _update_mode_visibility(self, mode: str) -> None:
+        is_cct = mode == "CCT"
+        self.cct.setVisible(is_cct)
+        self.hue.setVisible(not is_cct)
+        self.saturation.setVisible(not is_cct)
+
+    def _send_values(self) -> None:
+        brightness = self.brightness.value()
+        if self.mode.currentText() == "CCT":
+            self.cct_requested.emit(self.cct.value(), brightness)
+        else:
+            self.hsi_requested.emit(
+                self.hue.value(),
+                self.saturation.value(),
+                brightness,
+            )
 class SettingsDialog(QDialog):
     def __init__(self, config: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._source_config = config
         self.setWindowTitle("Hardware-Einstellungen")
         self.setMinimumWidth(620)
         self.result_config: AppSettings | None = None
@@ -125,6 +239,8 @@ class SettingsDialog(QDialog):
         self.camera_ip = QLineEdit(config.camera_ip)
         self.robot_ip = QLineEdit(config.robot_ip)
         self.cti_path = QLineEdit(config.camera_cti_path)
+        self.light_1_address = QLineEdit(config.light_address)
+        self.light_2_address = QLineEdit(config.light_2_address)
         browse = QPushButton("Durchsuchen …")
         browse.clicked.connect(self._browse_cti)
         cti_row = QWidget()
@@ -142,6 +258,8 @@ class SettingsDialog(QDialog):
         form.addRow("Baumer-IP", self.camera_ip)
         form.addRow("UR16e-IP", self.robot_ip)
         form.addRow("Baumer GenTL (.cti)", cti_row)
+        form.addRow("Licht 1 BLE-Adresse", self.light_1_address)
+        form.addRow("Licht 2 BLE-Adresse", self.light_2_address)
         form.addRow("Maximale Vorschau-FPS", self.preview_fps)
         form.addRow("Wiederverbindung", self.auto_reconnect)
         layout.addLayout(form)
@@ -176,6 +294,11 @@ class SettingsDialog(QDialog):
                 camera_ip=self.camera_ip.text(),
                 robot_ip=self.robot_ip.text(),
                 camera_cti_path=self.cti_path.text(),
+                camera_serial=self._source_config.camera_serial,
+                light_address=self.light_1_address.text().strip(),
+                light_name=self._source_config.light_name,
+                light_2_address=self.light_2_address.text().strip(),
+                light_2_name=self._source_config.light_2_name,
                 preview_max_fps=self.preview_fps.value(),
                 auto_reconnect=self.auto_reconnect.isChecked(),
             ).validated()

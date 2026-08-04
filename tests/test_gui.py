@@ -54,12 +54,23 @@ def test_dashboard_renders_status_without_hardware(qtbot, tmp_path) -> None:
             values_are_confirmed_commands=True,
         )
     )
+    window._light_2_status(
+        LightStatus(
+            name="RGB660-2",
+            address="CC:DD",
+            connected=True,
+            brightness=70,
+            values_are_confirmed_commands=True,
+        )
+    )
 
     assert "TestCam" in window.camera_card.details.text()
     assert "RUNNING" in window.robot_card.details.text()
     assert "35 %" in window.light_card.details.text()
+    assert "70 %" in window.light_2_card.details.text()
     assert window.config.camera_serial == "42"
     assert window.config.light_address == "AA:BB"
+    assert window.config.light_2_address == "CC:DD"
 
 
 def test_light_controls_follow_connection_state(qtbot, tmp_path) -> None:
@@ -71,6 +82,11 @@ def test_light_controls_follow_connection_state(qtbot, tmp_path) -> None:
     window._light_state(ConnectionState.CONNECTED)
     assert window.light_brightness.isEnabled()
 
+    window._light_2_state(ConnectionState.DISCONNECTED)
+    assert not window.light_2_card.brightness.isEnabled()
+    window._light_2_state(ConnectionState.CONNECTED)
+    assert window.light_2_card.brightness.isEnabled()
+
 
 def test_device_failures_do_not_change_other_cards(qtbot, tmp_path) -> None:
     window = make_window(qtbot, tmp_path)
@@ -80,4 +96,4 @@ def test_device_failures_do_not_change_other_cards(qtbot, tmp_path) -> None:
     assert window.camera_card.state is ConnectionState.ERROR
     assert window.robot_card.state is ConnectionState.DISCONNECTED
     assert window.light_card.state is ConnectionState.DISCONNECTED
-
+    assert window.light_2_card.state is ConnectionState.DISCONNECTED
