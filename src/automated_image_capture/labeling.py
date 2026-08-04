@@ -14,7 +14,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-
 CAPTURE_NAME = re.compile(
     r"^img_(?P<index>\d+)_ur(?P<pose>\d+)_p1-(?P<p1>\d+)_p2-(?P<p2>\d+)_"
     r"(?P<exposure>auto|e\d+us)\.png$",
@@ -59,8 +58,8 @@ class LabelingConfig:
     class_name: str = "Kk1"
     class_id: int = 0
     validation_fraction: float = 0.2
-    minimum_difference: int = 8
-    consensus_fraction: float = 0.45
+    minimum_difference: int = 80
+    consensus_fraction: float = 0.55
     box_margin_pixels: int = 8
     include_background_negatives: bool = True
     prefer_hardlinks: bool = True
@@ -75,10 +74,12 @@ class LabelingConfig:
             raise LabelingError(f"Leerbildordner nicht gefunden: {background}")
         if foreground == background:
             raise LabelingError("Bauteil- und Leerbildordner müssen verschieden sein.")
-        if output in {foreground, background}:
-            raise LabelingError("Der Ausgabeordner darf kein Eingabeordner sein.")
+        if output.is_relative_to(foreground) or output.is_relative_to(background):
+            raise LabelingError("Der Ausgabeordner darf nicht in einem Eingabeordner liegen.")
         if not self.class_name.strip():
             raise LabelingError("Der Klassenname darf nicht leer sein.")
+        if re.search(r'[<>:"/\\|?*]', self.class_name):
+            raise LabelingError("Der Klassenname enthält ein unzulässiges Dateizeichen.")
         if self.class_id < 0:
             raise LabelingError("Die Klassen-ID darf nicht negativ sein.")
         if not 0.0 <= self.validation_fraction < 1.0:
@@ -206,6 +207,41 @@ def _largest_component(mask: np.ndarray, minimum_area: int = 250) -> np.ndarray:
     return filled
 
 
+def _align_background(foreground: np.ndarray, background: np.ndarray) -> np.ndarray:
+    """Register the empty scene to the object image with a rigid 2-D transform."""
+    scale = min(1.0, 640.0 / foreground.shape[1])
+    size = (round(foreground.shape[1] * scale), round(foreground.shape[0] * scale))
+    foreground_small = cv2.resize(foreground, size, interpolation=cv2.INTER_AREA)
+    background_small = cv2.resize(background, size, interpolation=cv2.INTER_AREA)
+    warp = np.eye(2, 3, dtype=np.float32)
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        80,
+        1e-5,
+    )
+    try:
+        _, warp = cv2.findTransformECC(
+            foreground_small,
+            background_small,
+            warp,
+            cv2.MOTION_EUCLIDEAN,
+            criteria,
+            None,
+            5,
+        )
+        warp[0, 2] /= scale
+        warp[1, 2] /= scale
+        return cv2.warpAffine(
+            background,
+            warp,
+            (foreground.shape[1], foreground.shape[0]),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+    except cv2.error:
+        return background
+
+
 def segment_pair(
     foreground: np.ndarray,
     background: np.ndarray,
@@ -215,6 +251,7 @@ def segment_pair(
         raise LabelingError(
             f"Bildgrößen stimmen nicht überein: {foreground.shape} / {background.shape}"
         )
+    background = _align_background(foreground, background)
     foreground_blurred = cv2.GaussianBlur(foreground, (5, 5), 0)
     background_blurred = cv2.GaussianBlur(background, (5, 5), 0)
     signed = foreground_blurred.astype(np.int16) - background_blurred.astype(np.int16)
@@ -234,6 +271,10 @@ def segment_pair(
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
     )
+    mask[:12, :] = 0
+    mask[-12:, :] = 0
+    mask[:, :12] = 0
+    mask[:, -12:] = 0
     mask = _largest_component(mask)
     return SegmentationMeasurement(threshold, int(np.count_nonzero(mask)), mask)
 
@@ -408,6 +449,46 @@ def _make_review_sheet(
     cv2.imwrite(str(destination), sheet, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
 
+def _make_pose_overview(
+    consensuses: dict[int, PoseConsensus],
+    grouped: dict[int, list[MatchedPair]],
+    destination: Path,
+) -> None:
+    tiles: list[np.ndarray] = []
+    for pose_id, consensus in consensuses.items():
+        pairs = grouped[pose_id]
+        pair = pairs[len(pairs) // 2]
+        image = cv2.imread(str(pair.foreground.path), cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        cv2.polylines(image, [np.rint(consensus.box).astype(np.int32)], True, (0, 255, 0), 6)
+        cv2.putText(
+            image,
+            f"Pose {pose_id}",
+            (30, 75),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2.0,
+            (0, 255, 0),
+            5,
+            cv2.LINE_AA,
+        )
+        scale = 360 / image.shape[1]
+        tiles.append(cv2.resize(image, (360, round(image.shape[0] * scale))))
+    if not tiles:
+        return
+    tile_height = tiles[0].shape[0]
+    blank = np.zeros((tile_height, 360, 3), dtype=np.uint8)
+    columns = 5
+    while len(tiles) % columns:
+        tiles.append(blank.copy())
+    rows = [np.hstack(tiles[index : index + columns]) for index in range(0, len(tiles), columns)]
+    cv2.imwrite(
+        str(destination),
+        np.vstack(rows),
+        [cv2.IMWRITE_JPEG_QUALITY, 94],
+    )
+
+
 def _write_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
     rows = list(rows)
     if not rows:
@@ -495,6 +576,7 @@ def generate_obb_dataset(
         consensus = consensuses[pose_id]
         cv2.imwrite(str(review / f"pose_{pose_id}_consensus_mask.png"), consensus.mask)
         _make_review_sheet(consensus, grouped[pose_id], review / f"pose_{pose_id}_obb.jpg")
+    _make_pose_overview(consensuses, grouped, review / "all_poses_obb.jpg")
 
     _write_csv(output / "label_report.csv", report_rows)
     summary = {

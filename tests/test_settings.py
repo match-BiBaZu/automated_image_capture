@@ -4,6 +4,7 @@ import pytest
 from PyQt6.QtCore import QSettings
 
 from automated_image_capture.acquisition import AcquisitionSettings
+from automated_image_capture.labeling import LabelingConfig
 from automated_image_capture.settings import AppSettings, SettingsStore
 
 
@@ -62,3 +63,28 @@ def test_acquisition_settings_round_trip(tmp_path) -> None:
     store.save_acquisition(expected)
 
     assert store.load_acquisition() == expected
+
+
+def test_labeling_settings_round_trip(tmp_path) -> None:
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    store = SettingsStore(backend)
+    foreground = tmp_path / "parts"
+    background = tmp_path / "empty"
+    foreground.mkdir()
+    background.mkdir()
+    expected = LabelingConfig(
+        foreground,
+        background,
+        tmp_path / "yolo_obb",
+        class_name="Kk1",
+        class_id=2,
+        validation_fraction=0.25,
+        minimum_difference=70,
+        consensus_fraction=0.6,
+        include_background_negatives=False,
+        prefer_hardlinks=False,
+    )
+
+    store.save_labeling(expected)
+
+    assert store.load_labeling() == expected

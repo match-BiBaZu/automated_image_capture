@@ -156,3 +156,99 @@ class SettingsStore:
                 value = str(value)
             self._settings.setValue(f"acquisition/{field_name}", value)
         self._settings.sync()
+
+    def load_labeling(self):
+        from automated_image_capture.labeling import LabelingConfig
+
+        pictures = Path.home() / "Pictures"
+
+        def latest_capture(root: Path) -> Path:
+            captures = sorted(
+                root.glob("capture_*"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            return captures[0] if captures else root
+
+        defaults = LabelingConfig(
+            foreground_directory=latest_capture(pictures / "Kk1"),
+            background_directory=latest_capture(pictures / "empty_slide"),
+            output_directory=pictures / "Kk1_yolo_obb",
+        )
+        return LabelingConfig(
+            foreground_directory=Path(
+                str(
+                    self._settings.value(
+                        "labeling/foreground_directory",
+                        str(defaults.foreground_directory),
+                    )
+                )
+            ),
+            background_directory=Path(
+                str(
+                    self._settings.value(
+                        "labeling/background_directory",
+                        str(defaults.background_directory),
+                    )
+                )
+            ),
+            output_directory=Path(
+                str(
+                    self._settings.value(
+                        "labeling/output_directory",
+                        str(defaults.output_directory),
+                    )
+                )
+            ),
+            class_name=str(
+                self._settings.value("labeling/class_name", defaults.class_name)
+            ),
+            class_id=int(self._settings.value("labeling/class_id", defaults.class_id)),
+            validation_fraction=float(
+                self._settings.value(
+                    "labeling/validation_fraction",
+                    defaults.validation_fraction,
+                )
+            ),
+            minimum_difference=int(
+                self._settings.value(
+                    "labeling/minimum_difference",
+                    defaults.minimum_difference,
+                )
+            ),
+            consensus_fraction=float(
+                self._settings.value(
+                    "labeling/consensus_fraction",
+                    defaults.consensus_fraction,
+                )
+            ),
+            include_background_negatives=self._settings.value(
+                "labeling/include_background_negatives",
+                defaults.include_background_negatives,
+                type=bool,
+            ),
+            prefer_hardlinks=self._settings.value(
+                "labeling/prefer_hardlinks",
+                defaults.prefer_hardlinks,
+                type=bool,
+            ),
+        )
+
+    def save_labeling(self, config) -> None:
+        for field_name in (
+            "foreground_directory",
+            "background_directory",
+            "output_directory",
+            "class_name",
+            "class_id",
+            "validation_fraction",
+            "minimum_difference",
+            "consensus_fraction",
+            "include_background_negatives",
+            "prefer_hardlinks",
+        ):
+            value = getattr(config, field_name)
+            if isinstance(value, Path):
+                value = str(value)
+            self._settings.setValue(f"labeling/{field_name}", value)
+        self._settings.sync()

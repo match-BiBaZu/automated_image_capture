@@ -76,6 +76,32 @@ vom Kamera-Verbindungsaufbau zurückgesetzt.
 **Aufnahme stoppen** verhindert weitere Aufträge und Bilder. Eine bereits begonnene Bewegung
 wird aus Sicherheitsgründen nicht durch einen externen Stop-Befehl unterbrochen.
 
+## Automatische OBB-Labels
+
+Über **OBB-Labels …** lässt sich aus einer Bauteilserie und einer parametrisch identischen
+Leerbildserie ein YOLO-OBB-Datensatz erzeugen. Das Tool paart die Aufnahmen anhand von Pose,
+beiden Panelhelligkeiten und Belichtung. Vor der Differenzbildung wird jedes Leerbild
+subpixelgenau registriert, damit kleine Wiederholabweichungen auf strukturierten Untergründen
+nicht als Objekt erscheinen.
+
+Alle Beleuchtungsvarianten derselben Pose stimmen über eine gemeinsame Segmentierungsmaske
+und eine gemeinsame orientierte Bounding Box ab. Einzelbilder mit schwacher Übereinstimmung
+werden in `label_report.csv` als `REVIEW` markiert. Unter `review/` entstehen eine
+Gesamtübersicht, sechs repräsentative Overlays je Pose und die Konsensmasken.
+
+Der Ausgabeordner ist direkt als Ultralytics-YOLO-OBB-Datensatz aufgebaut:
+
+- `images/train`, `images/val`
+- `labels/train`, `labels/val` mit acht normierten OBB-Koordinaten
+- `data.yaml`
+- `label_summary.json` und `label_report.csv`
+
+Der Train-/Val-Split erfolgt nach vollständigen Posen statt zufällig nach Bildern. Dadurch
+landen Beleuchtungsvarianten derselben Ansicht nicht zugleich in Training und Validierung.
+Optional werden die Leerbilder mit leeren Labeldateien als negative Beispiele übernommen.
+Auf demselben Laufwerk nutzt das Tool Hardlinks, sodass dabei keine zweite Kopie der großen
+PNG-Dateien entsteht.
+
 Die beiden BLE-Adressen werden getrennt gespeichert, sodass „Alle verbinden“ nicht beide
 Adapter demselben Panel zuordnet. Die Lichtwerte sind als „bestätigter letzter Befehl“
 gekennzeichnet. Das BLE-Protokoll liefert

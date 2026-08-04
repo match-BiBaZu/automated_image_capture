@@ -30,6 +30,7 @@ from automated_image_capture.models import (
     RobotStatus,
 )
 from automated_image_capture.settings import SettingsStore
+from automated_image_capture.ui.labeling_dialog import LabelingDialog
 from automated_image_capture.ui.widgets import (
     AcquisitionCard,
     AcquisitionDialog,
@@ -91,12 +92,15 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         connect_all = QPushButton("Alle verbinden")
         disconnect_all = QPushButton("Alle trennen")
+        labeling_button = QPushButton("OBB-Labels …")
         settings_button = QPushButton("Einstellungen …")
         connect_all.clicked.connect(self.connect_all)
         disconnect_all.clicked.connect(self.disconnect_all)
+        labeling_button.clicked.connect(self.open_labeling)
         settings_button.clicked.connect(self.open_settings)
         toolbar.addWidget(connect_all)
         toolbar.addWidget(disconnect_all)
+        toolbar.addWidget(labeling_button)
         toolbar.addStretch(1)
         safety = QLabel("UR16e: nur freigegebene Posen über RTDE-Handshake")
         safety.setStyleSheet("color:#b45309; font-weight:600;")
@@ -333,6 +337,10 @@ class MainWindow(QMainWindow):
         self.light_2.config = self.config
         self.statusBar().showMessage(f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}")
         self._append_event("Einstellungen gespeichert; sie gelten ab der nächsten Verbindung.")
+
+    def open_labeling(self) -> None:
+        dialog = LabelingDialog(self.settings_store, self)
+        dialog.exec()
 
     def open_acquisition_settings(self) -> None:
         if self.acquisition.running:
