@@ -28,7 +28,12 @@ from automated_image_capture.models import (
     RobotStatus,
 )
 from automated_image_capture.settings import SettingsStore
-from automated_image_capture.ui.widgets import DeviceCard, LightControlCard, SettingsDialog
+from automated_image_capture.ui.widgets import (
+    DeviceCard,
+    LightControlCard,
+    RobotPoseControlCard,
+    SettingsDialog,
+)
 
 
 class MainWindow(QMainWindow):
@@ -80,8 +85,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(connect_all)
         toolbar.addWidget(disconnect_all)
         toolbar.addStretch(1)
-        safety = QLabel("UR16e: nur Status – keine Bewegung oder Schreibbefehle")
-        safety.setStyleSheet("color:#166534; font-weight:600;")
+        safety = QLabel("UR16e: nur freigegebene Posen über RTDE-Handshake")
+        safety.setStyleSheet("color:#b45309; font-weight:600;")
         toolbar.addWidget(safety)
         toolbar.addWidget(settings_button)
         root.addLayout(toolbar)
@@ -90,7 +95,7 @@ class MainWindow(QMainWindow):
         cards_container = QWidget()
         cards_layout = QVBoxLayout(cards_container)
         self.camera_card = DeviceCard("Baumer Industriekamera")
-        self.robot_card = DeviceCard("Universal Robots UR16e")
+        self.robot_card = RobotPoseControlCard("Universal Robots UR16e")
         self.light_card = LightControlCard("Neewer RGB660 Pro II · Licht 1")
         self.light_2_card = LightControlCard("Neewer RGB660 Pro II · Licht 2")
         self.camera_card.action_requested.connect(lambda: self._toggle(self.camera))
@@ -163,6 +168,7 @@ class MainWindow(QMainWindow):
         self.camera.status_changed.connect(self._camera_status)
         self.camera.frame_ready.connect(self._camera_frame)
         self.robot.status_changed.connect(self._robot_status)
+        self.robot_card.pose_requested.connect(self.robot.request_pose)
         self.light.status_changed.connect(self._light_status)
         self.light.state_changed.connect(self._light_state)
         self.light_2.status_changed.connect(self._light_2_status)
@@ -238,6 +244,7 @@ class MainWindow(QMainWindow):
         self._render_image()
 
     def _robot_status(self, status: RobotStatus) -> None:
+        self.robot_card.set_status(status)
         scaling = "–" if status.speed_scaling is None else f"{status.speed_scaling * 100:.0f} %"
         joints = "–" if not status.joint_positions else ", ".join(
             f"{value:.3f}" for value in status.joint_positions
@@ -248,6 +255,7 @@ class MainWindow(QMainWindow):
             f"{'ja' if status.dashboard_connected else 'nein'}\n"
             f"Robot/Safety Mode: {status.robot_mode} / {status.safety_mode}\n"
             f"Remote: {status.remote_control} · Programm: {status.program_state}\n"
+            f"Geladen: {status.loaded_program}\n"
             f"Speed Scaling: {scaling}\n"
             f"Gelenke [rad]: {joints}\n"
             f"TCP [m, rotvec]: {tcp}\n"

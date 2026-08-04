@@ -1,0 +1,25 @@
+def BiBaZu_GUI_Wait():
+  local command = read_input_integer_register(43)
+  while command == last_command:
+    sync()
+    command = read_input_integer_register(43)
+  end
+
+  local requested_angle = read_input_integer_register(42)
+  local valid = requested_angle == 155 or requested_angle == 160 or requested_angle == 170 or requested_angle == 180 or requested_angle == 190 or requested_angle == 200 or requested_angle == 210
+
+  if valid:
+    global angle = requested_angle
+    global active_command = command
+    global command_valid = True
+    write_output_integer_register(43, 2)
+  else:
+    global angle = 0
+    global command_valid = False
+    global last_command = command
+    write_output_integer_register(43, -1)
+    write_output_integer_register(42, command)
+  end
+end
+
+BiBaZu_GUI_Wait()

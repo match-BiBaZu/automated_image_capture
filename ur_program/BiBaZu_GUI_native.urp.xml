@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="utf-8"?>
+<URProgram name="BiBaZu_GUI" installation="default" installationRelativePath="default" directory="/programs/usbdisk" createdIn="5.12.3.1101619" lastSavedIn="5.12.3.1101619" robotSerialNumber="20225600150">
+  <kinematics status="LINEARIZED" validChecksum="true">
+    <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+    <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+    <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+    <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+    <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+  </kinematics>
+  <children>
+    <SpecialSequence type="BeforeStart"><children><Script type="File"><cachedContents>def BiBaZu_GUI_Init():
+  global angle = 0
+  global last_command = read_input_integer_register(43)
+  global active_command = last_command
+  global command_valid = False
+  write_output_integer_register(42, last_command)
+  write_output_integer_register(43, 1)
+  write_output_integer_register(41, 0)
+end
+
+BiBaZu_GUI_Init()
+</cachedContents><file resolves-to="file">BiBaZu_GUI_Init.script</file></Script></children></SpecialSequence><MainProgram runOnlyOnce="false" InitVariablesNode="false">
+      <children>
+        <Assignment valueSource="Expression">
+          <variable name="angle" prefersPersistentValue="false">
+            <initializeExpression />
+          </variable>
+        <expression><ExpressionChar character="0" /></expression></Assignment><Script type="File"><cachedContents>def BiBaZu_GUI_Wait():
+  local command = read_input_integer_register(43)
+  while command == last_command:
+    sync()
+    command = read_input_integer_register(43)
+  end
+
+  local requested_angle = read_input_integer_register(42)
+  local valid = requested_angle == 155 or requested_angle == 160 or requested_angle == 170 or requested_angle == 180 or requested_angle == 190 or requested_angle == 200 or requested_angle == 210
+
+  if valid:
+    global angle = requested_angle
+    global active_command = command
+    global command_valid = True
+    write_output_integer_register(43, 2)
+  else:
+    global angle = 0
+    global command_valid = False
+    global last_command = command
+    write_output_integer_register(43, -1)
+    write_output_integer_register(42, command)
+  end
+end
+
+BiBaZu_GUI_Wait()
+</cachedContents><file resolves-to="file">BiBaZu_GUI_Wait.script</file></Script>
+        <Switch>
+          <expression>
+            <ExpressionVariable>
+              <ProgramVariable reference="../../../../Assignment/variable" />
+            </ExpressionVariable>
+          </expression>
+          <children>
+            <Case caseValue="155">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" referencedName="Joint_0_name" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_7" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7164042631732386, -2.1188909016051234, -1.88267183303833, 4.755092139333048, -1.4816272894488733, -2.8443403879748743" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+            <Case caseValue="160">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" reference="../../../../Case/children/Move/feature" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_5" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7151597181903284, -2.1180955372252406, -1.8828034400939941, 4.752662430494585, -1.474816624318258, -2.8388169447528284" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+            <Case caseValue="170">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" reference="../../../../Case/children/Move/feature" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_4" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7127741018878382, -2.116480966607565, -1.8830666542053223, 4.747780608921804, -1.4612954298602503, -2.827742878590719" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+            <Case caseValue="180">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" reference="../../../../Case/children/Move/feature" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_3" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7103703657733362, -2.11486878017568, -1.8832803964614868, 4.742725049122729, -1.4477956930743616, -2.8165932337390345" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+            <Case caseValue="190">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" reference="../../../../Case/children/Move/feature" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_1" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7080095450030726, -2.113220354119772, -1.8833537101745605, 4.737384530692854, -1.4343469778644007, -2.8053703943835657" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+            <Case caseValue="200">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" reference="../../../../Case/children/Move/feature" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_2" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7056649366961878, -2.1116024456419886, -1.883575201034546, 4.731691078260102, -1.4210260550128382, -2.79401141801943" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+            <Case caseValue="210">
+              <children>
+                <Move motionType="MoveJ" speed="1.0471975511965976" acceleration="1.3962634015954636" useActiveTCP="true" positionType="CartesianPose">
+                  <feature class="GeomFeatureReference" reference="../../../../Case/children/Move/feature" />
+                  <children>
+                    <Waypoint type="Fixed" name="Waypoint_9" kinematicsFlags="6">
+                      <motionParameters />
+                      <position>
+                        <JointAngles angles="-1.7033246199237269, -2.1099382839598597, -1.8835521936416626, 4.725893483474412, -1.407684628163473, -2.7826486269580286" />
+                        <TCPOffset pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                        <Kinematics status="LINEARIZED" validChecksum="true">
+                          <deltaTheta value="7.243391880740191E-8, 0.7234374943931703, 5.729253354108991, -0.16951099358893373, 5.215343985565113E-7, 2.921872454889063E-7" />
+                          <a value="9.397567246024616E-5, -0.3584712703420291, -0.3549666955614656, -2.559324634670488E-5, 3.837432874657519E-5, 0.0" />
+                          <d value="0.18083110550330567, -2593.4998265705426, 2607.5238333327716, -13.849972853326852, 0.11981664975825583, 0.11561864427138566" />
+                          <alpha value="1.57030647871928, -1.2207065472476982E-4, 0.004332013722941687, 1.5691253584262224, -1.5697849080481225, 0.0" />
+                          <jointChecksum value="-1442160533, -1441728783, 659192754, -1493219607, -1493242982, -1493435229" />
+                        </Kinematics>
+                      </position>
+                      <BaseToFeature pose="0.0, 0.0, 0.0, 0.0, 0.0, 0.0" />
+                    </Waypoint>
+                  </children>
+                </Move>
+              </children>
+            </Case>
+          </children>
+        </Switch><Script type="File"><cachedContents>def BiBaZu_GUI_Ack():
+  if command_valid:
+    write_output_integer_register(41, angle)
+    write_output_integer_register(43, 3)
+    write_output_integer_register(42, active_command)
+    global last_command = active_command
+    global command_valid = False
+  end
+end
+
+BiBaZu_GUI_Ack()
+</cachedContents><file resolves-to="file">BiBaZu_GUI_Ack.script</file></Script>
+      </children>
+    </MainProgram>
+  </children>
+</URProgram>

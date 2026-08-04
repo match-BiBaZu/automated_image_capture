@@ -4,12 +4,14 @@ PyQt6-Hardware-Dashboard als erster Baustein einer automatisierten Aufnahme von
 YOLO-Trainingsbildern. Die Anwendung verbindet:
 
 - eine Baumer GigE-Vision-Kamera über den installierten GenTL-Producer,
-- einen Universal Robots UR16e ausschließlich lesend über RTDE und Dashboard Server,
+- einen Universal Robots UR16e über einen Statusmonitor und einen begrenzten
+  RTDE-Pose-Handshake,
 - zwei Neewer RGB660 Pro II über Bluetooth Low Energy.
 
 Die aktuelle Version zeigt das Kamera-Livebild und Gerätestatus an und erlaubt die
-unabhängige manuelle Steuerung beider Lichtpanels. Roboterbewegungen, automatische Aufnahmesequenzen,
-Bildspeicherung und Annotation sind noch nicht enthalten.
+unabhängige manuelle Steuerung beider Lichtpanels. Sie kann außerdem eine von sieben fest im
+UR-Programm freigegebenen Ansichten anfordern. Automatische Aufnahmesequenzen, Bildspeicherung und
+Annotation sind noch nicht enthalten.
 
 ## Voraussetzungen
 
@@ -49,7 +51,9 @@ Kamera- und Lichtauswahl wird über `QSettings` im Windows-Benutzerprofil gespei
 3. **Alle verbinden** oder die einzelnen Schaltflächen verwenden.
 4. Das Kamerabild sowie Modell, Seriennummer, Pixelformat und Bildrate prüfen.
 5. Beim UR die RTDE-/Dashboard-Anzeigen und insbesondere den Safety Mode prüfen.
-6. Die Lichter erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
+6. Für einen Pose-Auftrag das vorbereitete `BiBaZu`-Programm manuell starten, eine Ansicht
+   auswählen und die einmalige Bewegungsfreigabe bestätigen.
+7. Die Lichter erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
 
 Die beiden BLE-Adressen werden getrennt gespeichert, sodass „Alle verbinden“ nicht beide
 Adapter demselben Panel zuordnet. Die Lichtwerte sind als „bestätigter letzter Befehl“
@@ -59,16 +63,21 @@ nicht automatisch ausgeschaltet oder umgestellt.
 
 ## Sicherheit
 
-Die UR-Integration importiert ausschließlich `rtde_receive`. Der eingebaute Dashboard-Client
-akzeptiert nur folgende Abfragen:
+Der UR-Statusmonitor verwendet `rtde_receive`. Der separate `rtde_io`-Kanal darf ausschließlich
+die Input-Integer-Register 42 und 43 für eine freigegebene Pose und deren Befehlsnummer schreiben.
+Der eingebaute Dashboard-Client akzeptiert weiterhin nur folgende Abfragen:
 
 - `robotmode`
 - `safetymode`
 - `programState`
+- `get loaded program`
 - `is in remote control`
 - `PolyscopeVersion`
 
-Es gibt keine Bewegungs-, Power-, Brake-, I/O- oder URScript-Funktion in diesem Meilenstein.
+Es gibt keine direkte Bewegungs-, Power-, Brake-, Dashboard-Play- oder URScript-Upload-Funktion.
+Der Roboter bewegt sich ausschließlich durch die zuvor lokal geprüften Bewegungsnodes seines
+laufenden PolyScope-Programms. Das Registerprotokoll und die Inbetriebnahme sind unter
+[`ur_program/README.md`](ur_program/README.md) beschrieben.
 
 ## Tests
 

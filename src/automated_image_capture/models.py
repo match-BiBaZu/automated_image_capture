@@ -43,10 +43,19 @@ class RobotStatus:
     safety_mode: str = "–"
     remote_control: str = "–"
     program_state: str = "–"
+    loaded_program: str = "–"
     polyscope_version: str = "–"
     speed_scaling: float | None = None
     joint_positions: tuple[float, ...] = field(default_factory=tuple)
     tcp_pose: tuple[float, ...] = field(default_factory=tuple)
+    command_channel_connected: bool = False
+    command_state_code: int | None = None
+    command_state: str = "–"
+    requested_pose: int | None = None
+    requested_sequence: int | None = None
+    acknowledged_pose: int | None = None
+    acknowledged_sequence: int | None = None
+    command_pending: bool = False
 
 
 @dataclass(slots=True, frozen=True)

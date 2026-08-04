@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import socket
 import threading
 import time
@@ -40,12 +41,34 @@ SAFETY_MODES = {
     13: "THREE_POSITION_ENABLING_STOP",
 }
 
+ALLOWED_POSES = (155, 160, 170, 180, 190, 200, 210)
+POSE_INPUT_REGISTER = 42
+SEQUENCE_INPUT_REGISTER = 43
+ACK_SEQUENCE_OUTPUT_REGISTER = 42
+COMMAND_STATE_OUTPUT_REGISTER = 43
+CURRENT_POSE_OUTPUT_REGISTER = 41
+
+COMMAND_STATES = {
+    0: "UR-Programm nicht bereit",
+    1: "Bereit",
+    2: "Fährt",
+    3: "Pose erreicht",
+    -1: "Ungültige Pose abgelehnt",
+}
+
 
 class DashboardReadClient:
     """Minimal line-based client restricted to read-only dashboard commands."""
 
     ALLOWED_COMMANDS = frozenset(
-        {"robotmode", "safetymode", "programState", "is in remote control", "PolyscopeVersion"}
+        {
+            "robotmode",
+            "safetymode",
+            "programState",
+            "get loaded program",
+            "is in remote control",
+            "PolyscopeVersion",
+        }
     )
 
     def __init__(self, host: str, timeout: float = 2.0) -> None:
@@ -106,17 +129,30 @@ def _safe_call(target: Any, method: str, default: Any = None) -> Any:
         return default
 
 
+def _create_rtde_receive(interface: Any, host: str) -> Any:
+    """Open the receive recipe using external-client registers 42-46."""
+    return interface(host, 10.0, [], False, True)
+
+
 class RobotWorker(QObject):
     state_changed = pyqtSignal(object)
     status_changed = pyqtSignal(object)
     error = pyqtSignal(str)
     event_message = pyqtSignal(str)
     finished = pyqtSignal()
+    command_failed = pyqtSignal(int, str)
 
     def __init__(self, config: AppSettings) -> None:
         super().__init__()
         self._config = config
         self._stop = threading.Event()
+        self._commands: queue.Queue[tuple[int, int]] = queue.Queue()
+        self._requested_pose: int | None = None
+        self._requested_sequence: int | None = None
+
+    def enqueue_pose_command(self, pose: int, sequence: int) -> None:
+        """Thread-safe mailbox; register writes happen exclusively in run()."""
+        self._commands.put((pose, sequence))
 
     def stop(self) -> None:
         self._stop.set()
@@ -124,8 +160,10 @@ class RobotWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         rtde: Any = None
+        rtde_io: Any = None
         dashboard: DashboardReadClient | None = None
         last_rtde_attempt = 0.0
+        last_io_attempt = 0.0
         last_dashboard_attempt = 0.0
         last_dashboard_poll = 0.0
         last_reported_error = ""
@@ -133,20 +171,25 @@ class RobotWorker(QObject):
         was_rtde_connected = False
         was_dashboard_connected = False
         self.state_changed.emit(ConnectionState.CONNECTING)
-        self.event_message.emit("Starte read-only RTDE- und Dashboard-Verbindungen …")
+        self.event_message.emit("Starte RTDE-Monitor, Pose-Register und Dashboard-Verbindung …")
 
         try:
+            from rtde_io import RTDEIOInterface
             from rtde_receive import RTDEReceiveInterface
 
             while not self._stop.is_set():
                 now = time.monotonic()
                 rtde_error = ""
+                io_error = ""
                 dashboard_error = ""
 
                 if rtde is None and now - last_rtde_attempt >= 5.0:
                     last_rtde_attempt = now
                     try:
-                        rtde = RTDEReceiveInterface(self._config.robot_ip, 10.0)
+                        rtde = _create_rtde_receive(
+                            RTDEReceiveInterface,
+                            self._config.robot_ip,
+                        )
                         if not rtde.isConnected():
                             raise ConnectionError("RTDE-Handshake nicht erfolgreich.")
                         if not was_rtde_connected:
@@ -155,6 +198,23 @@ class RobotWorker(QObject):
                     except Exception as exc:
                         rtde_error = f"RTDE: {exc}"
                         rtde = None
+
+                if rtde_io is None and now - last_io_attempt >= 5.0:
+                    last_io_attempt = now
+                    try:
+                        rtde_io = RTDEIOInterface(
+                            self._config.robot_ip,
+                            False,
+                            True,
+                        )
+                        if not rtde_io.isConnected():
+                            raise ConnectionError("RTDE-I/O-Handshake nicht erfolgreich.")
+                        self.event_message.emit(
+                            "Pose-Auswahlkanal verbunden (nur RTDE-Register 42/43)."
+                        )
+                    except Exception as exc:
+                        io_error = f"Pose-Auswahlkanal: {exc}"
+                        rtde_io = None
 
                 if dashboard is None and now - last_dashboard_attempt >= 5.0:
                     last_dashboard_attempt = now
@@ -179,6 +239,7 @@ class RobotWorker(QObject):
                             ("robotmode", "robot_mode"),
                             ("safetymode", "safety_mode"),
                             ("programState", "program_state"),
+                            ("get loaded program", "loaded_program"),
                             ("is in remote control", "remote_control"),
                             ("PolyscopeVersion", "polyscope_version"),
                         ):
@@ -191,10 +252,12 @@ class RobotWorker(QObject):
                 status = RobotStatus(
                     rtde_connected=rtde is not None,
                     dashboard_connected=dashboard is not None,
+                    command_channel_connected=rtde_io is not None,
                     robot_mode=dashboard_values.get("robot_mode", "–"),
                     safety_mode=dashboard_values.get("safety_mode", "–"),
                     remote_control=dashboard_values.get("remote_control", "–"),
                     program_state=dashboard_values.get("program_state", "–"),
+                    loaded_program=dashboard_values.get("loaded_program", "–"),
                     polyscope_version=dashboard_values.get("polyscope_version", "–"),
                 )
 
@@ -207,6 +270,22 @@ class RobotWorker(QObject):
                         status.speed_scaling = float(rtde.getSpeedScaling())
                         status.joint_positions = tuple(float(v) for v in rtde.getActualQ())
                         status.tcp_pose = tuple(float(v) for v in rtde.getActualTCPPose())
+                        status.acknowledged_sequence = int(
+                            rtde.getOutputIntRegister(ACK_SEQUENCE_OUTPUT_REGISTER)
+                        )
+                        status.command_state_code = int(
+                            rtde.getOutputIntRegister(COMMAND_STATE_OUTPUT_REGISTER)
+                        )
+                        status.command_state = COMMAND_STATES.get(
+                            status.command_state_code,
+                            f"Unbekannt ({status.command_state_code})",
+                        )
+                        acknowledged_pose = int(
+                            rtde.getOutputIntRegister(CURRENT_POSE_OUTPUT_REGISTER)
+                        )
+                        status.acknowledged_pose = (
+                            acknowledged_pose if acknowledged_pose in ALLOWED_POSES else None
+                        )
                     except Exception as exc:
                         rtde_error = f"RTDE: {exc}"
                         try:
@@ -216,7 +295,47 @@ class RobotWorker(QObject):
                         rtde = None
                         status.rtde_connected = False
 
-                if status.rtde_connected and status.dashboard_connected:
+                if rtde_io is not None:
+                    active_sequence: int | None = None
+                    try:
+                        while True:
+                            pose, sequence = self._commands.get_nowait()
+                            active_sequence = sequence
+                            if not rtde_io.setInputIntRegister(POSE_INPUT_REGISTER, pose):
+                                raise ConnectionError("Pose-Register wurde nicht bestätigt.")
+                            if not rtde_io.setInputIntRegister(
+                                SEQUENCE_INPUT_REGISTER, sequence
+                            ):
+                                raise ConnectionError("Befehlsregister wurde nicht bestätigt.")
+                            self._requested_pose = pose
+                            self._requested_sequence = sequence
+                            self.event_message.emit(
+                                f"Pose {pose} als Auswahl #{sequence} an das UR-Programm übergeben."
+                            )
+                    except queue.Empty:
+                        pass
+                    except Exception as exc:
+                        io_error = f"Pose-Auswahlkanal: {exc}"
+                        if active_sequence is not None:
+                            self.command_failed.emit(active_sequence, str(exc))
+                        try:
+                            rtde_io.disconnect()
+                        except Exception:
+                            pass
+                        rtde_io = None
+
+                status.requested_pose = self._requested_pose
+                status.requested_sequence = self._requested_sequence
+                status.command_pending = (
+                    self._requested_sequence is not None
+                    and status.acknowledged_sequence != self._requested_sequence
+                )
+
+                if (
+                    status.rtde_connected
+                    and status.dashboard_connected
+                    and status.command_channel_connected
+                ):
                     state = ConnectionState.CONNECTED
                 elif status.rtde_connected or status.dashboard_connected:
                     state = ConnectionState.DEGRADED
@@ -225,7 +344,9 @@ class RobotWorker(QObject):
                 self.state_changed.emit(state)
                 self.status_changed.emit(status)
 
-                combined_error = "; ".join(filter(None, (rtde_error, dashboard_error)))
+                combined_error = "; ".join(
+                    filter(None, (rtde_error, io_error, dashboard_error))
+                )
                 if combined_error and combined_error != last_reported_error:
                     self.error.emit(combined_error)
                     last_reported_error = combined_error
@@ -242,12 +363,15 @@ class RobotWorker(QObject):
                     rtde.disconnect()
                 except Exception:
                     pass
+            if rtde_io is not None:
+                try:
+                    rtde_io.disconnect()
+                except Exception:
+                    pass
             if dashboard is not None:
                 dashboard.close()
             self.state_changed.emit(ConnectionState.DISCONNECTED)
-            self.event_message.emit(
-                "Verbindungen getrennt; es wurden keine Roboterbefehle gesendet."
-            )
+            self.event_message.emit("UR-Verbindungen und Pose-Auswahlkanal getrennt.")
             self.finished.emit()
 
 
@@ -257,6 +381,8 @@ class RobotAdapter(DeviceAdapter):
         self.config = config
         self._thread: QThread | None = None
         self._worker: RobotWorker | None = None
+        self._pending_sequence: int | None = None
+        self._next_sequence = int(time.time() * 1000) & 0x7FFFFFFF
 
     def connect(self) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -267,6 +393,7 @@ class RobotAdapter(DeviceAdapter):
         self._thread.started.connect(self._worker.run)
         self._worker.state_changed.connect(self._set_state)
         self._worker.status_changed.connect(self._forward_status)
+        self._worker.command_failed.connect(self._command_failed)
         self._worker.error.connect(self._emit_error)
         self._worker.event_message.connect(self._emit_event)
         self._worker.finished.connect(self._thread.quit)
@@ -280,6 +407,40 @@ class RobotAdapter(DeviceAdapter):
         self._worker = None
         self._thread = None
 
+    def request_pose(self, pose: int) -> bool:
+        if pose not in ALLOWED_POSES:
+            self._emit_error(f"Pose {pose} ist nicht freigegeben.")
+            return False
+        if self._worker is None or self._thread is None or not self._thread.isRunning():
+            self._emit_error("Pose kann nur bei bestehender UR-Verbindung angefordert werden.")
+            return False
+        if self._pending_sequence is not None:
+            self._emit_error("Die vorherige Pose wurde noch nicht vom UR-Programm bestätigt.")
+            return False
+        self._next_sequence = (self._next_sequence + 1) & 0x7FFFFFFF
+        if self._next_sequence == 0:
+            self._next_sequence = 1
+        self._pending_sequence = self._next_sequence
+        self._worker.enqueue_pose_command(pose, self._next_sequence)
+        self._emit_event(f"Pose {pose} angefordert (Auswahl #{self._next_sequence}).")
+        return True
+
+    @pyqtSlot(object)
+    def _forward_status(self, status: object) -> None:
+        if isinstance(status, RobotStatus) and (
+            self._pending_sequence is not None
+            and status.acknowledged_sequence == self._pending_sequence
+        ):
+            self._pending_sequence = None
+            status.command_pending = False
+        super()._forward_status(status)
+
+    @pyqtSlot(int, str)
+    def _command_failed(self, sequence: int, message: str) -> None:
+        if self._pending_sequence == sequence:
+            self._pending_sequence = None
+        self._emit_error(f"Pose-Auswahl #{sequence} fehlgeschlagen: {message}")
+
     def disconnect(self) -> None:
         worker, thread = self._worker, self._thread
         if worker is not None:
@@ -288,4 +449,5 @@ class RobotAdapter(DeviceAdapter):
             thread.quit()
             if not thread.wait(3000):
                 self._emit_error("UR-Worker wurde nicht innerhalb von 3 Sekunden beendet.")
+        self._pending_sequence = None
         self._set_state(ConnectionState.DISCONNECTED)

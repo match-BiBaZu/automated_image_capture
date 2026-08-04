@@ -5,7 +5,14 @@ import inspect
 import pytest
 
 import automated_image_capture.hardware.robot as robot_module
-from automated_image_capture.hardware.robot import DashboardReadClient
+from automated_image_capture.hardware.robot import (
+    ALLOWED_POSES,
+    CURRENT_POSE_OUTPUT_REGISTER,
+    POSE_INPUT_REGISTER,
+    SEQUENCE_INPUT_REGISTER,
+    DashboardReadClient,
+    _create_rtde_receive,
+)
 
 
 def test_dashboard_client_rejects_write_commands() -> None:
@@ -25,7 +32,31 @@ def test_robot_module_has_no_control_interface() -> None:
         "robotmode",
         "safetymode",
         "programState",
+        "get loaded program",
         "is in remote control",
         "PolyscopeVersion",
     }
 
+
+def test_pose_channel_is_limited_to_whitelist_and_external_registers() -> None:
+    assert ALLOWED_POSES == (155, 160, 170, 180, 190, 200, 210)
+    assert POSE_INPUT_REGISTER == 42
+    assert SEQUENCE_INPUT_REGISTER == 43
+    assert CURRENT_POSE_OUTPUT_REGISTER == 41
+    assert "moveJ" not in inspect.getsource(robot_module)
+    assert "moveL" not in inspect.getsource(robot_module)
+    assert "sendall" in inspect.getsource(DashboardReadClient)
+
+
+def test_receive_interface_uses_upper_register_range() -> None:
+    captured: tuple[object, ...] = ()
+
+    def fake_interface(*args: object) -> object:
+        nonlocal captured
+        captured = args
+        return object()
+
+    result = _create_rtde_receive(fake_interface, "10.10.10.10")
+
+    assert result is not None
+    assert captured == ("10.10.10.10", 10.0, [], False, True)

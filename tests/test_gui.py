@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QSettings
+from PyQt6.QtTest import QSignalSpy
 
 from automated_image_capture.models import (
     CameraStatus,
@@ -97,3 +98,55 @@ def test_device_failures_do_not_change_other_cards(qtbot, tmp_path) -> None:
     assert window.robot_card.state is ConnectionState.DISCONNECTED
     assert window.light_card.state is ConnectionState.DISCONNECTED
     assert window.light_2_card.state is ConnectionState.DISCONNECTED
+
+
+def test_robot_pose_requires_running_program_and_one_time_consent(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+    spy = QSignalSpy(window.robot_card.pose_requested)
+
+    window._robot_status(
+        RobotStatus(
+            rtde_connected=True,
+            dashboard_connected=True,
+            command_channel_connected=True,
+            robot_mode="RUNNING",
+            safety_mode="NORMAL",
+            program_state="PLAYING BiBaZu.urp",
+            loaded_program="/programs/BiBaZu.urp",
+            command_state_code=1,
+            command_state="Bereit",
+        )
+    )
+
+    assert not window.robot_card.move_button.isEnabled()
+    window.robot_card.motion_consent.setChecked(True)
+    assert window.robot_card.move_button.isEnabled()
+
+    window.robot_card.pose_selector.setCurrentIndex(3)
+    window.robot_card.move_button.click()
+
+    assert len(spy) == 1
+    assert spy[0][0] == 180
+    assert not window.robot_card.motion_consent.isChecked()
+    assert not window.robot_card.move_button.isEnabled()
+
+
+def test_robot_pose_is_disabled_while_command_is_pending(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+    window._robot_status(
+        RobotStatus(
+            rtde_connected=True,
+            dashboard_connected=True,
+            command_channel_connected=True,
+            robot_mode="RUNNING",
+            safety_mode="NORMAL",
+            program_state="PLAYING BiBaZu.urp",
+            loaded_program="/programs/BiBaZu.urp",
+            command_state_code=2,
+            command_state="Fährt",
+            command_pending=True,
+        )
+    )
+
+    window.robot_card.motion_consent.setChecked(True)
+    assert not window.robot_card.move_button.isEnabled()

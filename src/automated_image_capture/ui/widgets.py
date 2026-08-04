@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from automated_image_capture.models import ConnectionState, LightStatus
+from automated_image_capture.models import ConnectionState, LightStatus, RobotStatus
 from automated_image_capture.settings import AppSettings
 
 STATE_COLORS = {
@@ -69,6 +69,91 @@ class DeviceCard(QGroupBox):
         self.action_button.setText(
             "Verbinden" if state is ConnectionState.DISCONNECTED else "Trennen"
         )
+
+
+class RobotPoseControlCard(DeviceCard):
+    pose_requested = pyqtSignal(int)
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(title, parent)
+        self._status = RobotStatus()
+
+        warning = QLabel(
+            "Die Auswahl kann eine reale Roboterbewegung auslösen. "
+            "Arbeitsraum und Sicherheitsfreigaben vorher prüfen."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color:#b45309; font-weight:600;")
+        self.content_layout.addWidget(warning)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Freigegebene Ansicht"))
+        self.pose_selector = QComboBox()
+        for pose in (155, 160, 170, 180, 190, 200, 210):
+            self.pose_selector.addItem(f"{pose}°", pose)
+        row.addWidget(self.pose_selector)
+        self.content_layout.addLayout(row)
+
+        self.motion_consent = QCheckBox(
+            "Arbeitsraum ist frei; Bewegung für den nächsten Befehl freigeben"
+        )
+        self.motion_consent.toggled.connect(self._update_controls)
+        self.content_layout.addWidget(self.motion_consent)
+
+        self.move_button = QPushButton("Ausgewählte Pose anfordern")
+        self.move_button.clicked.connect(self._request_pose)
+        self.move_button.setEnabled(False)
+        self.content_layout.addWidget(self.move_button)
+
+        self.command_details = QLabel("Pose-Auswahlkanal nicht verbunden.")
+        self.command_details.setWordWrap(True)
+        self.content_layout.addWidget(self.command_details)
+
+    def set_status(self, status: RobotStatus) -> None:
+        self._status = status
+        pose = "–" if status.acknowledged_pose is None else f"{status.acknowledged_pose}°"
+        sequence = (
+            "–" if status.acknowledged_sequence is None else str(status.acknowledged_sequence)
+        )
+        pending = "ja" if status.command_pending else "nein"
+        self.command_details.setText(
+            f"Pose-Kanal: {'verbunden' if status.command_channel_connected else 'getrennt'} · "
+            f"UR-Handshake: {status.command_state}\n"
+            f"Bestätigte Pose: {pose} · Quittung: {sequence} · Ausstehend: {pending}"
+        )
+        self._update_controls()
+
+    def set_state(self, state: ConnectionState) -> None:
+        super().set_state(state)
+        self._update_controls()
+
+    def _update_controls(self) -> None:
+        if not hasattr(self, "move_button"):
+            return
+        program_running = "PLAYING" in self._status.program_state.upper()
+        correct_program = "BIBAZU" in self._status.loaded_program.upper()
+        handshake_ready = self._status.command_state_code in {1, 3, -1}
+        safe_mode = self._status.safety_mode.upper() in {"NORMAL", "REDUCED"}
+        can_request = (
+            self._status.command_channel_connected
+            and self._status.rtde_connected
+            and self._status.robot_mode.upper() == "RUNNING"
+            and program_running
+            and correct_program
+            and handshake_ready
+            and safe_mode
+            and not self._status.command_pending
+        )
+        self.pose_selector.setEnabled(can_request)
+        self.motion_consent.setEnabled(can_request)
+        self.move_button.setEnabled(can_request and self.motion_consent.isChecked())
+
+    def _request_pose(self) -> None:
+        if not self.move_button.isEnabled():
+            return
+        pose = int(self.pose_selector.currentData())
+        self.motion_consent.setChecked(False)
+        self.pose_requested.emit(pose)
 
 
 class LabeledSlider(QWidget):
