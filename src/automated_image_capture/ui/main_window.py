@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -19,6 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from automated_image_capture.acquisition import AcquisitionController, build_capture_points
 from automated_image_capture.hardware import CameraAdapter, LightAdapter, RobotAdapter
 from automated_image_capture.models import (
     CameraFrame,
@@ -29,6 +31,8 @@ from automated_image_capture.models import (
 )
 from automated_image_capture.settings import SettingsStore
 from automated_image_capture.ui.widgets import (
+    AcquisitionCard,
+    AcquisitionDialog,
     DeviceCard,
     LightControlCard,
     RobotPoseControlCard,
@@ -48,7 +52,9 @@ class MainWindow(QMainWindow):
         self._logger = logging.getLogger("ui")
         self.settings_store = settings_store or SettingsStore()
         self.config = self.settings_store.load()
+        self.acquisition_config = self.settings_store.load_acquisition()
         self._last_image: QImage | None = None
+        self._camera_status_data = CameraStatus()
         self._closing = False
         self.camera = CameraAdapter(self.config, self)
         self.robot = RobotAdapter(self.config, self)
@@ -65,6 +71,13 @@ class MainWindow(QMainWindow):
             display_name="Neewer-Licht 2",
             address_attribute="light_2_address",
             excluded_addresses=lambda: {self.config.light_address},
+        )
+        self.acquisition = AcquisitionController(
+            self.camera,
+            self.robot,
+            self.light,
+            self.light_2,
+            self,
         )
 
         self._build_ui()
@@ -98,10 +111,12 @@ class MainWindow(QMainWindow):
         self.robot_card = RobotPoseControlCard("Universal Robots UR16e")
         self.light_card = LightControlCard("Neewer RGB660 Pro II · Licht 1")
         self.light_2_card = LightControlCard("Neewer RGB660 Pro II · Licht 2")
+        self.acquisition_card = AcquisitionCard()
         self.camera_card.action_requested.connect(lambda: self._toggle(self.camera))
         self.robot_card.action_requested.connect(lambda: self._toggle(self.robot))
         self.light_card.action_requested.connect(lambda: self._toggle(self.light))
         self.light_2_card.action_requested.connect(lambda: self._toggle(self.light_2))
+        cards_layout.addWidget(self.acquisition_card)
         cards_layout.addWidget(self.camera_card)
         cards_layout.addWidget(self.robot_card)
         cards_layout.addWidget(self.light_card)
@@ -113,6 +128,7 @@ class MainWindow(QMainWindow):
         self.light_hue = self.light_card.hue
         self.light_saturation = self.light_card.saturation
         self.light_command_timer = self.light_card.command_timer
+        self.acquisition_card.set_settings(self.acquisition_config)
         cards_layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -149,9 +165,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.event_log)
 
         self.setCentralWidget(central)
-        self.statusBar().showMessage(
-            f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}"
-        )
+        self.statusBar().showMessage(f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}")
 
     def _wire_adapters(self) -> None:
         for adapter, card in (
@@ -180,6 +194,16 @@ class MainWindow(QMainWindow):
             card.power_requested.connect(adapter.set_power)
             card.cct_requested.connect(adapter.set_cct)
             card.hsi_requested.connect(adapter.set_hsi)
+        self.acquisition_card.configure_requested.connect(self.open_acquisition_settings)
+        self.acquisition_card.start_requested.connect(self.start_acquisition)
+        self.acquisition_card.stop_requested.connect(self.acquisition.stop)
+        self.acquisition.running_changed.connect(self.acquisition_card.set_running)
+        self.acquisition.running_changed.connect(self._acquisition_running)
+        self.acquisition.progress_changed.connect(self.acquisition_card.set_progress)
+        self.acquisition.status_changed.connect(self._acquisition_status)
+        self.acquisition.error.connect(
+            lambda message: self._show_error("Automatische Aufnahme", message)
+        )
 
     def _toggle(self, adapter: CameraAdapter | RobotAdapter | LightAdapter) -> None:
         if adapter.state is ConnectionState.DISCONNECTED:
@@ -194,12 +218,14 @@ class MainWindow(QMainWindow):
         self.light_2.connect()
 
     def disconnect_all(self) -> None:
+        self.acquisition.stop()
         self.camera.disconnect()
         self.robot.disconnect()
         self.light.disconnect()
         self.light_2.disconnect()
 
     def _camera_status(self, status: CameraStatus) -> None:
+        self._camera_status_data = status
         fps = "–" if status.camera_fps is None else f"{status.camera_fps:.1f}"
         self.camera_card.details.setText(
             f"Modell: {status.model}\n"
@@ -207,6 +233,9 @@ class MainWindow(QMainWindow):
             f"IP: {status.ip_address}\n"
             f"Bild: {status.width} × {status.height} · {status.pixel_format}\n"
             f"Kamera/Vorschau: {fps} / {status.preview_fps:.1f} FPS"
+            f"\nBelichtung: "
+            f"{'–' if status.exposure_time_us is None else f'{status.exposure_time_us:.0f} µs'}"
+            f" · Auto: {status.exposure_auto}"
         )
         if (
             status.serial_number not in ("", "–")
@@ -246,8 +275,10 @@ class MainWindow(QMainWindow):
     def _robot_status(self, status: RobotStatus) -> None:
         self.robot_card.set_status(status)
         scaling = "–" if status.speed_scaling is None else f"{status.speed_scaling * 100:.0f} %"
-        joints = "–" if not status.joint_positions else ", ".join(
-            f"{value:.3f}" for value in status.joint_positions
+        joints = (
+            "–"
+            if not status.joint_positions
+            else ", ".join(f"{value:.3f}" for value in status.joint_positions)
         )
         tcp = "–" if not status.tcp_pose else ", ".join(f"{value:.4f}" for value in status.tcp_pose)
         self.robot_card.details.setText(
@@ -300,10 +331,51 @@ class MainWindow(QMainWindow):
         self.robot.config = self.config
         self.light.config = self.config
         self.light_2.config = self.config
-        self.statusBar().showMessage(
-            f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}"
-        )
+        self.statusBar().showMessage(f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}")
         self._append_event("Einstellungen gespeichert; sie gelten ab der nächsten Verbindung.")
+
+    def open_acquisition_settings(self) -> None:
+        if self.acquisition.running:
+            return
+        dialog = AcquisitionDialog(
+            self.acquisition_config,
+            self._camera_status_data,
+            self,
+        )
+        if dialog.exec() != AcquisitionDialog.DialogCode.Accepted:
+            return
+        if dialog.result_config is None:
+            return
+        self.acquisition_config = dialog.result_config
+        self.settings_store.save_acquisition(self.acquisition_config)
+        self.acquisition_card.set_settings(self.acquisition_config)
+        self._append_event("Einstellungen für die automatische Aufnahme gespeichert.")
+
+    def start_acquisition(self) -> None:
+        count = len(build_capture_points(self.acquisition_config))
+        answer = QMessageBox.question(
+            self,
+            "Automatische Roboterbewegung starten",
+            f"Die Sitzung umfasst {count} Aufnahmen und verfährt den UR automatisch.\n\n"
+            "Ist der Arbeitsraum frei und darf die Sequenz gestartet werden?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.acquisition.start(self.acquisition_config)
+
+    def _acquisition_status(self, message: str) -> None:
+        self.acquisition_card.status.setText(message)
+        self._append_event(f"Aufnahme: {message}")
+
+    def _acquisition_running(self, running: bool) -> None:
+        for card in (
+            self.camera_card,
+            self.robot_card,
+            self.light_card,
+            self.light_2_card,
+        ):
+            card.setEnabled(not running)
 
     def _show_error(self, device: str, message: str) -> None:
         self.statusBar().showMessage(f"{device}: {message}", 10000)
@@ -320,11 +392,13 @@ class MainWindow(QMainWindow):
         self._closing = True
         self.light_card.command_timer.stop()
         self.light_2_card.command_timer.stop()
+        self.acquisition.stop()
         self.camera.disconnect()
         self.robot.disconnect()
         event.accept()
 
     async def shutdown_async(self) -> None:
+        self.acquisition.close()
         self.camera.disconnect()
         self.robot.disconnect()
         await self.light.shutdown()

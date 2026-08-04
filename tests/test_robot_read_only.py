@@ -39,7 +39,23 @@ def test_robot_module_has_no_control_interface() -> None:
 
 
 def test_pose_channel_is_limited_to_whitelist_and_external_registers() -> None:
-    assert ALLOWED_POSES == (155, 160, 170, 180, 190, 200, 210)
+    assert ALLOWED_POSES == (
+        155,
+        160,
+        170,
+        180,
+        190,
+        200,
+        210,
+        1155,
+        1170,
+        1185,
+        1200,
+        2155,
+        2170,
+        2185,
+        2200,
+    )
     assert POSE_INPUT_REGISTER == 42
     assert SEQUENCE_INPUT_REGISTER == 43
     assert CURRENT_POSE_OUTPUT_REGISTER == 41

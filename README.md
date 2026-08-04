@@ -10,8 +10,9 @@ YOLO-Trainingsbildern. Die Anwendung verbindet:
 
 Die aktuelle Version zeigt das Kamera-Livebild und Gerätestatus an und erlaubt die
 unabhängige manuelle Steuerung beider Lichtpanels. Sie kann außerdem eine von sieben fest im
-UR-Programm freigegebenen Ansichten anfordern. Automatische Aufnahmesequenzen, Bildspeicherung und
-Annotation sind noch nicht enthalten.
+UR-Programm freigegebenen Ansichten anfordern. Automatische Aufnahmesequenzen mit getrennten
+Panelhelligkeiten, optionaler Belichtungsvariation und Bild-/YAML-Speicherung sind enthalten.
+Automatische Annotation ist noch nicht enthalten.
 
 ## Voraussetzungen
 
@@ -54,6 +55,26 @@ Kamera- und Lichtauswahl wird über `QSettings` im Windows-Benutzerprofil gespei
 6. Für einen Pose-Auftrag das vorbereitete `BiBaZu`-Programm manuell starten, eine Ansicht
    auswählen und die einmalige Bewegungsfreigabe bestätigen.
 7. Die Lichter erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
+
+## Automatische Aufnahme
+
+1. `BiBaZu_GUI.urp` am Teach Pendant laden und manuell starten.
+2. Kamera, UR und beide Panels in der GUI verbinden.
+3. Unter **Aufnahme konfigurieren** Speicherort, UR-Start-/Endpose sowie Start, Ende und
+   Schrittweite beider Panelhelligkeiten festlegen.
+4. Optional die Belichtungsvariation aktivieren, wenn die verbundene Kamera eine manuell
+   beschreibbare `ExposureTime` meldet.
+5. **Aufnahme starten** wählen und die Freigabe des Arbeitsraums bestätigen.
+
+Die Reihenfolge ist Pose → Panel 2 → Panel 1 → Belichtung. Panel 1 läuft damit vollständig
+durch, bevor Panel 2 erhöht wird; erst nach sämtlichen Lichtkombinationen wird der UR verfahren.
+Jede Sitzung erhält einen eigenen Ordner `capture_YYYYMMDD_HHMMSS`. Zu jeder verlustfreien
+PNG-Datei wird eine gleichnamige YAML-Datei mit Kamera-, Roboter-, Licht- und Sequenzdaten
+gespeichert. Eine optionale Belichtungsvariation wird beim Abschluss oder Stoppen auf den Wert
+vom Kamera-Verbindungsaufbau zurückgesetzt.
+
+**Aufnahme stoppen** verhindert weitere Aufträge und Bilder. Eine bereits begonnene Bewegung
+wird aus Sicherheitsgründen nicht durch einen externen Stop-Befehl unterbrochen.
 
 Die beiden BLE-Adressen werden getrennt gespeichert, sodass „Alle verbinden“ nicht beide
 Adapter demselben Panel zuordnet. Die Lichtwerte sind als „bestätigter letzter Befehl“

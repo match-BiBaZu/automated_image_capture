@@ -49,9 +49,7 @@ class SettingsStore:
         return AppSettings(
             camera_ip=str(self._settings.value("camera/ip", defaults.camera_ip)),
             robot_ip=str(self._settings.value("robot/ip", defaults.robot_ip)),
-            camera_cti_path=str(
-                self._settings.value("camera/cti_path", defaults.camera_cti_path)
-            ),
+            camera_cti_path=str(self._settings.value("camera/cti_path", defaults.camera_cti_path)),
             camera_serial=str(self._settings.value("camera/serial", "")),
             light_address=str(self._settings.value("light/address", "")),
             light_name=str(self._settings.value("light/name", "")),
@@ -77,4 +75,84 @@ class SettingsStore:
         self._settings.setValue("light_2/name", config.light_2_name)
         self._settings.setValue("camera/preview_max_fps", config.preview_max_fps)
         self._settings.setValue("connections/auto_reconnect", config.auto_reconnect)
+        self._settings.sync()
+
+    def load_acquisition(self):
+        from automated_image_capture.acquisition import AcquisitionSettings
+
+        defaults = AcquisitionSettings(
+            output_directory=Path.home() / "Pictures" / "AutomatedImageCapture"
+        )
+        return AcquisitionSettings(
+            output_directory=Path(
+                str(
+                    self._settings.value(
+                        "acquisition/output_directory",
+                        str(defaults.output_directory),
+                    )
+                )
+            ),
+            pose_start=int(self._settings.value("acquisition/pose_start", defaults.pose_start)),
+            pose_end=int(self._settings.value("acquisition/pose_end", defaults.pose_end)),
+            light_1_start=int(
+                self._settings.value("acquisition/light_1_start", defaults.light_1_start)
+            ),
+            light_1_end=int(self._settings.value("acquisition/light_1_end", defaults.light_1_end)),
+            light_1_step=int(
+                self._settings.value("acquisition/light_1_step", defaults.light_1_step)
+            ),
+            light_2_start=int(
+                self._settings.value("acquisition/light_2_start", defaults.light_2_start)
+            ),
+            light_2_end=int(self._settings.value("acquisition/light_2_end", defaults.light_2_end)),
+            light_2_step=int(
+                self._settings.value("acquisition/light_2_step", defaults.light_2_step)
+            ),
+            exposure_enabled=self._settings.value(
+                "acquisition/exposure_enabled", defaults.exposure_enabled, type=bool
+            ),
+            exposure_start_us=int(
+                self._settings.value("acquisition/exposure_start_us", defaults.exposure_start_us)
+            ),
+            exposure_end_us=int(
+                self._settings.value("acquisition/exposure_end_us", defaults.exposure_end_us)
+            ),
+            exposure_step_us=int(
+                self._settings.value("acquisition/exposure_step_us", defaults.exposure_step_us)
+            ),
+            light_settle_ms=int(
+                self._settings.value("acquisition/light_settle_ms", defaults.light_settle_ms)
+            ),
+            robot_settle_ms=int(
+                self._settings.value("acquisition/robot_settle_ms", defaults.robot_settle_ms)
+            ),
+            camera_settle_ms=int(
+                self._settings.value("acquisition/camera_settle_ms", defaults.camera_settle_ms)
+            ),
+        ).validated()
+
+    def save_acquisition(self, config) -> None:
+        config = config.validated()
+        for field_name in (
+            "output_directory",
+            "pose_start",
+            "pose_end",
+            "light_1_start",
+            "light_1_end",
+            "light_1_step",
+            "light_2_start",
+            "light_2_end",
+            "light_2_step",
+            "exposure_enabled",
+            "exposure_start_us",
+            "exposure_end_us",
+            "exposure_step_us",
+            "light_settle_ms",
+            "robot_settle_ms",
+            "camera_settle_ms",
+        ):
+            value = getattr(config, field_name)
+            if field_name == "output_directory":
+                value = str(value)
+            self._settings.setValue(f"acquisition/{field_name}", value)
         self._settings.sync()

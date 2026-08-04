@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from PyQt6.QtCore import QSettings
 
+from automated_image_capture.acquisition import AcquisitionSettings
 from automated_image_capture.settings import AppSettings, SettingsStore
 
 
@@ -37,3 +38,27 @@ def test_invalid_ip_is_rejected(field: str) -> None:
 def test_invalid_preview_rate_is_rejected() -> None:
     with pytest.raises(ValueError, match="Bildrate"):
         AppSettings(preview_max_fps=0).validated()
+
+
+def test_acquisition_settings_round_trip(tmp_path) -> None:
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    store = SettingsStore(backend)
+    expected = AcquisitionSettings(
+        output_directory=tmp_path / "dataset",
+        pose_start=160,
+        pose_end=200,
+        light_1_start=10,
+        light_1_end=80,
+        light_1_step=5,
+        light_2_start=20,
+        light_2_end=90,
+        light_2_step=10,
+        exposure_enabled=True,
+        exposure_start_us=2000,
+        exposure_end_us=8000,
+        exposure_step_us=2000,
+    )
+
+    store.save_acquisition(expected)
+
+    assert store.load_acquisition() == expected

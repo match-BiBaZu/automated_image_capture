@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -22,6 +23,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from automated_image_capture.acquisition import (
+    AcquisitionSettings,
+    build_capture_points,
+)
+from automated_image_capture.hardware.robot import ALLOWED_POSES
 from automated_image_capture.models import ConnectionState, LightStatus, RobotStatus
 from automated_image_capture.settings import AppSettings
 
@@ -89,8 +95,8 @@ class RobotPoseControlCard(DeviceCard):
         row = QHBoxLayout()
         row.addWidget(QLabel("Freigegebene Ansicht"))
         self.pose_selector = QComboBox()
-        for pose in (155, 160, 170, 180, 190, 200, 210):
-            self.pose_selector.addItem(f"{pose}°", pose)
+        for pose in ALLOWED_POSES:
+            self.pose_selector.addItem(str(pose), pose)
         row.addWidget(self.pose_selector)
         self.content_layout.addLayout(row)
 
@@ -111,7 +117,7 @@ class RobotPoseControlCard(DeviceCard):
 
     def set_status(self, status: RobotStatus) -> None:
         self._status = status
-        pose = "–" if status.acknowledged_pose is None else f"{status.acknowledged_pose}°"
+        pose = "–" if status.acknowledged_pose is None else str(status.acknowledged_pose)
         sequence = (
             "–" if status.acknowledged_sequence is None else str(status.acknowledged_sequence)
         )
@@ -252,9 +258,7 @@ class LightControlCard(DeviceCard):
 
     def set_status(self, status: LightStatus) -> None:
         confirmed = (
-            "bestätigter letzter Befehl"
-            if status.values_are_confirmed_commands
-            else "kein Istwert"
+            "bestätigter letzter Befehl" if status.values_are_confirmed_commands else "kein Istwert"
         )
         rssi = "–" if status.rssi is None else f"{status.rssi} dBm"
         power = "–" if status.power is None else ("Ein" if status.power else "Aus")
@@ -283,9 +287,7 @@ class LightControlCard(DeviceCard):
         self._update_mode_visibility(status.mode)
 
     def _power_toggled(self, enabled: bool) -> None:
-        self.power_button.setText(
-            "Licht ausschalten" if enabled else "Licht einschalten"
-        )
+        self.power_button.setText("Licht ausschalten" if enabled else "Licht einschalten")
         if not self._updating:
             self.power_requested.emit(enabled)
 
@@ -311,6 +313,295 @@ class LightControlCard(DeviceCard):
                 self.saturation.value(),
                 brightness,
             )
+
+
+class AcquisitionCard(QGroupBox):
+    configure_requested = pyqtSignal()
+    start_requested = pyqtSignal()
+    stop_requested = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("Automatisierte Bildaufnahme", parent)
+        layout = QVBoxLayout(self)
+        self.summary = QLabel("Noch keine Aufnahmeeinstellungen geladen.")
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+
+        buttons = QHBoxLayout()
+        self.configure_button = QPushButton("Aufnahme konfigurieren …")
+        self.start_button = QPushButton("Aufnahme starten")
+        self.stop_button = QPushButton("Aufnahme stoppen")
+        self.stop_button.setEnabled(False)
+        self.configure_button.clicked.connect(self.configure_requested.emit)
+        self.start_button.clicked.connect(self.start_requested.emit)
+        self.stop_button.clicked.connect(self.stop_requested.emit)
+        buttons.addWidget(self.configure_button)
+        buttons.addWidget(self.start_button)
+        buttons.addWidget(self.stop_button)
+        layout.addLayout(buttons)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+        self.status = QLabel("Bereit.")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+    def set_settings(self, settings: AcquisitionSettings) -> None:
+        count = len(build_capture_points(settings))
+        exposure = (
+            f" · Belichtung {settings.exposure_start_us}–{settings.exposure_end_us} µs"
+            if settings.exposure_enabled
+            else " · Belichtung unverändert"
+        )
+        self.summary.setText(
+            f"UR-Pose {settings.pose_start} bis {settings.pose_end} · "
+            f"Panel 1 {settings.light_1_start}–{settings.light_1_end} % / "
+            f"Panel 2 {settings.light_2_start}–{settings.light_2_end} %"
+            f"{exposure}\n{count} Bilder · Ziel: {settings.output_directory}"
+        )
+
+    def set_running(self, running: bool) -> None:
+        self.configure_button.setEnabled(not running)
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+
+    def set_progress(self, current: int, total: int) -> None:
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(current)
+        self.progress.setFormat(f"{current} / {total} Bilder")
+
+
+class AcquisitionDialog(QDialog):
+    def __init__(
+        self,
+        config: AcquisitionSettings,
+        camera_status: object | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Automatisierte Bildaufnahme konfigurieren")
+        self.setMinimumWidth(700)
+        self.result_config: AcquisitionSettings | None = None
+        layout = QVBoxLayout(self)
+
+        output_form = QFormLayout()
+        self.output_directory = QLineEdit(str(config.output_directory))
+        browse = QPushButton("Durchsuchen …")
+        browse.clicked.connect(self._browse_output)
+        output_row = QWidget()
+        output_layout = QHBoxLayout(output_row)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.addWidget(self.output_directory, 1)
+        output_layout.addWidget(browse)
+        output_form.addRow("Speicherort", output_row)
+        layout.addLayout(output_form)
+
+        ranges = QGroupBox("Variationen")
+        ranges_form = QFormLayout(ranges)
+        self.pose_start = self._pose_combo(config.pose_start)
+        self.pose_end = self._pose_combo(config.pose_end)
+        ranges_form.addRow("UR Startpose", self.pose_start)
+        ranges_form.addRow("UR Endpose", self.pose_end)
+
+        self.light_1_start, self.light_1_end, self.light_1_step = self._range_row(
+            0, 100, config.light_1_start, config.light_1_end, config.light_1_step, "%"
+        )
+        ranges_form.addRow(
+            "Panel 1 Start / Ende / Schritt",
+            self._row_widget(self.light_1_start, self.light_1_end, self.light_1_step),
+        )
+        self.light_2_start, self.light_2_end, self.light_2_step = self._range_row(
+            0, 100, config.light_2_start, config.light_2_end, config.light_2_step, "%"
+        )
+        ranges_form.addRow(
+            "Panel 2 Start / Ende / Schritt",
+            self._row_widget(self.light_2_start, self.light_2_end, self.light_2_step),
+        )
+
+        self.exposure_enabled = QCheckBox("Belichtungszeit zusätzlich variieren")
+        self.exposure_enabled.setChecked(config.exposure_enabled)
+        exposure_writable = bool(getattr(camera_status, "exposure_writable", False))
+        self.exposure_enabled.setEnabled(exposure_writable)
+        self.exposure_start, self.exposure_end, self.exposure_step = self._range_row(
+            1,
+            10_000_000,
+            config.exposure_start_us,
+            config.exposure_end_us,
+            config.exposure_step_us,
+            " µs",
+        )
+        exposure_row = self._row_widget(
+            self.exposure_start,
+            self.exposure_end,
+            self.exposure_step,
+        )
+        ranges_form.addRow(self.exposure_enabled)
+        ranges_form.addRow("Belichtung Start / Ende / Schritt", exposure_row)
+        if exposure_writable:
+            minimum = getattr(camera_status, "exposure_min_us", None)
+            maximum = getattr(camera_status, "exposure_max_us", None)
+            current = getattr(camera_status, "exposure_time_us", None)
+            range_text = (
+                f"{minimum:.0f}–{maximum:.0f} µs"
+                if minimum is not None and maximum is not None
+                else "Bereich unbekannt"
+            )
+            current_text = "–" if current is None else f"{current:.0f} µs"
+            ranges_form.addRow(
+                "Kamerabereich",
+                QLabel(f"{range_text} · aktuell {current_text}"),
+            )
+        else:
+            ranges_form.addRow(
+                "Kamerabelichtung",
+                QLabel("Nicht verbunden, ExposureAuto aktiv oder nicht beschreibbar."),
+            )
+        self.exposure_enabled.toggled.connect(self._update_exposure_controls)
+        layout.addWidget(ranges)
+
+        timing = QGroupBox("Stabilisierungszeiten")
+        timing_form = QFormLayout(timing)
+        self.light_settle = self._spin(0, 10_000, config.light_settle_ms, " ms")
+        self.robot_settle = self._spin(0, 10_000, config.robot_settle_ms, " ms")
+        self.camera_settle = self._spin(0, 10_000, config.camera_settle_ms, " ms")
+        timing_form.addRow("Nach Lichtänderung", self.light_settle)
+        timing_form.addRow("Nach Roboterfahrt", self.robot_settle)
+        timing_form.addRow("Nach Belichtungsänderung", self.camera_settle)
+        layout.addWidget(timing)
+
+        self.estimate = QLabel()
+        self.estimate.setStyleSheet("font-weight:600;")
+        layout.addWidget(self.estimate)
+        for control in (
+            self.pose_start,
+            self.pose_end,
+            self.light_1_start,
+            self.light_1_end,
+            self.light_1_step,
+            self.light_2_start,
+            self.light_2_end,
+            self.light_2_step,
+            self.exposure_start,
+            self.exposure_end,
+            self.exposure_step,
+        ):
+            signal = getattr(control, "valueChanged", None) or control.currentIndexChanged
+            signal.connect(self._update_estimate)
+        self.exposure_enabled.toggled.connect(self._update_estimate)
+        self._update_exposure_controls()
+        self._update_estimate()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _spin(minimum: int, maximum: int, value: int, suffix: str = "") -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        spin.setSuffix(suffix)
+        return spin
+
+    @classmethod
+    def _range_row(
+        cls,
+        minimum: int,
+        maximum: int,
+        start: int,
+        end: int,
+        step: int,
+        suffix: str,
+    ) -> tuple[QSpinBox, QSpinBox, QSpinBox]:
+        return (
+            cls._spin(minimum, maximum, start, suffix),
+            cls._spin(minimum, maximum, end, suffix),
+            cls._spin(1, maximum, step, suffix),
+        )
+
+    @staticmethod
+    def _row_widget(*widgets: QWidget) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        for widget in widgets:
+            row_layout.addWidget(widget)
+        return row
+
+    @staticmethod
+    def _pose_combo(value: int) -> QComboBox:
+        combo = QComboBox()
+        for pose in ALLOWED_POSES:
+            combo.addItem(str(pose), pose)
+        combo.setCurrentIndex(max(0, combo.findData(value)))
+        return combo
+
+    def _browse_output(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Speicherort für Aufnahmen wählen",
+            self.output_directory.text(),
+        )
+        if directory:
+            self.output_directory.setText(directory)
+
+    def _update_exposure_controls(self) -> None:
+        enabled = self.exposure_enabled.isChecked() and self.exposure_enabled.isEnabled()
+        for control in (self.exposure_start, self.exposure_end, self.exposure_step):
+            control.setEnabled(enabled)
+
+    def _current_config(self) -> AcquisitionSettings:
+        return AcquisitionSettings(
+            output_directory=Path(self.output_directory.text().strip()),
+            pose_start=int(self.pose_start.currentData()),
+            pose_end=int(self.pose_end.currentData()),
+            light_1_start=self.light_1_start.value(),
+            light_1_end=self.light_1_end.value(),
+            light_1_step=self.light_1_step.value(),
+            light_2_start=self.light_2_start.value(),
+            light_2_end=self.light_2_end.value(),
+            light_2_step=self.light_2_step.value(),
+            exposure_enabled=self.exposure_enabled.isChecked(),
+            exposure_start_us=self.exposure_start.value(),
+            exposure_end_us=self.exposure_end.value(),
+            exposure_step_us=self.exposure_step.value(),
+            light_settle_ms=self.light_settle.value(),
+            robot_settle_ms=self.robot_settle.value(),
+            camera_settle_ms=self.camera_settle.value(),
+        )
+
+    def _update_estimate(self, *_: object) -> None:
+        try:
+            count = len(build_capture_points(self._current_config()))
+            self.estimate.setText(f"Geplante Aufnahmen: {count}")
+        except ValueError as exc:
+            self.estimate.setText(str(exc))
+
+    def _validate_and_accept(self) -> None:
+        if not self.output_directory.text().strip():
+            QMessageBox.warning(
+                self,
+                "Ungültige Aufnahmeeinstellung",
+                "Bitte einen Speicherort auswählen.",
+            )
+            return
+        try:
+            config = self._current_config().validated()
+            count = len(build_capture_points(config))
+            if count > 100_000:
+                raise ValueError("Mehr als 100.000 Aufnahmen sind in einer Sitzung nicht erlaubt.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ungültige Aufnahmeeinstellung", str(exc))
+            return
+        self.result_config = config
+        self.accept()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)

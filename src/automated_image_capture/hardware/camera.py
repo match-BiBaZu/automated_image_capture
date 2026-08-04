@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import queue
 import re
 import threading
 import time
@@ -80,6 +81,34 @@ def _node_value(node_map: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def _find_node(node_map: Any, *names: str) -> Any:
+    for name in names:
+        try:
+            return getattr(node_map, name)
+        except Exception:
+            continue
+    return None
+
+
+def _node_number(node: Any, attribute: str) -> float | None:
+    try:
+        return float(getattr(node, attribute))
+    except Exception:
+        return None
+
+
+def _node_writable(node: Any) -> bool:
+    if node is None:
+        return False
+    try:
+        from genicam.genapi import is_writable
+
+        return bool(is_writable(node))
+    except Exception:
+        access_mode = str(getattr(node, "access_mode", "")).upper()
+        return access_mode in {"RW", "WO", "4"}
+
+
 def _format_camera_ip(value: Any, fallback: str) -> str:
     if isinstance(value, int):
         try:
@@ -110,11 +139,20 @@ class CameraWorker(QObject):
     error = pyqtSignal(str)
     event_message = pyqtSignal(str)
     finished = pyqtSignal()
+    exposure_applied = pyqtSignal(float)
+    exposure_failed = pyqtSignal(str)
 
     def __init__(self, config: AppSettings) -> None:
         super().__init__()
         self._config = config
         self._stop = threading.Event()
+        self._exposure_commands: queue.Queue[float | None] = queue.Queue()
+
+    def enqueue_exposure(self, exposure_time_us: float) -> None:
+        self._exposure_commands.put(float(exposure_time_us))
+
+    def enqueue_exposure_restore(self) -> None:
+        self._exposure_commands.put(None)
 
     def stop(self) -> None:
         self._stop.set()
@@ -141,6 +179,8 @@ class CameraWorker(QObject):
     def run(self) -> None:
         harvester = None
         acquirer = None
+        exposure_node: Any = None
+        original_exposure: float | None = None
         try:
             self.state_changed.emit(ConnectionState.DISCOVERING)
             self.event_message.emit("Suche über den Baumer GenTL-Producer …")
@@ -167,6 +207,9 @@ class CameraWorker(QObject):
             )
             acquirer = harvester.create(selected)
             node_map = acquirer.remote_device.node_map
+            exposure_node = _find_node(node_map, "ExposureTime", "ExposureTimeAbs")
+            original_exposure = _node_number(exposure_node, "value")
+            exposure_auto = str(_node_value(node_map, "ExposureAuto", "–"))
             width = int(_node_value(node_map, "Width", 0))
             height = int(_node_value(node_map, "Height", 0))
             pixel_format = str(_node_value(node_map, "PixelFormat", "Unbekannt"))
@@ -187,6 +230,17 @@ class CameraWorker(QObject):
                 height=height,
                 pixel_format=pixel_format,
                 camera_fps=camera_fps,
+                exposure_time_us=original_exposure,
+                exposure_min_us=_node_number(exposure_node, "min"),
+                exposure_max_us=_node_number(exposure_node, "max"),
+                exposure_writable=_node_writable(exposure_node)
+                and exposure_auto.lower() in {"off", "–", "none"},
+                exposure_auto=exposure_auto,
+                gain=(
+                    float(_node_value(node_map, "Gain", 0.0))
+                    if _node_value(node_map, "Gain", None) is not None
+                    else None
+                ),
             )
             self.status_changed.emit(status)
 
@@ -199,6 +253,31 @@ class CameraWorker(QObject):
             preview_frames = 0
 
             while not self._stop.is_set():
+                try:
+                    while True:
+                        requested_exposure = self._exposure_commands.get_nowait()
+                        if exposure_node is None or not status.exposure_writable:
+                            raise RuntimeError(
+                                "Die Belichtungszeit ist an dieser Kamera nicht manuell "
+                                "verstellbar."
+                            )
+                        if requested_exposure is None:
+                            if original_exposure is None:
+                                raise RuntimeError("Ursprüngliche Belichtungszeit ist unbekannt.")
+                            requested_exposure = original_exposure
+                        minimum = status.exposure_min_us or requested_exposure
+                        maximum = status.exposure_max_us or requested_exposure
+                        requested_exposure = max(minimum, min(maximum, requested_exposure))
+                        exposure_node.value = requested_exposure
+                        applied = float(exposure_node.value)
+                        status.exposure_time_us = applied
+                        self.status_changed.emit(status)
+                        self.exposure_applied.emit(applied)
+                except queue.Empty:
+                    pass
+                except Exception as exc:
+                    self.exposure_failed.emit(str(exc) or type(exc).__name__)
+
                 try:
                     with acquirer.fetch(timeout=0.5) as buffer:
                         component = buffer.payload.components[0]
@@ -231,6 +310,11 @@ class CameraWorker(QObject):
             self.error.emit(camera_error_message(exc))
         finally:
             if acquirer is not None:
+                if exposure_node is not None and original_exposure is not None:
+                    try:
+                        exposure_node.value = original_exposure
+                    except Exception:
+                        pass
                 try:
                     acquirer.stop()
                 except Exception:
@@ -252,12 +336,14 @@ class CameraWorker(QObject):
 
 class CameraAdapter(DeviceAdapter):
     frame_ready = pyqtSignal(object)
+    exposure_applied = pyqtSignal(float)
 
     def __init__(self, config: AppSettings, parent: QObject | None = None) -> None:
         super().__init__("Kamera", parent)
         self.config = config
         self._thread: QThread | None = None
         self._worker: CameraWorker | None = None
+        self._status = CameraStatus()
 
     def connect(self) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -267,8 +353,10 @@ class CameraAdapter(DeviceAdapter):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.state_changed.connect(self._set_state)
-        self._worker.status_changed.connect(self._forward_status)
+        self._worker.status_changed.connect(self._camera_status)
         self._worker.frame_ready.connect(self._forward_frame)
+        self._worker.exposure_applied.connect(self.exposure_applied)
+        self._worker.exposure_failed.connect(self._emit_error)
         self._worker.error.connect(self._emit_error)
         self._worker.event_message.connect(self._emit_event)
         self._worker.finished.connect(self._thread.quit)
@@ -285,6 +373,28 @@ class CameraAdapter(DeviceAdapter):
     @pyqtSlot(object)
     def _forward_frame(self, frame: object) -> None:
         self.frame_ready.emit(frame)
+
+    @pyqtSlot(object)
+    def _camera_status(self, status: object) -> None:
+        if isinstance(status, CameraStatus):
+            self._status = status
+        self._forward_status(status)
+
+    def set_exposure_time(self, exposure_time_us: float) -> bool:
+        if self._worker is None or self.state is not ConnectionState.CONNECTED:
+            self._emit_error("Belichtungszeit kann nur bei verbundener Kamera geändert werden.")
+            return False
+        if not self._status.exposure_writable:
+            self._emit_error("Die Kamera meldet keine manuell verstellbare Belichtungszeit.")
+            return False
+        self._worker.enqueue_exposure(exposure_time_us)
+        return True
+
+    def restore_exposure(self) -> bool:
+        if self._worker is None or self.state is not ConnectionState.CONNECTED:
+            return False
+        self._worker.enqueue_exposure_restore()
+        return True
 
     def disconnect(self) -> None:
         worker, thread = self._worker, self._thread

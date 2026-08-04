@@ -26,6 +26,12 @@ class CameraStatus:
     pixel_format: str = "–"
     camera_fps: float | None = None
     preview_fps: float = 0.0
+    exposure_time_us: float | None = None
+    exposure_min_us: float | None = None
+    exposure_max_us: float | None = None
+    exposure_writable: bool = False
+    exposure_auto: str = "–"
+    gain: float | None = None
 
 
 @dataclass(slots=True)
