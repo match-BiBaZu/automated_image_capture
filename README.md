@@ -1,0 +1,1 @@
+# automated_image_capture
