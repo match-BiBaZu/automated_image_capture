@@ -9,6 +9,7 @@ import pytest
 from automated_image_capture.labeling import (
     LabelingConfig,
     LabelingError,
+    LabelSource,
     generate_obb_dataset,
     match_captures,
     scan_capture,
@@ -27,7 +28,7 @@ def _write_capture(directory: Path, pose: int, index: int, p1: int, p2: int) -> 
     cv2.fillConvexPoly(foreground, np.rint(cv2.boxPoints(rect)).astype(np.int32), 25)
     name = f"img_{index:06d}_ur{pose}_p1-{p1:03d}_p2-{p2:03d}_auto.png"
     target = directory / name
-    image = foreground if directory.name == "parts" else background
+    image = foreground if directory.name.startswith("parts") else background
     assert cv2.imwrite(str(target), image)
 
 
@@ -59,10 +60,11 @@ def test_generate_yolo_obb_dataset_with_negative_images(tmp_path: Path) -> None:
 
     result = generate_obb_dataset(
         LabelingConfig(
-            foreground,
-            background,
+            (
+                LabelSource("Pose 1", foreground),
+                LabelSource("Leere Rutsche", background, is_empty=True),
+            ),
             output,
-            class_name="Kk1",
             validation_fraction=0.5,
             minimum_difference=20,
             consensus_fraction=0.5,
@@ -73,12 +75,54 @@ def test_generate_yolo_obb_dataset_with_negative_images(tmp_path: Path) -> None:
     assert result.negative_images == 6
     assert result.poses == 2
     assert len(list((output / "images").rglob("*.png"))) == 12
-    labels = list((output / "labels").rglob("Kk1_*.txt"))
-    negative_labels = list((output / "labels").rglob("background_*.txt"))
+    labels = list((output / "labels").rglob("class_*.txt"))
+    negative_labels = list((output / "labels").rglob("empty_*.txt"))
     assert len(labels) == 6
     assert len(negative_labels) == 6
     assert all(len(path.read_text(encoding="ascii").split()) == 9 for path in labels)
     assert all(not path.read_text(encoding="ascii") for path in negative_labels)
     assert "train: images/train" in (output / "data.yaml").read_text(encoding="utf-8")
     assert (output / "label_report.csv").is_file()
-    assert len(list((output / "review").glob("pose_*_obb.jpg"))) == 2
+    assert len(list((output / "review").glob("class_*_ur_*_obb.jpg"))) == 2
+
+
+def test_generate_multiple_pose_classes_and_deduplicate_empty_images(tmp_path: Path) -> None:
+    pose1, background = _make_capture_pair(tmp_path)
+    pose2 = tmp_path / "parts_pose2"
+    pose2.mkdir()
+    for record in scan_capture(pose1).values():
+        _write_capture(
+            pose2,
+            record.key.pose_id,
+            record.sequence_index,
+            record.key.panel_1,
+            record.key.panel_2,
+        )
+    output = tmp_path / "multi_dataset"
+
+    result = generate_obb_dataset(
+        LabelingConfig(
+            (
+                LabelSource("Pose 1", pose1),
+                LabelSource("Pose 2", pose2),
+                LabelSource("Leere Rutsche", background, is_empty=True),
+            ),
+            output,
+            validation_fraction=0.5,
+            minimum_difference=20,
+            consensus_fraction=0.5,
+        )
+    )
+
+    assert result.classes == 2
+    assert result.positive_images == 12
+    assert result.negative_images == 6
+    assert len(list((output / "images").rglob("*.png"))) == 18
+    positive_labels = list((output / "labels").rglob("class_*.txt"))
+    assert {path.read_text(encoding="ascii").split()[0] for path in positive_labels} == {
+        "0",
+        "1",
+    }
+    yaml_text = (output / "data.yaml").read_text(encoding="utf-8")
+    assert '0: "Pose 1"' in yaml_text
+    assert '1: "Pose 2"' in yaml_text

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import numpy as np
 from PyQt6.QtCore import QSettings
 from PyQt6.QtTest import QSignalSpy
 
+from automated_image_capture.inference import InferenceDetection, InferenceFrame
 from automated_image_capture.models import (
     CameraStatus,
     ConnectionState,
@@ -98,6 +100,43 @@ def test_device_failures_do_not_change_other_cards(qtbot, tmp_path) -> None:
     assert window.robot_card.state is ConnectionState.DISCONNECTED
     assert window.light_card.state is ConnectionState.DISCONNECTED
     assert window.light_2_card.state is ConnectionState.DISCONNECTED
+
+
+def test_live_inference_result_updates_preview_and_status(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+    frame = InferenceFrame(
+        image=np.zeros((80, 120, 3), dtype=np.uint8),
+        detections=(
+            InferenceDetection(
+                0,
+                "Pose 1",
+                0.95,
+                ((10, 10), (30, 10), (30, 30), (10, 30)),
+            ),
+        ),
+        inference_ms=24.6,
+        timestamp=0.0,
+    )
+
+    window._inference_frame(frame)
+
+    assert window._last_image is not None
+    assert "1 Objekt" in window.inference_status.text()
+    assert "25 ms" in window.inference_status.text()
+
+
+def test_resume_button_is_only_enabled_for_interrupted_sequence(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+
+    assert not window.acquisition_card.resume_button.isEnabled()
+    window.acquisition_card.set_resume_available(True)
+    assert window.acquisition_card.resume_button.isEnabled()
+    window.acquisition_card.set_running(True)
+    assert not window.acquisition_card.resume_button.isEnabled()
+    window.acquisition_card.set_running(False)
+    assert window.acquisition_card.resume_button.isEnabled()
+    window.acquisition_card.set_resume_available(False)
+    assert not window.acquisition_card.resume_button.isEnabled()
 
 
 def test_robot_pose_requires_running_program_and_one_time_consent(qtbot, tmp_path) -> None:

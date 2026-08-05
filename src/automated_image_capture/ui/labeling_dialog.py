@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -27,6 +28,7 @@ from automated_image_capture.labeling import (
     LabelingCancelled,
     LabelingConfig,
     LabelingResult,
+    LabelSource,
     generate_obb_dataset,
 )
 from automated_image_capture.settings import SettingsStore
@@ -62,6 +64,52 @@ class LabelingWorker(QObject):
             self.completed.emit(result)
 
 
+class LabelSourceRow(QWidget):
+    remove_requested = pyqtSignal(object)
+
+    def __init__(self, source: LabelSource, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.is_empty = source.is_empty
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 2, 0, 2)
+        self.name = QLineEdit(source.name)
+        self.name.setMinimumWidth(120)
+        self.name.setReadOnly(source.is_empty)
+        self.kind = QLabel("Negativ" if source.is_empty else "Klasse")
+        self.kind.setMinimumWidth(65)
+        self.directory = QLineEdit("" if source.directory == Path() else str(source.directory))
+        browse = QPushButton("Ordner …")
+        browse.clicked.connect(self._browse)
+        self.remove_button = QPushButton("Entfernen")
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
+        self.remove_button.setVisible(not source.is_empty)
+        row.addWidget(self.name)
+        row.addWidget(self.kind)
+        row.addWidget(self.directory, 1)
+        row.addWidget(browse)
+        row.addWidget(self.remove_button)
+
+    def set_class_id(self, class_id: int) -> None:
+        if not self.is_empty:
+            self.kind.setText(f"Klasse {class_id}")
+
+    def source(self) -> LabelSource:
+        return LabelSource(
+            self.name.text().strip(),
+            Path(self.directory.text().strip()),
+            self.is_empty,
+        )
+
+    def _browse(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            f"Ordner für {self.name.text().strip() or 'Quelle'} auswählen",
+            self.directory.text(),
+        )
+        if selected:
+            self.directory.setText(selected)
+
+
 class LabelingDialog(QDialog):
     def __init__(
         self,
@@ -86,32 +134,38 @@ class LabelingDialog(QDialog):
 
         layout = QVBoxLayout(self)
         explanation = QLabel(
-            "Das Tool paart jede Bauteilaufnahme mit dem Leerbild derselben Pose und "
-            "Beleuchtung. Aus allen Beleuchtungen einer Pose entsteht eine gemeinsame OBB; "
-            "abweichende Segmentierungen werden im Prüfbericht markiert."
+            "Jede Pose in der Liste wird eine eigene YOLO-Klasse. Das Tool paart ihre "
+            "Aufnahmen mit dem Leerbild derselben UR-Ansicht und Beleuchtung. Aus allen "
+            "Beleuchtungen entsteht je Klasse und UR-Ansicht eine gemeinsame OBB."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
 
-        form = QFormLayout()
-        self.foreground = QLineEdit(str(defaults.foreground_directory))
-        self.background = QLineEdit(str(defaults.background_directory))
-        self.output = QLineEdit(str(output_directory))
-        form.addRow("Bauteil-Aufnahme", self._path_row(self.foreground, self._browse_foreground))
-        form.addRow("Leere Rutsche", self._path_row(self.background, self._browse_background))
-        form.addRow("YOLO-Ausgabe", self._path_row(self.output, self._browse_output))
+        source_header = QHBoxLayout()
+        source_header.addWidget(QLabel("Bildquellen"))
+        source_header.addStretch(1)
+        self.add_pose_button = QPushButton("Pose hinzufügen")
+        self.add_pose_button.clicked.connect(self._add_pose)
+        source_header.addWidget(self.add_pose_button)
+        layout.addLayout(source_header)
 
-        self.class_name = QLineEdit(defaults.class_name)
-        self.class_id = QSpinBox()
-        self.class_id.setRange(0, 9999)
-        self.class_id.setValue(defaults.class_id)
-        class_row = QHBoxLayout()
-        class_row.addWidget(self.class_name, 1)
-        class_row.addWidget(QLabel("ID"))
-        class_row.addWidget(self.class_id)
-        class_widget = QWidget()
-        class_widget.setLayout(class_row)
-        form.addRow("Klasse", class_widget)
+        source_scroll = QScrollArea()
+        source_scroll.setWidgetResizable(True)
+        source_scroll.setMinimumHeight(150)
+        source_scroll.setMaximumHeight(260)
+        self.source_container = QWidget()
+        self.source_layout = QVBoxLayout(self.source_container)
+        self.source_layout.setContentsMargins(4, 4, 4, 4)
+        self.source_rows: list[LabelSourceRow] = []
+        for source in defaults.sources:
+            self._add_source_row(source)
+        self.source_layout.addStretch(1)
+        source_scroll.setWidget(self.source_container)
+        layout.addWidget(source_scroll)
+
+        form = QFormLayout()
+        self.output = QLineEdit(str(output_directory))
+        form.addRow("YOLO-Ausgabe", self._path_row(self.output, self._browse_output))
 
         self.validation = QSpinBox()
         self.validation.setRange(0, 50)
@@ -196,12 +250,6 @@ class LabelingDialog(QDialog):
         row.addWidget(browse)
         return widget
 
-    def _browse_foreground(self) -> None:
-        self._choose_directory(self.foreground, "Bauteil-Aufnahme auswählen")
-
-    def _browse_background(self) -> None:
-        self._choose_directory(self.background, "Leeraufnahme auswählen")
-
     def _browse_output(self) -> None:
         self._choose_directory(self.output, "Leeren YOLO-Ausgabeordner auswählen")
 
@@ -210,13 +258,51 @@ class LabelingDialog(QDialog):
         if selected:
             field.setText(selected)
 
+    def _add_source_row(self, source: LabelSource) -> None:
+        row = LabelSourceRow(source, self.source_container)
+        row.remove_requested.connect(self._remove_source_row)
+        if source.is_empty or not self.source_rows:
+            self.source_rows.append(row)
+            self.source_layout.addWidget(row)
+        else:
+            empty_index = next(
+                (index for index, item in enumerate(self.source_rows) if item.is_empty),
+                len(self.source_rows),
+            )
+            self.source_rows.insert(empty_index, row)
+            self.source_layout.insertWidget(empty_index, row)
+        self._refresh_source_rows()
+
+    def _add_pose(self) -> None:
+        used_names = {row.name.text().strip().casefold() for row in self.source_rows}
+        number = 1
+        while f"pose {number}" in used_names:
+            number += 1
+        self._add_source_row(LabelSource(f"Pose {number}", Path()))
+
+    @pyqtSlot(object)
+    def _remove_source_row(self, row: object) -> None:
+        if not isinstance(row, LabelSourceRow) or row.is_empty:
+            return
+        pose_rows = [item for item in self.source_rows if not item.is_empty]
+        if len(pose_rows) <= 1:
+            QMessageBox.warning(self, "Pose erforderlich", "Mindestens eine Pose muss bleiben.")
+            return
+        self.source_rows.remove(row)
+        self.source_layout.removeWidget(row)
+        row.deleteLater()
+        self._refresh_source_rows()
+
+    def _refresh_source_rows(self) -> None:
+        pose_rows = [row for row in self.source_rows if not row.is_empty]
+        for class_id, row in enumerate(pose_rows):
+            row.set_class_id(class_id)
+            row.remove_button.setEnabled(len(pose_rows) > 1)
+
     def _config(self) -> LabelingConfig:
         return LabelingConfig(
-            foreground_directory=Path(self.foreground.text().strip()),
-            background_directory=Path(self.background.text().strip()),
+            sources=tuple(row.source() for row in self.source_rows),
             output_directory=Path(self.output.text().strip()),
-            class_name=self.class_name.text().strip(),
-            class_id=self.class_id.value(),
             validation_fraction=self.validation.value() / 100.0,
             minimum_difference=self.minimum_difference.value(),
             consensus_fraction=self.consensus.value(),
@@ -227,8 +313,8 @@ class LabelingDialog(QDialog):
     def _start(self) -> None:
         if self._thread is not None:
             return
-        if not self.foreground.text().strip() or not self.background.text().strip():
-            QMessageBox.warning(self, "Pfad fehlt", "Bitte beide Aufnahmeordner auswählen.")
+        if any(not row.directory.text().strip() for row in self.source_rows):
+            QMessageBox.warning(self, "Pfad fehlt", "Bitte für jede Quelle einen Ordner auswählen.")
             return
         if not self.output.text().strip():
             QMessageBox.warning(self, "Pfad fehlt", "Bitte einen Ausgabeordner auswählen.")
@@ -245,6 +331,8 @@ class LabelingDialog(QDialog):
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.open_button.setEnabled(False)
+        self.source_container.setEnabled(False)
+        self.add_pose_button.setEnabled(False)
 
         thread = QThread(self)
         worker = LabelingWorker(config)
@@ -276,11 +364,12 @@ class LabelingDialog(QDialog):
         self._result = result
         self.status.setText(
             f"Fertig: {result.positive_images} positive und {result.negative_images} negative "
-            f"Bilder, {result.poses} Posen, {result.flagged_images} Bilder zur Nachprüfung.\n"
+            f"Bilder, {result.classes} Klassen und {result.poses} UR-Ansichten, "
+            f"{result.flagged_images} Bilder zur Nachprüfung.\n"
             f"Bericht: {result.report_path}"
         )
         self.open_button.setEnabled(True)
-        previews = sorted(result.review_directory.glob("pose_*_obb.jpg"))
+        previews = sorted(result.review_directory.glob("class_*_ur_*_obb.jpg"))
         if previews:
             pixmap = QPixmap(str(previews[0])).scaled(
                 740,
@@ -305,6 +394,8 @@ class LabelingDialog(QDialog):
         self._worker = None
         self.start_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self.source_container.setEnabled(True)
+        self.add_pose_button.setEnabled(True)
 
     def _cancel(self) -> None:
         if self._worker is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from ipaddress import ip_address
 from pathlib import Path
@@ -158,7 +159,7 @@ class SettingsStore:
         self._settings.sync()
 
     def load_labeling(self):
-        from automated_image_capture.labeling import LabelingConfig
+        from automated_image_capture.labeling import LabelingConfig, LabelSource
 
         pictures = Path.home() / "Pictures"
 
@@ -170,77 +171,110 @@ class SettingsStore:
             )
             return captures[0] if captures else root
 
-        defaults = LabelingConfig(
-            foreground_directory=latest_capture(pictures / "Kk1"),
-            background_directory=latest_capture(pictures / "empty_slide"),
-            output_directory=pictures / "Kk1_yolo_obb",
+        default_sources = (
+            LabelSource("Pose 1", latest_capture(pictures / "Kk1")),
+            LabelSource("Pose 2", latest_capture(pictures / "kk1_flipped")),
+            LabelSource(
+                "Leere Rutsche",
+                latest_capture(pictures / "empty_slide"),
+                is_empty=True,
+            ),
         )
+        sources: tuple[LabelSource, ...] = default_sources
+        serialized_sources = str(self._settings.value("labeling/sources_json", "")).strip()
+        if serialized_sources:
+            try:
+                entries = json.loads(serialized_sources)
+                parsed = tuple(
+                    LabelSource(
+                        str(entry["name"]),
+                        Path(str(entry["directory"])),
+                        bool(entry.get("is_empty", False)),
+                    )
+                    for entry in entries
+                )
+                if parsed:
+                    sources = parsed
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                sources = default_sources
+        elif self._settings.contains("labeling/foreground_directory"):
+            # One-time migration from the original two-directory labeling dialog.
+            sources = (
+                LabelSource(
+                    "Pose 1",
+                    Path(str(self._settings.value("labeling/foreground_directory"))),
+                ),
+                default_sources[1],
+                LabelSource(
+                    "Leere Rutsche",
+                    Path(
+                        str(
+                            self._settings.value(
+                                "labeling/background_directory",
+                                str(default_sources[2].directory),
+                            )
+                        )
+                    ),
+                    is_empty=True,
+                ),
+            )
         return LabelingConfig(
-            foreground_directory=Path(
-                str(
-                    self._settings.value(
-                        "labeling/foreground_directory",
-                        str(defaults.foreground_directory),
-                    )
-                )
-            ),
-            background_directory=Path(
-                str(
-                    self._settings.value(
-                        "labeling/background_directory",
-                        str(defaults.background_directory),
-                    )
-                )
-            ),
+            sources=sources,
             output_directory=Path(
                 str(
                     self._settings.value(
                         "labeling/output_directory",
-                        str(defaults.output_directory),
+                        str(pictures / "multi_pose_yolo_obb"),
                     )
                 )
             ),
-            class_name=str(
-                self._settings.value("labeling/class_name", defaults.class_name)
-            ),
-            class_id=int(self._settings.value("labeling/class_id", defaults.class_id)),
             validation_fraction=float(
                 self._settings.value(
                     "labeling/validation_fraction",
-                    defaults.validation_fraction,
+                    0.2,
                 )
             ),
             minimum_difference=int(
                 self._settings.value(
                     "labeling/minimum_difference",
-                    defaults.minimum_difference,
+                    80,
                 )
             ),
             consensus_fraction=float(
                 self._settings.value(
                     "labeling/consensus_fraction",
-                    defaults.consensus_fraction,
+                    0.55,
                 )
             ),
             include_background_negatives=self._settings.value(
                 "labeling/include_background_negatives",
-                defaults.include_background_negatives,
+                True,
                 type=bool,
             ),
             prefer_hardlinks=self._settings.value(
                 "labeling/prefer_hardlinks",
-                defaults.prefer_hardlinks,
+                True,
                 type=bool,
             ),
         )
 
     def save_labeling(self, config) -> None:
+        self._settings.setValue(
+            "labeling/sources_json",
+            json.dumps(
+                [
+                    {
+                        "name": source.name,
+                        "directory": str(source.directory),
+                        "is_empty": source.is_empty,
+                    }
+                    for source in config.sources
+                ],
+                ensure_ascii=False,
+            ),
+        )
         for field_name in (
-            "foreground_directory",
-            "background_directory",
             "output_directory",
-            "class_name",
-            "class_id",
             "validation_fraction",
             "minimum_difference",
             "consensus_fraction",
@@ -282,4 +316,26 @@ class SettingsStore:
             "training/dataset_directory",
             "" if dataset_directory is None else str(dataset_directory),
         )
+        self._settings.sync()
+
+    def load_live_inference(self):
+        from automated_image_capture.inference import LiveInferenceConfig, find_latest_model
+
+        saved_model = str(self._settings.value("inference/model_path", "")).strip()
+        model_path = Path(saved_model) if saved_model else find_latest_model()
+        return LiveInferenceConfig(
+            model_path=model_path,
+            confidence=float(self._settings.value("inference/confidence", 0.25)),
+            image_size=int(self._settings.value("inference/image_size", 640)),
+            max_fps=float(self._settings.value("inference/max_fps", 5.0)),
+            device=str(self._settings.value("inference/device", "0")),
+        ).validated(require_model=False)
+
+    def save_live_inference(self, config) -> None:
+        config = config.validated(require_model=False)
+        self._settings.setValue("inference/model_path", str(config.model_path))
+        self._settings.setValue("inference/confidence", config.confidence)
+        self._settings.setValue("inference/image_size", config.image_size)
+        self._settings.setValue("inference/max_fps", config.max_fps)
+        self._settings.setValue("inference/device", config.device)
         self._settings.sync()

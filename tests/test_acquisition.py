@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtTest import QSignalSpy
 
 from automated_image_capture.acquisition import (
     AcquisitionController,
@@ -151,6 +153,45 @@ class FakeLight(QObject):
         self.status_changed.emit(self.status)
 
 
+def _ready_controller() -> tuple[
+    AcquisitionController,
+    FakeCamera,
+    FakeRobot,
+    FakeLight,
+    FakeLight,
+]:
+    camera = FakeCamera()
+    robot = FakeRobot()
+    light_1 = FakeLight("PANEL-1")
+    light_2 = FakeLight("PANEL-2")
+    controller = AcquisitionController(camera, robot, light_1, light_2)
+    camera.status_changed.emit(CameraStatus(model="TestCam"))
+    robot.status_changed.emit(_robot_status(command_state_code=1))
+    light_1.status_changed.emit(light_1.status)
+    light_2.status_changed.emit(light_2.status)
+    return controller, camera, robot, light_1, light_2
+
+
+def _robot_status(
+    *,
+    command_state_code: int,
+    sequence: int | None = None,
+    acknowledged_pose: int | None = None,
+) -> RobotStatus:
+    return RobotStatus(
+        rtde_connected=True,
+        command_channel_connected=True,
+        robot_mode="RUNNING",
+        safety_mode="NORMAL",
+        program_state="PLAYING",
+        loaded_program="/programs/BiBaZu_GUI.urp",
+        command_state_code=command_state_code,
+        requested_sequence=sequence,
+        acknowledged_sequence=sequence,
+        acknowledged_pose=acknowledged_pose,
+        command_pending=False,
+    )
+
 def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None:
     camera = FakeCamera()
     robot = FakeRobot()
@@ -218,3 +259,200 @@ def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None
     yaml_text = metadata[0].read_text(encoding="utf-8")
     assert "requested_pose_id: 180" in yaml_text
     assert "requested_brightness_percent: 20" in yaml_text
+
+
+def test_interrupted_sequence_resumes_in_same_directory_without_duplicates(
+    qtbot, tmp_path: Path
+) -> None:
+    controller, camera, robot, light_1, light_2 = _ready_controller()
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        pose_start=180,
+        pose_end=180,
+        light_1_start=20,
+        light_1_end=30,
+        light_1_step=10,
+        light_2_start=40,
+        light_2_end=40,
+        light_settle_ms=0,
+        robot_settle_ms=0,
+    )
+
+    assert controller.start(settings)
+    qtbot.waitUntil(lambda: robot.requests == [180], timeout=2000)
+    robot.status_changed.emit(
+        _robot_status(command_state_code=3, sequence=7, acknowledged_pose=180)
+    )
+    qtbot.waitUntil(lambda: controller._phase == "frame", timeout=2000)
+    camera.frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 90, dtype=np.uint8), "RGB8", time.time() + 0.01)
+    )
+    qtbot.waitUntil(lambda: controller._index == 1, timeout=3000)
+    qtbot.waitUntil(lambda: controller._phase == "frame", timeout=2000)
+    session = controller.session_directory
+    controller._fail("simulierter Kameraausfall")
+
+    assert not controller.running
+    assert controller.resume_available
+    assert controller.remaining_count == 1
+    assert session is not None
+    assert json.loads((session / "capture_session.json").read_text(encoding="utf-8"))[
+        "status"
+    ] == "interrupted"
+
+    camera.state = ConnectionState.ERROR
+    assert not controller.resume()
+    assert controller.resume_available
+    camera.state = ConnectionState.CONNECTED
+    assert controller.resume()
+    qtbot.waitUntil(lambda: robot.requests == [180, 180], timeout=2000)
+    robot.status_changed.emit(
+        _robot_status(command_state_code=3, sequence=8, acknowledged_pose=180)
+    )
+    qtbot.waitUntil(lambda: controller._phase == "frame", timeout=2000)
+    camera.frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 120, dtype=np.uint8), "RGB8", time.time() + 0.01)
+    )
+    qtbot.waitUntil(lambda: not controller.running, timeout=5000)
+
+    assert not controller.resume_available
+    assert len(list(session.glob("*.png"))) == 2
+    assert len(list(session.glob("*.yaml"))) == 2
+    manifest = json.loads((session / "capture_session.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "completed"
+    assert manifest["next_index"] == 2
+    controller.close()
+
+
+def test_interrupted_session_is_restored_after_controller_restart(qtbot, tmp_path: Path) -> None:
+    first, _camera, robot, _light_1, _light_2 = _ready_controller()
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        pose_start=180,
+        pose_end=180,
+        light_1_start=20,
+        light_1_end=30,
+        light_1_step=10,
+        light_2_start=40,
+        light_2_end=40,
+    )
+    assert first.start(settings)
+    qtbot.waitUntil(lambda: robot.requests == [180], timeout=2000)
+    session = first.session_directory
+    first._fail("simulierter Neustart")
+    first.close()
+
+    second, _camera2, _robot2, _light3, _light4 = _ready_controller()
+    assert second.restore_interrupted(settings)
+    assert second.resume_available
+    assert second.remaining_count == 2
+    assert second.session_directory == session
+    second.close()
+
+
+def _create_checkpoint(
+    controller: AcquisitionController,
+    settings: AcquisitionSettings,
+    *,
+    complete_first_pair: bool,
+    orphan_first_image: bool = False,
+) -> Path:
+    points = build_capture_points(settings)
+    session = controller.writer.start_session(settings.output_directory)
+    controller._settings = settings
+    controller._points = points
+    controller._index = 0
+    controller._session_directory = session
+    controller._writer_token = controller.writer.session_token
+    image_path, yaml_path = controller.writer.expected_paths(0, points[0])
+    if complete_first_pair or orphan_first_image:
+        image_path.write_bytes(b"test")
+    if complete_first_pair:
+        yaml_path.write_text("test: true\n", encoding="utf-8")
+    controller._write_manifest("interrupted", "Test-Checkpoint")
+    return session
+
+
+def test_restore_reconciles_complete_file_pairs_without_recapturing(qtbot, tmp_path: Path) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        pose_start=180,
+        pose_end=180,
+        light_1_start=20,
+        light_1_end=30,
+        light_1_step=10,
+        light_2_start=40,
+        light_2_end=40,
+    )
+    first, *_ = _ready_controller()
+    session = _create_checkpoint(first, settings, complete_first_pair=True)
+    first.close()
+
+    second, *_ = _ready_controller()
+    assert second.restore_interrupted(settings)
+    assert second.session_directory == session
+    assert second.remaining_count == 1
+    manifest = json.loads((session / "capture_session.json").read_text(encoding="utf-8"))
+    assert manifest["next_index"] == 1
+    second.close()
+
+
+def test_restore_rejects_incomplete_png_yaml_pair(qtbot, tmp_path: Path) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        pose_start=180,
+        pose_end=180,
+        light_1_start=20,
+        light_1_end=30,
+        light_1_step=10,
+        light_2_start=40,
+        light_2_end=40,
+    )
+    first, *_ = _ready_controller()
+    _create_checkpoint(
+        first,
+        settings,
+        complete_first_pair=False,
+        orphan_first_image=True,
+    )
+    first.close()
+
+    second, *_ = _ready_controller()
+    errors = QSignalSpy(second.error)
+    assert not second.restore_interrupted(settings)
+    assert not second.resume_available
+    assert len(errors) == 1
+    assert "Unvollständiges Dateipaar" in errors[0][0]
+    second.close()
+
+
+def test_legacy_interrupted_folder_is_reconstructed_from_complete_prefix(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        pose_start=180,
+        pose_end=180,
+        light_1_start=20,
+        light_1_end=30,
+        light_1_step=10,
+        light_2_start=40,
+        light_2_end=40,
+    )
+    first, *_ = _ready_controller()
+    points = build_capture_points(settings)
+    session = first.writer.start_session(tmp_path)
+    image_path, yaml_path = first.writer.expected_paths(0, points[0])
+    image_path.write_bytes(b"legacy")
+    yaml_path.write_text("legacy: true\n", encoding="utf-8")
+    first.close()
+
+    second, *_ = _ready_controller()
+    assert second.restore_interrupted(settings)
+    assert second.resume_available
+    assert second.remaining_count == 1
+    assert second.session_directory == session
+    manifest = json.loads((session / "capture_session.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "interrupted"
+    assert manifest["next_index"] == 1
+    second.close()

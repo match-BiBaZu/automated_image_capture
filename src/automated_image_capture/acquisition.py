@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -166,13 +166,18 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
 
 
 class DatasetWriter(QObject):
-    saved = pyqtSignal(int, str)
-    failed = pyqtSignal(int, str)
+    saved = pyqtSignal(int, int, str)
+    failed = pyqtSignal(int, int, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dataset-writer")
         self._session_directory: Path | None = None
+        self._session_token = 0
+
+    @property
+    def session_token(self) -> int:
+        return self._session_token
 
     def start_session(self, output_directory: Path) -> Path:
         root = output_directory.expanduser().resolve()
@@ -185,7 +190,31 @@ class DatasetWriter(QObject):
             suffix += 1
         session.mkdir()
         self._session_directory = session
+        self._session_token += 1
         return session
+
+    def attach_session(self, session_directory: Path) -> None:
+        session = session_directory.expanduser().resolve()
+        if not session.is_dir():
+            raise RuntimeError(f"Aufnahmesitzung nicht gefunden: {session}")
+        self._session_directory = session
+        self._session_token += 1
+
+    def expected_paths(self, index: int, point: CapturePoint) -> tuple[Path, Path]:
+        if self._session_directory is None:
+            raise RuntimeError("Keine Aufnahmesitzung gestartet.")
+        exposure = "auto" if point.exposure_time_us is None else f"e{point.exposure_time_us}us"
+        stem = (
+            f"img_{index + 1:06d}_ur{point.pose}_"
+            f"p1-{point.light_1_brightness:03d}_p2-{point.light_2_brightness:03d}_{exposure}"
+        )
+        return (
+            self._session_directory / f"{stem}.png",
+            self._session_directory / f"{stem}.yaml",
+        )
+
+    def flush(self, timeout_seconds: float = 30.0) -> None:
+        self._executor.submit(lambda: None).result(timeout=timeout_seconds)
 
     def submit(
         self,
@@ -196,13 +225,12 @@ class DatasetWriter(QObject):
     ) -> None:
         if self._session_directory is None:
             raise RuntimeError("Keine Aufnahmesitzung gestartet.")
-        exposure = "auto" if point.exposure_time_us is None else f"e{point.exposure_time_us}us"
-        stem = (
-            f"img_{index + 1:06d}_ur{point.pose}_"
-            f"p1-{point.light_1_brightness:03d}_p2-{point.light_2_brightness:03d}_{exposure}"
-        )
-        image_path = self._session_directory / f"{stem}.png"
-        yaml_path = self._session_directory / f"{stem}.yaml"
+        image_path, yaml_path = self.expected_paths(index, point)
+        if image_path.exists() or yaml_path.exists():
+            raise RuntimeError(
+                f"Zieldatei für Aufnahme {index + 1} existiert bereits: {image_path.name}"
+            )
+        token = self._session_token
         metadata = {
             **metadata,
             "image": {**metadata.get("image", {}), "file": image_path.name},
@@ -219,9 +247,9 @@ class DatasetWriter(QObject):
         def done(result: Any) -> None:
             try:
                 result.result()
-                self.saved.emit(index, str(image_path))
+                self.saved.emit(token, index, str(image_path))
             except Exception as exc:
-                self.failed.emit(index, str(exc) or type(exc).__name__)
+                self.failed.emit(token, index, str(exc) or type(exc).__name__)
 
         future.add_done_callback(done)
 
@@ -256,6 +284,7 @@ class DatasetWriter(QObject):
 
 class AcquisitionController(QObject):
     running_changed = pyqtSignal(bool)
+    resume_available_changed = pyqtSignal(bool)
     progress_changed = pyqtSignal(int, int)
     status_changed = pyqtSignal(str)
     error = pyqtSignal(str)
@@ -286,6 +315,8 @@ class AcquisitionController(QObject):
         self._applied_exposure: int | None = None
         self._frame_after = 0.0
         self._session_directory: Path | None = None
+        self._writer_token = 0
+        self._resume_available = False
         self._camera_status = CameraStatus()
         self._robot_status = RobotStatus()
         self._light_statuses = [LightStatus(), LightStatus()]
@@ -308,6 +339,22 @@ class AcquisitionController(QObject):
     def running(self) -> bool:
         return self._running
 
+    @property
+    def resume_available(self) -> bool:
+        return self._resume_available and not self._running
+
+    @property
+    def remaining_count(self) -> int:
+        return max(0, len(self._points) - self._index)
+
+    @property
+    def session_directory(self) -> Path | None:
+        return self._session_directory
+
+    @property
+    def session_settings(self) -> AcquisitionSettings | None:
+        return self._settings
+
     def start(self, settings: AcquisitionSettings) -> bool:
         if self._running:
             return False
@@ -320,6 +367,8 @@ class AcquisitionController(QObject):
             self.error.emit(str(exc) or type(exc).__name__)
             return False
 
+        if self._resume_available:
+            self._write_manifest("abandoned", "Durch eine neue Sitzung ersetzt.")
         self._settings = settings
         self._points = points
         self._index = 0
@@ -328,6 +377,9 @@ class AcquisitionController(QObject):
         self._applied_lights = None
         self._applied_exposure = None
         self._session_directory = session
+        self._writer_token = self.writer.session_token
+        self._set_resume_available(False)
+        self._write_manifest("running", "Neue Sitzung gestartet.")
         self._watchdog.start()
         self.running_changed.emit(True)
         self.progress_changed.emit(0, len(points))
@@ -341,11 +393,225 @@ class AcquisitionController(QObject):
     def stop(self) -> None:
         if not self._running:
             return
-        self._finish("Aufnahme gestoppt. Eine bereits gestartete UR-Fahrt wird nicht abgebrochen.")
+        self._finish(
+            "Aufnahme gestoppt. Eine bereits gestartete UR-Fahrt wird nicht abgebrochen.",
+            resumable=True,
+        )
+
+    def resume(self) -> bool:
+        if self._running or not self._resume_available:
+            return False
+        if self._settings is None or self._session_directory is None or not self._points:
+            self._set_resume_available(False)
+            self.error.emit("Es ist keine fortsetzbare Aufnahmesitzung geladen.")
+            return False
+        try:
+            self.writer.flush()
+            self._reconcile_saved_points()
+            self.progress_changed.emit(self._index, len(self._points))
+            if self._index >= len(self._points):
+                message = f"Aufnahme bereits vollständig: {self._session_directory}"
+                self._write_manifest("completed", message)
+                self._set_resume_available(False)
+                self.progress_changed.emit(self._index, len(self._points))
+                self.status_changed.emit(message)
+                self.completed.emit(message)
+                return True
+            self._write_manifest(
+                "interrupted",
+                "Vorhandene Dateipaare vor dem Fortsetzen abgeglichen.",
+            )
+            self._validate_hardware(self._settings)
+        except Exception as exc:
+            self.error.emit(str(exc) or type(exc).__name__)
+            return False
+
+        self._running = True
+        self._current_pose = None
+        self._applied_lights = None
+        self._applied_exposure = None
+        self._writer_token = self.writer.session_token
+        self._set_resume_available(False)
+        self._write_manifest("running", "Unterbrochene Sitzung wird fortgesetzt.")
+        self._watchdog.start()
+        self.running_changed.emit(True)
+        self.progress_changed.emit(self._index, len(self._points))
+        self.status_changed.emit(
+            f"Sitzung wird bei Bild {self._index + 1}/{len(self._points)} fortgesetzt: "
+            f"{self._session_directory}"
+        )
+        self._set_phase("power", 8.0)
+        self.light_1.set_power(True)
+        self.light_2.set_power(True)
+        self._maybe_power_ready()
+        return True
+
+    def restore_interrupted(self, configured_settings: AcquisitionSettings) -> bool:
+        if self._running:
+            return False
+        root = configured_settings.output_directory.expanduser().resolve()
+        if not root.is_dir():
+            return False
+        manifests = sorted(
+            root.glob("capture_*/capture_session.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for manifest in manifests:
+            try:
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                if payload.get("status") not in {"running", "interrupted"}:
+                    continue
+                settings = self._settings_from_manifest(payload["settings"])
+                points = build_capture_points(settings)
+                index = int(payload.get("next_index", 0))
+                if not 0 <= index <= len(points):
+                    raise ValueError("Ungültiger Aufnahmeindex im Sitzungs-Checkpoint.")
+                self.writer.attach_session(manifest.parent)
+                self._settings = settings
+                self._points = points
+                self._index = index
+                self._session_directory = manifest.parent
+                self._writer_token = self.writer.session_token
+                self._reconcile_saved_points()
+                if self._index >= len(self._points):
+                    self._write_manifest("completed", "Alle Dateipaare sind vollständig.")
+                    continue
+                self._write_manifest(
+                    "interrupted",
+                    "Checkpoint und vorhandene Dateipaare abgeglichen.",
+                )
+                self._set_resume_available(True)
+                self.progress_changed.emit(self._index, len(self._points))
+                self.status_changed.emit(
+                    f"Unterbrochene Sitzung gefunden: {self._index}/{len(self._points)} Bilder · "
+                    f"{manifest.parent}"
+                )
+                return True
+            except Exception as exc:
+                self.error.emit(
+                    f"Unterbrochene Sitzung konnte nicht geladen werden ({manifest}): "
+                    f"{str(exc) or type(exc).__name__}"
+                )
+                return False
+        if manifests:
+            return False
+        return self._restore_legacy_session(configured_settings, root)
 
     def close(self) -> None:
         self.stop()
         self.writer.close()
+
+    def _set_resume_available(self, available: bool) -> None:
+        available = bool(available)
+        if available == self._resume_available:
+            return
+        self._resume_available = available
+        self.resume_available_changed.emit(available)
+
+    @staticmethod
+    def _settings_from_manifest(payload: object) -> AcquisitionSettings:
+        if not isinstance(payload, dict):
+            raise ValueError("Aufnahmeeinstellungen im Checkpoint sind ungültig.")
+        names = set(AcquisitionSettings.__dataclass_fields__)
+        values = {name: payload[name] for name in names}
+        values["output_directory"] = Path(str(values["output_directory"]))
+        return AcquisitionSettings(**values).validated()
+
+    def _write_manifest(self, status: str, message: str) -> None:
+        if self._settings is None or self._session_directory is None:
+            return
+        settings = asdict(self._settings)
+        settings["output_directory"] = str(self._settings.output_directory)
+        payload = {
+            "schema_version": 1,
+            "status": status,
+            "next_index": self._index,
+            "total": len(self._points),
+            "settings": settings,
+            "message": message,
+            "updated_at": datetime.now().astimezone().isoformat(),
+        }
+        destination = self._session_directory / "capture_session.json"
+        temporary = self._session_directory / "capture_session.json.part"
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(destination)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            self.error.emit(f"Sitzungs-Checkpoint konnte nicht gespeichert werden: {exc}")
+
+    def _reconcile_saved_points(self) -> None:
+        while self._index < len(self._points):
+            image_path, yaml_path = self.writer.expected_paths(
+                self._index,
+                self._points[self._index],
+            )
+            image_exists = image_path.is_file()
+            yaml_exists = yaml_path.is_file()
+            if image_exists and yaml_exists:
+                self._index += 1
+                continue
+            if image_exists != yaml_exists:
+                raise RuntimeError(
+                    "Unvollständiges Dateipaar verhindert sicheres Fortsetzen: "
+                    f"{image_path.name} / {yaml_path.name}"
+                )
+            break
+
+    def _restore_legacy_session(
+        self,
+        configured_settings: AcquisitionSettings,
+        root: Path,
+    ) -> bool:
+        sessions = sorted(
+            (path for path in root.glob("capture_*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not sessions:
+            return False
+        session = sessions[0]
+        if (session / "capture_session.json").exists() or list(session.glob("*.part")):
+            return False
+        try:
+            settings = configured_settings.validated()
+            points = build_capture_points(settings)
+            self.writer.attach_session(session)
+            self._settings = settings
+            self._points = points
+            self._index = 0
+            self._session_directory = session
+            self._writer_token = self.writer.session_token
+            self._reconcile_saved_points()
+            expected_images: set[Path] = set()
+            expected_metadata: set[Path] = set()
+            for index in range(self._index):
+                image_path, yaml_path = self.writer.expected_paths(index, points[index])
+                expected_images.add(image_path)
+                expected_metadata.add(yaml_path)
+            actual_images = set(session.glob("img_*.png"))
+            actual_metadata = set(session.glob("img_*.yaml"))
+            if actual_images != expected_images or actual_metadata != expected_metadata:
+                return False
+            if self._index >= len(points):
+                return False
+            self._write_manifest(
+                "interrupted",
+                "Fortschritt einer älteren Sitzung aus vorhandenen Dateipaaren rekonstruiert.",
+            )
+            self._set_resume_available(True)
+            self.progress_changed.emit(self._index, len(points))
+            self.status_changed.emit(
+                f"Unterbrochene ältere Sitzung rekonstruiert: "
+                f"{self._index}/{len(points)} Bilder · {session}"
+            )
+            return True
+        except Exception:
+            return False
 
     def _validate_hardware(self, settings: AcquisitionSettings) -> None:
         if self.camera.state is not ConnectionState.CONNECTED:
@@ -524,7 +790,10 @@ class AcquisitionController(QObject):
         point = self._points[self._index]
         metadata = self._metadata(point, frame)
         self._set_phase("writing", 20.0)
-        self.writer.submit(self._index, point, frame, metadata)
+        try:
+            self.writer.submit(self._index, point, frame, metadata)
+        except Exception as exc:
+            self._fail(f"Speichern konnte nicht gestartet werden: {exc}")
 
     def _metadata(self, point: CapturePoint, frame: CameraFrame) -> dict[str, Any]:
         camera = self._camera_status
@@ -580,16 +849,22 @@ class AcquisitionController(QObject):
             "values_are_confirmed_commands": status.values_are_confirmed_commands,
         }
 
-    def _on_saved(self, index: int, image_path: str) -> None:
-        if not self._running or self._phase != "writing" or index != self._index:
+    def _on_saved(self, token: int, index: int, image_path: str) -> None:
+        if (
+            token != self._writer_token
+            or not self._running
+            or self._phase != "writing"
+            or index != self._index
+        ):
             return
         self._index += 1
+        self._write_manifest("running", f"Bild {self._index} gespeichert.")
         self.progress_changed.emit(self._index, len(self._points))
         self.status_changed.emit(f"Gespeichert: {image_path}")
         self._advance()
 
-    def _on_write_failed(self, index: int, message: str) -> None:
-        if self._running and index == self._index:
+    def _on_write_failed(self, token: int, index: int, message: str) -> None:
+        if token == self._writer_token and self._running and index == self._index:
             self._fail(f"Speichern fehlgeschlagen: {message}")
 
     def _check_timeout(self) -> None:
@@ -598,9 +873,15 @@ class AcquisitionController(QObject):
 
     def _fail(self, message: str) -> None:
         self.error.emit(message)
-        self._finish(f"Aufnahme wegen Fehler beendet: {message}")
+        self._finish(f"Aufnahme wegen Fehler beendet: {message}", resumable=True)
 
-    def _finish(self, message: str, *, completed: bool = False) -> None:
+    def _finish(
+        self,
+        message: str,
+        *,
+        completed: bool = False,
+        resumable: bool = False,
+    ) -> None:
         restore_exposure = (
             self._settings is not None and self._settings.exposure_enabled
         )
@@ -610,6 +891,9 @@ class AcquisitionController(QObject):
         self._watchdog.stop()
         if restore_exposure:
             self.camera.restore_exposure()
+        can_resume = resumable and self._index < len(self._points)
+        self._write_manifest("interrupted" if can_resume else "completed", message)
+        self._set_resume_available(can_resume)
         self.running_changed.emit(False)
         self.status_changed.emit(message)
         if completed:

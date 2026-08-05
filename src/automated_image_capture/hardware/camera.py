@@ -15,6 +15,9 @@ from automated_image_capture.hardware.base import DeviceAdapter
 from automated_image_capture.models import CameraFrame, CameraStatus, ConnectionState
 from automated_image_capture.settings import AppSettings
 
+FETCH_TIMEOUT_SECONDS = 0.5
+MAX_CONSECUTIVE_FETCH_TIMEOUTS = 6
+
 
 def _normalize_to_uint8(image: np.ndarray, pixel_format: str) -> np.ndarray:
     if image.dtype == np.uint8:
@@ -130,6 +133,19 @@ def camera_error_message(error: BaseException) -> str:
     if any(token in message.lower() for token in busy_tokens):
         message += " Schließen Sie den Baumer Camera Explorer und versuchen Sie es erneut."
     return message
+
+
+def is_camera_fetch_timeout(error: BaseException) -> bool:
+    """Recognize GenTL timeouts even when the producer returns an empty message."""
+    description = f"{type(error).__name__} {error}".lower()
+    return "timeout" in description or "timed out" in description
+
+
+def should_retry_camera_fetch(error: BaseException, consecutive_timeouts: int) -> bool:
+    return (
+        is_camera_fetch_timeout(error)
+        and consecutive_timeouts < MAX_CONSECUTIVE_FETCH_TIMEOUTS
+    )
 
 
 class CameraWorker(QObject):
@@ -251,6 +267,7 @@ class CameraWorker(QObject):
             last_preview = 0.0
             fps_window_start = time.monotonic()
             preview_frames = 0
+            consecutive_fetch_timeouts = 0
 
             while not self._stop.is_set():
                 try:
@@ -279,7 +296,12 @@ class CameraWorker(QObject):
                     self.exposure_failed.emit(str(exc) or type(exc).__name__)
 
                 try:
-                    with acquirer.fetch(timeout=0.5) as buffer:
+                    with acquirer.fetch(timeout=FETCH_TIMEOUT_SECONDS) as buffer:
+                        if consecutive_fetch_timeouts:
+                            self.event_message.emit(
+                                "Kamerastream nach kurzem Buffer-Timeout wiederhergestellt."
+                            )
+                        consecutive_fetch_timeouts = 0
                         component = buffer.payload.components[0]
                         now = time.monotonic()
                         if now - last_preview < preview_interval:
@@ -303,8 +325,23 @@ class CameraWorker(QObject):
                 except Exception as exc:
                     if self._stop.is_set():
                         break
-                    if "timeout" not in str(exc).lower():
-                        raise
+                    if is_camera_fetch_timeout(exc):
+                        consecutive_fetch_timeouts += 1
+                        if consecutive_fetch_timeouts == 1:
+                            self.event_message.emit(
+                                "Ein Kamerabuffer blieb aus; der Stream wird weiter abgefragt."
+                            )
+                        if should_retry_camera_fetch(exc, consecutive_fetch_timeouts):
+                            continue
+                        elapsed_without_frame = (
+                            consecutive_fetch_timeouts * FETCH_TIMEOUT_SECONDS
+                        )
+                        raise RuntimeError(
+                            "Kamerastream liefert seit "
+                            f"{elapsed_without_frame:.1f} Sekunden kein Bild "
+                            f"({consecutive_fetch_timeouts} aufeinanderfolgende Timeouts)."
+                        ) from exc
+                    raise
         except Exception as exc:
             self.state_changed.emit(ConnectionState.ERROR)
             self.error.emit(camera_error_message(exc))

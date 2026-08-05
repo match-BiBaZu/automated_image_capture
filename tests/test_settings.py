@@ -5,7 +5,7 @@ from PyQt6.QtCore import QSettings
 
 from automated_image_capture.acquisition import AcquisitionSettings
 from automated_image_capture.dataset import default_build_config
-from automated_image_capture.labeling import LabelingConfig
+from automated_image_capture.labeling import LabelingConfig, LabelSource
 from automated_image_capture.settings import AppSettings, SettingsStore
 
 
@@ -74,11 +74,12 @@ def test_labeling_settings_round_trip(tmp_path) -> None:
     foreground.mkdir()
     background.mkdir()
     expected = LabelingConfig(
-        foreground,
-        background,
+        (
+            LabelSource("Pose 1", foreground),
+            LabelSource("Pose 2", tmp_path / "parts_2"),
+            LabelSource("Leere Rutsche", background, is_empty=True),
+        ),
         tmp_path / "yolo_obb",
-        class_name="Kk1",
-        class_id=2,
         validation_fraction=0.25,
         minimum_difference=70,
         consensus_fraction=0.6,
@@ -89,6 +90,20 @@ def test_labeling_settings_round_trip(tmp_path) -> None:
     store.save_labeling(expected)
 
     assert store.load_labeling() == expected
+
+
+def test_legacy_labeling_settings_are_migrated_to_source_list(tmp_path) -> None:
+    backend = QSettings(str(tmp_path / "legacy.ini"), QSettings.Format.IniFormat)
+    backend.setValue("labeling/foreground_directory", str(tmp_path / "old_parts"))
+    backend.setValue("labeling/background_directory", str(tmp_path / "old_empty"))
+    store = SettingsStore(backend)
+
+    loaded = store.load_labeling()
+
+    assert loaded.sources[0] == LabelSource("Pose 1", tmp_path / "old_parts")
+    assert loaded.sources[-1] == LabelSource(
+        "Leere Rutsche", tmp_path / "old_empty", is_empty=True
+    )
 
 
 def test_training_paths_round_trip(tmp_path) -> None:

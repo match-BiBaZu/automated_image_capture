@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -318,6 +319,7 @@ class LightControlCard(DeviceCard):
 class AcquisitionCard(QGroupBox):
     configure_requested = pyqtSignal()
     start_requested = pyqtSignal()
+    resume_requested = pyqtSignal()
     stop_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -327,17 +329,23 @@ class AcquisitionCard(QGroupBox):
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
 
-        buttons = QHBoxLayout()
+        self._running = False
+        self._resume_available = False
+        buttons = QGridLayout()
         self.configure_button = QPushButton("Aufnahme konfigurieren …")
         self.start_button = QPushButton("Aufnahme starten")
+        self.resume_button = QPushButton("Aufnahme fortsetzen")
         self.stop_button = QPushButton("Aufnahme stoppen")
+        self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.configure_button.clicked.connect(self.configure_requested.emit)
         self.start_button.clicked.connect(self.start_requested.emit)
+        self.resume_button.clicked.connect(self.resume_requested.emit)
         self.stop_button.clicked.connect(self.stop_requested.emit)
-        buttons.addWidget(self.configure_button)
-        buttons.addWidget(self.start_button)
-        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.configure_button, 0, 0)
+        buttons.addWidget(self.start_button, 0, 1)
+        buttons.addWidget(self.resume_button, 1, 0)
+        buttons.addWidget(self.stop_button, 1, 1)
         layout.addLayout(buttons)
 
         self.progress = QProgressBar()
@@ -363,9 +371,15 @@ class AcquisitionCard(QGroupBox):
         )
 
     def set_running(self, running: bool) -> None:
+        self._running = running
         self.configure_button.setEnabled(not running)
         self.start_button.setEnabled(not running)
+        self.resume_button.setEnabled(not running and self._resume_available)
         self.stop_button.setEnabled(running)
+
+    def set_resume_available(self, available: bool) -> None:
+        self._resume_available = available
+        self.resume_button.setEnabled(available and not self._running)
 
     def set_progress(self, current: int, total: int) -> None:
         self.progress.setRange(0, max(1, total))

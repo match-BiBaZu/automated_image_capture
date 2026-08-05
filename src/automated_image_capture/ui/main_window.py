@@ -3,18 +3,24 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent, QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QCheckBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -22,6 +28,11 @@ from PyQt6.QtWidgets import (
 
 from automated_image_capture.acquisition import AcquisitionController, build_capture_points
 from automated_image_capture.hardware import CameraAdapter, LightAdapter, RobotAdapter
+from automated_image_capture.inference import (
+    InferenceFrame,
+    LiveInferenceConfig,
+    LiveInferenceWorker,
+)
 from automated_image_capture.models import (
     CameraFrame,
     CameraStatus,
@@ -55,7 +66,11 @@ class MainWindow(QMainWindow):
         self.settings_store = settings_store or SettingsStore()
         self.config = self.settings_store.load()
         self.acquisition_config = self.settings_store.load_acquisition()
+        self.inference_config = self.settings_store.load_live_inference()
         self._last_image: QImage | None = None
+        self._last_raw_image: QImage | None = None
+        self._inference_worker: LiveInferenceWorker | None = None
+        self._inference_has_result = False
         self._camera_status_data = CameraStatus()
         self._closing = False
         self._training_dialog: TrainingDialog | None = None
@@ -85,6 +100,10 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._wire_adapters()
+        if self.acquisition.restore_interrupted(self.acquisition_config):
+            if self.acquisition.session_settings is not None:
+                self.acquisition_config = self.acquisition.session_settings
+                self.acquisition_card.set_settings(self.acquisition_config)
         self._append_event("Dashboard bereit. Es werden noch keine Geräte automatisch verbunden.")
 
     def _build_ui(self) -> None:
@@ -150,6 +169,49 @@ class MainWindow(QMainWindow):
         preview_title = QLabel("Kamera-Livebild")
         preview_title.setStyleSheet("font-size:16px; font-weight:600;")
         preview_layout.addWidget(preview_title)
+
+        inference_controls = QHBoxLayout()
+        self.inference_toggle = QCheckBox("YOLO Live-Erkennung")
+        self.inference_toggle.setToolTip(
+            "Führt das trainierte OBB-Modell auf dem neuesten Kamerabild aus."
+        )
+        self.inference_model = QLineEdit()
+        self.inference_model.setReadOnly(True)
+        self.inference_model.setMinimumWidth(220)
+        self.inference_model.setText(str(self.inference_config.model_path))
+        self.inference_model.setToolTip(str(self.inference_config.model_path))
+        choose_model = QPushButton("Modell …")
+        choose_model.clicked.connect(self._choose_inference_model)
+        self.inference_confidence = QDoubleSpinBox()
+        self.inference_confidence.setRange(0.01, 1.0)
+        self.inference_confidence.setSingleStep(0.05)
+        self.inference_confidence.setDecimals(2)
+        self.inference_confidence.setValue(self.inference_config.confidence)
+        self.inference_confidence.setPrefix("Konf. ")
+        self.inference_confidence.setToolTip("Minimale Konfidenz für eine angezeigte OBB")
+        self.inference_max_fps = QSpinBox()
+        self.inference_max_fps.setRange(1, 15)
+        self.inference_max_fps.setValue(round(self.inference_config.max_fps))
+        self.inference_max_fps.setSuffix(" FPS")
+        self.inference_max_fps.setToolTip("Maximale Bildrate der YOLO-Inferenz")
+        self.inference_status = QLabel("Aus")
+        self.inference_status.setMinimumWidth(150)
+        self.inference_status.setStyleSheet("color:#64748b;")
+        self.inference_toggle.toggled.connect(self._toggle_live_inference)
+        self.inference_confidence.editingFinished.connect(
+            self._apply_inference_runtime_settings
+        )
+        self.inference_max_fps.editingFinished.connect(
+            self._apply_inference_runtime_settings
+        )
+        inference_controls.addWidget(self.inference_toggle)
+        inference_controls.addWidget(self.inference_model, 1)
+        inference_controls.addWidget(choose_model)
+        inference_controls.addWidget(self.inference_confidence)
+        inference_controls.addWidget(self.inference_max_fps)
+        inference_controls.addWidget(self.inference_status)
+        preview_layout.addLayout(inference_controls)
+
         self.preview = QLabel("Noch kein Kamerabild")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setMinimumSize(640, 480)
@@ -205,8 +267,12 @@ class MainWindow(QMainWindow):
             card.hsi_requested.connect(adapter.set_hsi)
         self.acquisition_card.configure_requested.connect(self.open_acquisition_settings)
         self.acquisition_card.start_requested.connect(self.start_acquisition)
+        self.acquisition_card.resume_requested.connect(self.resume_acquisition)
         self.acquisition_card.stop_requested.connect(self.acquisition.stop)
         self.acquisition.running_changed.connect(self.acquisition_card.set_running)
+        self.acquisition.resume_available_changed.connect(
+            self.acquisition_card.set_resume_available
+        )
         self.acquisition.running_changed.connect(self._acquisition_running)
         self.acquisition.progress_changed.connect(self.acquisition_card.set_progress)
         self.acquisition.status_changed.connect(self._acquisition_status)
@@ -258,6 +324,116 @@ class MainWindow(QMainWindow):
         height, width, channels = image.shape
         if channels != 3:
             return
+        raw_image = QImage(
+            image.data,
+            width,
+            height,
+            int(image.strides[0]),
+            QImage.Format.Format_RGB888,
+        ).copy()
+        self._last_raw_image = raw_image
+        worker = self._inference_worker
+        if worker is not None and worker.isRunning():
+            worker.submit(image, frame.timestamp)
+            if not self._inference_has_result:
+                self._last_image = raw_image
+                self._render_image()
+        else:
+            self._last_image = raw_image
+            self._render_image()
+
+    def _current_inference_config(self) -> LiveInferenceConfig:
+        return LiveInferenceConfig(
+            model_path=self.inference_config.model_path,
+            confidence=self.inference_confidence.value(),
+            image_size=self.inference_config.image_size,
+            max_fps=float(self.inference_max_fps.value()),
+            device=self.inference_config.device,
+        )
+
+    def _choose_inference_model(self) -> None:
+        current = self.inference_config.model_path
+        start_directory = str(current.parent if current.is_file() else current)
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "YOLO-OBB-Modell auswählen",
+            start_directory,
+            "PyTorch-Modell (*.pt)",
+        )
+        if not filename:
+            return
+        was_running = self.inference_toggle.isChecked()
+        if was_running:
+            self.inference_toggle.setChecked(False)
+        self.inference_config = replace(
+            self._current_inference_config(), model_path=Path(filename)
+        )
+        self.inference_model.setText(filename)
+        self.inference_model.setToolTip(filename)
+        self.settings_store.save_live_inference(self.inference_config)
+        self._append_event(f"Live-Modell ausgewählt: {filename}")
+        if was_running:
+            self.inference_toggle.setChecked(True)
+
+    def _toggle_live_inference(self, enabled: bool) -> None:
+        if not enabled:
+            self._stop_live_inference()
+            self.inference_status.setText("Aus")
+            self._inference_has_result = False
+            if self._last_raw_image is not None:
+                self._last_image = self._last_raw_image
+                self._render_image()
+            return
+        try:
+            config = self._current_inference_config().validated()
+        except ValueError as exc:
+            self.inference_toggle.blockSignals(True)
+            self.inference_toggle.setChecked(False)
+            self.inference_toggle.blockSignals(False)
+            self.inference_status.setText("Kein Modell")
+            QMessageBox.warning(self, "Live-Erkennung", str(exc))
+            return
+
+        self.inference_config = config
+        self.settings_store.save_live_inference(config)
+        self._inference_has_result = False
+        worker = LiveInferenceWorker(config, self)
+        worker.frame_ready.connect(
+            lambda frame, source=worker: self._inference_frame_from(source, frame)
+        )
+        worker.status_changed.connect(
+            lambda message, source=worker: self._inference_status_changed(source, message)
+        )
+        worker.error.connect(
+            lambda message, source=worker: self._inference_error_from(source, message)
+        )
+        worker.finished.connect(lambda source=worker: self._inference_finished(source))
+        self._inference_worker = worker
+        worker.start()
+        self._append_event(
+            f"YOLO-Live-Erkennung gestartet ({config.model_path.name}, "
+            f"Konfidenz {config.confidence:.2f}, max. {config.max_fps:g} FPS)."
+        )
+
+    def _apply_inference_runtime_settings(self) -> None:
+        try:
+            config = self._current_inference_config().validated(require_model=False)
+        except ValueError as exc:
+            self._show_error("Live-Erkennung", str(exc))
+            return
+        self.inference_config = config
+        self.settings_store.save_live_inference(config)
+        if self._inference_worker is not None:
+            self._inference_worker.update_runtime_settings(
+                config.confidence,
+                config.max_fps,
+            )
+
+    def _inference_frame(self, frame: InferenceFrame) -> None:
+        image = frame.image
+        height, width, channels = image.shape
+        if channels != 3:
+            return
         self._last_image = QImage(
             image.data,
             width,
@@ -265,7 +441,57 @@ class MainWindow(QMainWindow):
             int(image.strides[0]),
             QImage.Format.Format_RGB888,
         ).copy()
+        self._inference_has_result = True
+        count = len(frame.detections)
+        detection_text = "1 Objekt" if count == 1 else f"{count} Objekte"
+        self.inference_status.setText(f"{detection_text} · {frame.inference_ms:.0f} ms")
         self._render_image()
+
+    def _inference_frame_from(
+        self,
+        worker: LiveInferenceWorker,
+        frame: InferenceFrame,
+    ) -> None:
+        if worker is self._inference_worker:
+            self._inference_frame(frame)
+
+    def _inference_status_changed(
+        self,
+        worker: LiveInferenceWorker,
+        message: str,
+    ) -> None:
+        if worker is self._inference_worker:
+            self.inference_status.setText(message)
+
+    def _inference_error(self, message: str) -> None:
+        self._show_error("Live-Erkennung", message)
+        self._append_event(message)
+
+    def _inference_error_from(self, worker: LiveInferenceWorker, message: str) -> None:
+        if worker is self._inference_worker:
+            self._inference_error(message)
+
+    def _inference_finished(self, worker: LiveInferenceWorker) -> None:
+        if worker is not self._inference_worker:
+            return
+        self._inference_worker = None
+        if self.inference_toggle.isChecked():
+            self.inference_toggle.blockSignals(True)
+            self.inference_toggle.setChecked(False)
+            self.inference_toggle.blockSignals(False)
+        self._inference_has_result = False
+        if self._last_raw_image is not None:
+            self._last_image = self._last_raw_image
+            self._render_image()
+
+    def _stop_live_inference(self) -> None:
+        worker = self._inference_worker
+        if worker is None:
+            return
+        self._inference_worker = None
+        if not worker.stop():
+            self._logger.warning("YOLO-Inferenz-Thread reagierte nicht innerhalb des Timeouts.")
+        worker.deleteLater()
 
     def _render_image(self) -> None:
         if self._last_image is None:
@@ -379,16 +605,39 @@ class MainWindow(QMainWindow):
 
     def start_acquisition(self) -> None:
         count = len(build_capture_points(self.acquisition_config))
+        interrupted = (
+            "\n\nEine unterbrochene Sitzung ist vorhanden. Beim Start einer neuen Sitzung "
+            "wird deren Fortsetzung verworfen."
+            if self.acquisition.resume_available
+            else ""
+        )
         answer = QMessageBox.question(
             self,
             "Automatische Roboterbewegung starten",
             f"Die Sitzung umfasst {count} Aufnahmen und verfährt den UR automatisch.\n\n"
-            "Ist der Arbeitsraum frei und darf die Sequenz gestartet werden?",
+            f"Ist der Arbeitsraum frei und darf die Sequenz gestartet werden?{interrupted}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer is QMessageBox.StandardButton.Yes:
             self.acquisition.start(self.acquisition_config)
+
+    def resume_acquisition(self) -> None:
+        if not self.acquisition.resume_available:
+            return
+        remaining = self.acquisition.remaining_count
+        session = self.acquisition.session_directory or "–"
+        answer = QMessageBox.question(
+            self,
+            "Automatische Aufnahme fortsetzen",
+            f"Es fehlen noch {remaining} Aufnahmen in:\n{session}\n\n"
+            "Die Hardware wird erneut geprüft und der UR fährt die nächste benötigte Pose an. "
+            "Ist der Arbeitsraum frei und wurde die Fehlerursache behoben?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.acquisition.resume()
 
     def _acquisition_status(self, message: str) -> None:
         self.acquisition_card.status.setText(message)
@@ -419,6 +668,7 @@ class MainWindow(QMainWindow):
         self.light_card.command_timer.stop()
         self.light_2_card.command_timer.stop()
         self.acquisition.stop()
+        self._stop_live_inference()
         if self._training_dialog is not None:
             self._training_dialog.shutdown()
         self.camera.disconnect()
@@ -426,6 +676,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     async def shutdown_async(self) -> None:
+        self._stop_live_inference()
         if self._training_dialog is not None:
             self._training_dialog.shutdown()
         self.acquisition.close()

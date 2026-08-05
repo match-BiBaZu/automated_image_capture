@@ -57,6 +57,21 @@ Kamera- und Lichtauswahl wird über `QSettings` im Windows-Benutzerprofil gespei
    auswählen und die einmalige Bewegungsfreigabe bestätigen.
 7. Die Lichter erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
 
+## YOLO im Kamera-Livebild
+
+Oberhalb des Kamerabilds lässt sich **YOLO Live-Erkennung** zuschalten. Beim ersten Start
+wählt die GUI automatisch das neueste `best.pt` unter
+`Pictures\Kk1_pose12_yolo26_obb\runs`; über **Modell …** kann jederzeit ein anderes
+Ultralytics-OBB-Modell gewählt werden. Konfidenzschwelle und maximale Inferenz-Bildrate sind
+direkt einstellbar und werden gespeichert.
+
+Die erkannten orientierten Bounding Boxes, Klassen (`Pose 1`/`Pose 2`) und Konfidenzen werden
+in das Livebild eingezeichnet. Neben den Reglern stehen Objektzahl und Laufzeit des letzten
+Frames. Die Inferenz läuft auf der GPU in einem eigenen Thread und verarbeitet nur das jeweils
+neueste Kamerabild. Dadurch stauen sich bei hoher Kamera-Bildrate keine alten Bilder an und die
+Hardware-Bedienung bleibt responsiv. Der erste Frame benötigt wegen der CUDA-Initialisierung
+deutlich länger als die folgenden Frames.
+
 ## Automatische Aufnahme
 
 1. `BiBaZu_GUI.urp` am Teach Pendant laden und manuell starten.
@@ -77,18 +92,29 @@ vom Kamera-Verbindungsaufbau zurückgesetzt.
 **Aufnahme stoppen** verhindert weitere Aufträge und Bilder. Eine bereits begonnene Bewegung
 wird aus Sicherheitsgründen nicht durch einen externen Stop-Befehl unterbrochen.
 
+Wird eine Sitzung durch einen Gerätefehler, **Aufnahme stoppen** oder das Beenden der GUI
+unterbrochen, wird **Aufnahme fortsetzen** aktiviert. Die Sitzung speichert ihren Fortschritt
+atomar in `capture_session.json` und kann daher auch nach einem GUI-Neustart wiederhergestellt
+werden. Vor dem Fortsetzen werden alle Hardwareverbindungen erneut geprüft und bereits
+vollständige PNG-/YAML-Paare übersprungen. Ein unvollständiges Dateipaar führt bewusst zu einer
+Fehlermeldung, damit keine vorhandene Aufnahme unbemerkt überschrieben wird. Der UR fährt beim
+Fortsetzen die nächste benötigte freigegebene Pose erneut über den normalen Handshake an.
+
 ## Automatische OBB-Labels
 
-Über **OBB-Labels …** lässt sich aus einer Bauteilserie und einer parametrisch identischen
-Leerbildserie ein YOLO-OBB-Datensatz erzeugen. Das Tool paart die Aufnahmen anhand von Pose,
-beiden Panelhelligkeiten und Belichtung. Vor der Differenzbildung wird jedes Leerbild
-subpixelgenau registriert, damit kleine Wiederholabweichungen auf strukturierten Untergründen
-nicht als Objekt erscheinen.
+Über **OBB-Labels …** lässt sich aus beliebig vielen Bauteilserien und einer parametrisch
+identischen Leerbildserie ein gemeinsamer YOLO-OBB-Datensatz erzeugen. Die Quellenliste startet
+mit `Pose 1`, `Pose 2` und `Leere Rutsche`; weitere Posen lassen sich hinzufügen oder wieder
+entfernen. Jede Pose erhält anhand ihrer Listenposition eine eigene Klassen-ID und in jeder
+Zeile kann der zugehörige Aufnahmeordner gewählt werden. Das Tool paart die Aufnahmen anhand
+von UR-Pose, beiden Panelhelligkeiten und Belichtung. Vor der Differenzbildung wird jedes
+Leerbild subpixelgenau registriert, damit kleine Wiederholabweichungen auf strukturierten
+Untergründen nicht als Objekt erscheinen.
 
-Alle Beleuchtungsvarianten derselben Pose stimmen über eine gemeinsame Segmentierungsmaske
-und eine gemeinsame orientierte Bounding Box ab. Einzelbilder mit schwacher Übereinstimmung
-werden in `label_report.csv` als `REVIEW` markiert. Unter `review/` entstehen eine
-Gesamtübersicht, sechs repräsentative Overlays je Pose und die Konsensmasken.
+Alle Beleuchtungsvarianten derselben Klasse und UR-Pose stimmen über eine gemeinsame
+Segmentierungsmaske und eine gemeinsame orientierte Bounding Box ab. Einzelbilder mit
+schwacher Übereinstimmung werden in `label_report.csv` als `REVIEW` markiert. Unter `review/`
+entstehen repräsentative Overlays und Konsensmasken für jede Klasse und UR-Pose.
 
 Der Ausgabeordner ist direkt als Ultralytics-YOLO-OBB-Datensatz aufgebaut:
 
@@ -97,9 +123,10 @@ Der Ausgabeordner ist direkt als Ultralytics-YOLO-OBB-Datensatz aufgebaut:
 - `data.yaml`
 - `label_summary.json` und `label_report.csv`
 
-Der Train-/Val-Split erfolgt nach vollständigen Posen statt zufällig nach Bildern. Dadurch
-landen Beleuchtungsvarianten derselben Ansicht nicht zugleich in Training und Validierung.
-Optional werden die Leerbilder mit leeren Labeldateien als negative Beispiele übernommen.
+Der Train-/Val-Split erfolgt klassenübergreifend nach vollständigen UR-Posen statt zufällig
+nach Bildern. Dadurch landen Beleuchtungsvarianten derselben Ansicht nicht zugleich in
+Training und Validierung. Optional werden die Leerbilder genau einmal mit leeren Labeldateien
+als negative Beispiele übernommen.
 Auf demselben Laufwerk nutzt das Tool Hardlinks, sodass dabei keine zweite Kopie der großen
 PNG-Dateien entsteht.
 

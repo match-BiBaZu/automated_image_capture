@@ -51,12 +51,16 @@ class MatchedPair:
 
 
 @dataclass(slots=True, frozen=True)
+class LabelSource:
+    name: str
+    directory: Path
+    is_empty: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class LabelingConfig:
-    foreground_directory: Path
-    background_directory: Path
+    sources: tuple[LabelSource, ...]
     output_directory: Path
-    class_name: str = "Kk1"
-    class_id: int = 0
     validation_fraction: float = 0.2
     minimum_difference: int = 80
     consensus_fraction: float = 0.55
@@ -64,24 +68,43 @@ class LabelingConfig:
     include_background_negatives: bool = True
     prefer_hardlinks: bool = True
 
+    @property
+    def pose_sources(self) -> tuple[LabelSource, ...]:
+        return tuple(source for source in self.sources if not source.is_empty)
+
+    @property
+    def empty_source(self) -> LabelSource:
+        empty = tuple(source for source in self.sources if source.is_empty)
+        if len(empty) != 1:
+            raise LabelingError("Es muss genau eine Quelle 'Leere Rutsche' geben.")
+        return empty[0]
+
     def validated(self) -> LabelingConfig:
-        foreground = self.foreground_directory.expanduser().resolve()
-        background = self.background_directory.expanduser().resolve()
         output = self.output_directory.expanduser().resolve()
-        if not foreground.is_dir():
-            raise LabelingError(f"Bauteilordner nicht gefunden: {foreground}")
-        if not background.is_dir():
-            raise LabelingError(f"Leerbildordner nicht gefunden: {background}")
-        if foreground == background:
-            raise LabelingError("Bauteil- und Leerbildordner müssen verschieden sein.")
-        if output.is_relative_to(foreground) or output.is_relative_to(background):
-            raise LabelingError("Der Ausgabeordner darf nicht in einem Eingabeordner liegen.")
-        if not self.class_name.strip():
-            raise LabelingError("Der Klassenname darf nicht leer sein.")
-        if re.search(r'[<>:"/\\|?*]', self.class_name):
-            raise LabelingError("Der Klassenname enthält ein unzulässiges Dateizeichen.")
-        if self.class_id < 0:
-            raise LabelingError("Die Klassen-ID darf nicht negativ sein.")
+        if not self.pose_sources:
+            raise LabelingError("Mindestens eine Pose muss angelegt sein.")
+        _ = self.empty_source
+        normalized_sources: list[LabelSource] = []
+        names: set[str] = set()
+        directories: set[Path] = set()
+        for source in self.sources:
+            name = source.name.strip()
+            directory = source.directory.expanduser().resolve()
+            if not name:
+                raise LabelingError("Jeder Listeneintrag benötigt einen Namen.")
+            if re.search(r'[<>:"/\\|?*]', name):
+                raise LabelingError(f"Der Name '{name}' enthält ein unzulässiges Dateizeichen.")
+            if name.casefold() in names:
+                raise LabelingError(f"Der Name '{name}' ist doppelt vergeben.")
+            if not directory.is_dir():
+                raise LabelingError(f"Aufnahmeordner nicht gefunden: {directory}")
+            if directory in directories:
+                raise LabelingError(f"Der Aufnahmeordner ist doppelt vergeben: {directory}")
+            if output.is_relative_to(directory):
+                raise LabelingError("Der Ausgabeordner darf nicht in einem Eingabeordner liegen.")
+            names.add(name.casefold())
+            directories.add(directory)
+            normalized_sources.append(LabelSource(name, directory, source.is_empty))
         if not 0.0 <= self.validation_fraction < 1.0:
             raise LabelingError("Der Validierungsanteil muss zwischen 0 und unter 1 liegen.")
         if not 1 <= self.minimum_difference <= 255:
@@ -93,11 +116,8 @@ class LabelingConfig:
         if output.exists() and any(output.iterdir()):
             raise LabelingError(f"Der Ausgabeordner ist nicht leer: {output}")
         return LabelingConfig(
-            foreground,
-            background,
+            tuple(normalized_sources),
             output,
-            self.class_name.strip(),
-            self.class_id,
             self.validation_fraction,
             self.minimum_difference,
             self.consensus_fraction,
@@ -130,6 +150,7 @@ class LabelingResult:
     output_directory: Path
     positive_images: int
     negative_images: int
+    classes: int
     poses: int
     flagged_images: int
     review_directory: Path
@@ -499,36 +520,64 @@ def _write_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _filename_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-_")
+    return slug or "pose"
+
+
 def generate_obb_dataset(
     config: LabelingConfig,
     progress: ProgressCallback | None = None,
     cancelled: CancelCallback | None = None,
 ) -> LabelingResult:
     config = config.validated()
-    foreground = scan_capture(config.foreground_directory)
-    background = scan_capture(config.background_directory)
-    pairs = match_captures(foreground, background)
-    grouped: dict[int, list[MatchedPair]] = defaultdict(list)
-    for pair in pairs:
-        grouped[pair.foreground.key.pose_id].append(pair)
-    pose_ids = sorted(grouped)
-    total_steps = len(pairs) + len(pairs) * (2 if config.include_background_negatives else 1)
+    background = scan_capture(config.empty_source.directory)
+    source_data: list[
+        tuple[
+            int,
+            LabelSource,
+            list[MatchedPair],
+            dict[int, list[MatchedPair]],
+        ]
+    ] = []
+    all_pose_ids: set[int] = set()
+    for class_id, source in enumerate(config.pose_sources):
+        foreground = scan_capture(source.directory)
+        pairs = match_captures(foreground, background)
+        grouped: dict[int, list[MatchedPair]] = defaultdict(list)
+        for pair in pairs:
+            grouped[pair.foreground.key.pose_id].append(pair)
+        all_pose_ids.update(grouped)
+        source_data.append((class_id, source, pairs, grouped))
+
+    pose_ids = sorted(all_pose_ids)
+    positive_count = sum(len(pairs) for _, _, pairs, _ in source_data)
+    total_steps = positive_count * 2
+    if config.include_background_negatives:
+        total_steps += len(background)
     completed = 0
-    consensuses: dict[int, PoseConsensus] = {}
+    all_consensuses: dict[tuple[int, int], PoseConsensus] = {}
     report_rows: list[dict[str, object]] = []
-    for pose_id in pose_ids:
-        consensus, rows = build_pose_consensus(
-            pose_id,
-            grouped[pose_id],
-            config,
-            progress,
-            completed,
-            total_steps,
-            cancelled,
-        )
-        completed += len(grouped[pose_id])
-        consensuses[pose_id] = consensus
-        report_rows.extend(rows)
+    write_records: list[tuple[dict[str, object], MatchedPair, int, LabelSource]] = []
+    for class_id, source, _, grouped in source_data:
+        for pose_id in sorted(grouped):
+            consensus, rows = build_pose_consensus(
+                pose_id,
+                grouped[pose_id],
+                config,
+                progress,
+                completed,
+                total_steps,
+                cancelled,
+            )
+            completed += len(grouped[pose_id])
+            all_consensuses[(class_id, pose_id)] = consensus
+            for row, pair in zip(rows, grouped[pose_id], strict=True):
+                row["class_id"] = class_id
+                row["class_name"] = source.name
+                row["source_directory"] = str(source.directory)
+                report_rows.append(row)
+                write_records.append((row, pair, class_id, source))
 
     output = config.output_directory
     output.mkdir(parents=True, exist_ok=True)
@@ -539,20 +588,27 @@ def generate_obb_dataset(
         (output / "labels" / split).mkdir(parents=True)
     validation_poses = _validation_poses(pose_ids, config.validation_fraction)
 
-    negative_count = 0
-    for row, pair in zip(report_rows, pairs, strict=True):
+    for row, pair, class_id, source in write_records:
         if cancelled is not None and cancelled():
             raise LabelingCancelled("Label-Erzeugung abgebrochen.")
         pose_id = pair.foreground.key.pose_id
         split = "val" if pose_id in validation_poses else "train"
         image = _read_gray(pair.foreground.path)
         height, width = image.shape
-        positive_name = f"{config.class_name}_{pair.foreground.path.name}"
+        positive_name = (
+            f"class_{class_id:03d}_{_filename_slug(source.name)}_"
+            f"{pair.foreground.path.name}"
+        )
         positive_image = output / "images" / split / positive_name
         positive_label = output / "labels" / split / f"{Path(positive_name).stem}.txt"
         _link_or_copy(pair.foreground.path, positive_image, config.prefer_hardlinks)
         positive_label.write_text(
-            _normalized_obb(consensuses[pose_id].box, width, height, config.class_id),
+            _normalized_obb(
+                all_consensuses[(class_id, pose_id)].box,
+                width,
+                height,
+                class_id,
+            ),
             encoding="ascii",
         )
         row["split"] = split
@@ -560,59 +616,106 @@ def generate_obb_dataset(
         row["label_file"] = positive_label.name
         completed += 1
         if progress is not None:
-            progress(completed, total_steps, f"Schreibe Labels für Pose {pose_id}")
-        if config.include_background_negatives:
-            negative_name = f"background_{pair.background.path.name}"
+            progress(
+                completed,
+                total_steps,
+                f"Schreibe {source.name} · UR-Pose {pose_id}",
+            )
+
+    negative_count = 0
+    if config.include_background_negatives:
+        for background_record in background.values():
+            if cancelled is not None and cancelled():
+                raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+            pose_id = background_record.key.pose_id
+            split = "val" if pose_id in validation_poses else "train"
+            negative_name = f"empty_{background_record.path.name}"
             negative_image = output / "images" / split / negative_name
             negative_label = output / "labels" / split / f"{Path(negative_name).stem}.txt"
-            _link_or_copy(pair.background.path, negative_image, config.prefer_hardlinks)
+            _link_or_copy(background_record.path, negative_image, config.prefer_hardlinks)
             negative_label.write_text("", encoding="ascii")
             negative_count += 1
             completed += 1
             if progress is not None:
-                progress(completed, total_steps, f"Übernehme Leerbilder für Pose {pose_id}")
+                progress(completed, total_steps, f"Übernehme Leerbild · UR-Pose {pose_id}")
 
-    for pose_id in pose_ids:
-        consensus = consensuses[pose_id]
-        cv2.imwrite(str(review / f"pose_{pose_id}_consensus_mask.png"), consensus.mask)
-        _make_review_sheet(consensus, grouped[pose_id], review / f"pose_{pose_id}_obb.jpg")
-    _make_pose_overview(consensuses, grouped, review / "all_poses_obb.jpg")
+    for class_id, source, _, grouped in source_data:
+        class_consensuses: dict[int, PoseConsensus] = {}
+        prefix = f"class_{class_id:03d}_{_filename_slug(source.name)}"
+        for pose_id in sorted(grouped):
+            consensus = all_consensuses[(class_id, pose_id)]
+            class_consensuses[pose_id] = consensus
+            cv2.imwrite(
+                str(review / f"{prefix}_ur_{pose_id}_consensus_mask.png"),
+                consensus.mask,
+            )
+            _make_review_sheet(
+                consensus,
+                grouped[pose_id],
+                review / f"{prefix}_ur_{pose_id}_obb.jpg",
+            )
+        _make_pose_overview(
+            class_consensuses,
+            grouped,
+            review / f"{prefix}_all_poses_obb.jpg",
+        )
 
     _write_csv(output / "label_report.csv", report_rows)
     summary = {
         "format": "YOLO OBB",
-        "class_id": config.class_id,
-        "class_name": config.class_name,
-        "positive_images": len(pairs),
+        "positive_images": positive_count,
         "negative_images": negative_count,
         "validation_poses": sorted(validation_poses),
         "train_poses": sorted(set(pose_ids) - validation_poses),
-        "flagged_images": sum(item.flagged_count for item in consensuses.values()),
-        "poses": {
-            str(pose_id): {
-                "images": item.pair_count,
-                "median_consensus_iou": round(item.median_iou, 6),
-                "minimum_consensus_iou": round(item.minimum_iou, 6),
-                "flagged_images": item.flagged_count,
-                "obb_pixels": [[round(float(x), 2), round(float(y), 2)] for x, y in item.box],
+        "flagged_images": sum(item.flagged_count for item in all_consensuses.values()),
+        "classes": {
+            str(class_id): {
+                "name": source.name,
+                "source_directory": str(source.directory),
+                "poses": {
+                    str(pose_id): {
+                        "images": all_consensuses[(class_id, pose_id)].pair_count,
+                        "median_consensus_iou": round(
+                            all_consensuses[(class_id, pose_id)].median_iou,
+                            6,
+                        ),
+                        "minimum_consensus_iou": round(
+                            all_consensuses[(class_id, pose_id)].minimum_iou,
+                            6,
+                        ),
+                        "flagged_images": all_consensuses[
+                            (class_id, pose_id)
+                        ].flagged_count,
+                        "obb_pixels": [
+                            [round(float(x), 2), round(float(y), 2)]
+                            for x, y in all_consensuses[(class_id, pose_id)].box
+                        ],
+                    }
+                    for pose_id in sorted(grouped)
+                },
             }
-            for pose_id, item in consensuses.items()
+            for class_id, source, _, grouped in source_data
         },
+        "empty_source_directory": str(config.empty_source.directory),
     }
     (output / "label_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    names_yaml = "".join(
+        f"  {class_id}: {json.dumps(source.name, ensure_ascii=False)}\n"
+        for class_id, source in enumerate(config.pose_sources)
+    )
     (output / "data.yaml").write_text(
-        "path: .\ntrain: images/train\nval: images/val\n"
-        f"names:\n  {config.class_id}: {json.dumps(config.class_name, ensure_ascii=False)}\n",
+        "path: .\ntrain: images/train\nval: images/val\nnames:\n" + names_yaml,
         encoding="utf-8",
     )
-    flagged = sum(item.flagged_count for item in consensuses.values())
+    flagged = sum(item.flagged_count for item in all_consensuses.values())
     return LabelingResult(
         output,
-        len(pairs),
+        positive_count,
         negative_count,
+        len(config.pose_sources),
         len(pose_ids),
         flagged,
         review,

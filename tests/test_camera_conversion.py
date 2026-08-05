@@ -3,7 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from automated_image_capture.hardware.camera import camera_error_message, convert_to_rgb
+from automated_image_capture.hardware.camera import (
+    MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+    camera_error_message,
+    convert_to_rgb,
+    is_camera_fetch_timeout,
+    should_retry_camera_fetch,
+)
 
 
 def test_mono8_to_rgb() -> None:
@@ -51,3 +57,23 @@ def test_exclusive_access_error_mentions_camera_explorer() -> None:
     message = camera_error_message(RuntimeError("Open device with exclusive access failed"))
 
     assert "Camera Explorer" in message
+
+
+def test_empty_gentl_timeout_exception_is_recognized_by_type() -> None:
+    class TimeoutException(Exception):
+        pass
+
+    error = TimeoutException()
+
+    assert str(error) == ""
+    assert is_camera_fetch_timeout(error)
+    assert should_retry_camera_fetch(error, 1)
+    assert should_retry_camera_fetch(error, MAX_CONSECUTIVE_FETCH_TIMEOUTS - 1)
+    assert not should_retry_camera_fetch(error, MAX_CONSECUTIVE_FETCH_TIMEOUTS)
+
+
+def test_non_timeout_camera_error_is_not_retried() -> None:
+    error = RuntimeError("Buffer payload is invalid")
+
+    assert not is_camera_fetch_timeout(error)
+    assert not should_retry_camera_fetch(error, 1)
