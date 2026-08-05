@@ -12,7 +12,8 @@ Die aktuelle Version zeigt das Kamera-Livebild und Gerätestatus an und erlaubt 
 unabhängige manuelle Steuerung beider Lichtpanels. Sie kann außerdem eine von sieben fest im
 UR-Programm freigegebenen Ansichten anfordern. Automatische Aufnahmesequenzen mit getrennten
 Panelhelligkeiten, optionaler Belichtungsvariation und Bild-/YAML-Speicherung sind enthalten.
-Automatische Annotation ist noch nicht enthalten.
+Konsensbasierte OBB-Annotation, kuratierte Zwei-Klassen-Datensätze und ein reproduzierbares
+YOLO26n-OBB-Training sind ebenfalls enthalten.
 
 ## Voraussetzungen
 
@@ -107,6 +108,35 @@ Adapter demselben Panel zuordnet. Die Lichtwerte sind als „bestätigter letzte
 gekennzeichnet. Das BLE-Protokoll liefert
 nicht in jeder Firmware verlässliche physische Istwerte zurück. Beim Beenden wird das Panel
 nicht automatisch ausgeschaltet oder umgestellt.
+
+## Kuratierung und YOLO26-OBB-Training
+
+Über **YOLO-Training …** werden die beiden vorhandenen Labeldatensätze als `Pose 1` und
+`Pose 2` zusammengeführt. Leerbilder werden dabei nur einmal übernommen. Der Review zeigt
+automatisch auffällige Aufnahmen zuerst; ein entferntes Häkchen schließt ausschließlich dieses
+Bild aus. Die Entscheidung wird in `curation.json` gespeichert und verändert keine Quelldatei.
+
+Der erzeugte, versionierte Datensatz besitzt getrennte Ordner für Train, Validation und Test.
+Alle Lichtvarianten derselben UR-Pose bleiben im selben Split. `dataset_manifest.json`
+dokumentiert Quelle, Klasse, Beleuchtung, Split und Review-Entscheidung jeder Aufnahme.
+
+Nach der Datensatzprüfung startet **Training starten** `yolo26n-obb.pt` in einem separaten
+Prozess. Standardmäßig werden 200 Epochen bei 640 Pixeln mit Early Stopping trainiert. Das
+Training verwendet keine Spiegelungen oder starken Rotationen, da diese die beiden physisch
+unterschiedlichen Bauteilposen verfälschen könnten. `best.pt`, Validierungs-/Testmetriken,
+Confusion-Matrizen und die Fehlalarmrate auf leeren Testbildern liegen anschließend im
+angezeigten Ergebnisordner.
+
+Dieselben Schritte sind ohne GUI reproduzierbar:
+
+```powershell
+uv run python -m automated_image_capture.training prepare
+uv run python -m automated_image_capture.training train --dataset <DATENSATZORDNER>
+uv run python -m automated_image_capture.training diagnose
+```
+
+Der erste Modellaufruf lädt die vortrainierten Gewichte, sofern sie noch nicht lokal vorhanden
+sind. Das Projekt verwendet für die vorhandene RTX 3060 PyTorch mit CUDA 11.8.
 
 ## Sicherheit
 

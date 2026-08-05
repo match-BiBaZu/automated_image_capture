@@ -4,6 +4,7 @@ import pytest
 from PyQt6.QtCore import QSettings
 
 from automated_image_capture.acquisition import AcquisitionSettings
+from automated_image_capture.dataset import default_build_config
 from automated_image_capture.labeling import LabelingConfig
 from automated_image_capture.settings import AppSettings, SettingsStore
 
@@ -88,3 +89,22 @@ def test_labeling_settings_round_trip(tmp_path) -> None:
     store.save_labeling(expected)
 
     assert store.load_labeling() == expected
+
+
+def test_training_paths_round_trip(tmp_path) -> None:
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    store = SettingsStore(backend)
+    pose1 = tmp_path / "pose1"
+    pose2 = tmp_path / "pose2"
+    output = tmp_path / "combined"
+    dataset = output / "dataset_1"
+
+    store.save_training_paths(pose1, pose2, output, dataset)
+    loaded = store.load_training_paths(default_build_config())
+
+    assert loaded == {
+        "pose1_dataset": pose1,
+        "pose2_dataset": pose2,
+        "output_root": output,
+        "dataset_directory": dataset,
+    }

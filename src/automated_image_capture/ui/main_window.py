@@ -31,6 +31,7 @@ from automated_image_capture.models import (
 )
 from automated_image_capture.settings import SettingsStore
 from automated_image_capture.ui.labeling_dialog import LabelingDialog
+from automated_image_capture.ui.training_dialog import TrainingDialog
 from automated_image_capture.ui.widgets import (
     AcquisitionCard,
     AcquisitionDialog,
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         self._last_image: QImage | None = None
         self._camera_status_data = CameraStatus()
         self._closing = False
+        self._training_dialog: TrainingDialog | None = None
         self.camera = CameraAdapter(self.config, self)
         self.robot = RobotAdapter(self.config, self)
         self.light = LightAdapter(
@@ -94,13 +96,16 @@ class MainWindow(QMainWindow):
         disconnect_all = QPushButton("Alle trennen")
         labeling_button = QPushButton("OBB-Labels …")
         settings_button = QPushButton("Einstellungen …")
+        training_button = QPushButton("YOLO-Training …")
         connect_all.clicked.connect(self.connect_all)
         disconnect_all.clicked.connect(self.disconnect_all)
         labeling_button.clicked.connect(self.open_labeling)
+        training_button.clicked.connect(self.open_training)
         settings_button.clicked.connect(self.open_settings)
         toolbar.addWidget(connect_all)
         toolbar.addWidget(disconnect_all)
         toolbar.addWidget(labeling_button)
+        toolbar.addWidget(training_button)
         toolbar.addStretch(1)
         safety = QLabel("UR16e: nur freigegebene Posen über RTDE-Handshake")
         safety.setStyleSheet("color:#b45309; font-weight:600;")
@@ -342,6 +347,19 @@ class MainWindow(QMainWindow):
         dialog = LabelingDialog(self.settings_store, self)
         dialog.exec()
 
+    def open_training(self) -> None:
+        if self._training_dialog is None:
+            self._training_dialog = TrainingDialog(self.settings_store, self)
+            self._training_dialog.finished.connect(self._training_dialog_closed)
+        self._training_dialog.show()
+        self._training_dialog.raise_()
+        self._training_dialog.activateWindow()
+
+    def _training_dialog_closed(self) -> None:
+        if self._training_dialog is not None:
+            self._training_dialog.deleteLater()
+        self._training_dialog = None
+
     def open_acquisition_settings(self) -> None:
         if self.acquisition.running:
             return
@@ -401,11 +419,15 @@ class MainWindow(QMainWindow):
         self.light_card.command_timer.stop()
         self.light_2_card.command_timer.stop()
         self.acquisition.stop()
+        if self._training_dialog is not None:
+            self._training_dialog.shutdown()
         self.camera.disconnect()
         self.robot.disconnect()
         event.accept()
 
     async def shutdown_async(self) -> None:
+        if self._training_dialog is not None:
+            self._training_dialog.shutdown()
         self.acquisition.close()
         self.camera.disconnect()
         self.robot.disconnect()

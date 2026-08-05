@@ -16,8 +16,11 @@ dependencies = [
     "harvesters>=1.4.3,<2",
     "neewerlite==0.3.3",
     "numpy>=2.0,<3",
-    "opencv-python-headless>=4.10,<5",
+    "opencv-python>=4.10,<5",
     "qasync>=0.27,<1",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "ultralytics==8.4.102",
     "ur-rtde==1.6.3",
 ]
 
@@ -40,7 +43,17 @@ addopts = "-ra"
 testpaths = ["tests"]
 markers = [
     "hardware: requires the physical camera, robot, or BLE light",
+    "training: requires Ultralytics model weights and optionally a CUDA GPU",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }
 
 [tool.ruff]
 line-length = 100
@@ -48,4 +61,3 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
