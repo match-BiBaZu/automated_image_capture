@@ -15,6 +15,13 @@ def _source_root(root: Path) -> None:
     (root / "images").mkdir(parents=True)
     (root / "labels").mkdir()
     (root / "label_report.csv").write_text("unused\n", encoding="utf-8")
+    (root / "label_summary.json").write_text(
+        '{"classes":{"0":{"name":"Pose 1"}}}', encoding="utf-8"
+    )
+    (root / "data.yaml").write_text(
+        "path: .\ntrain: images\nval: images\nnames:\n  0: Pose 1\n",
+        encoding="utf-8",
+    )
 
 
 def _record(tmp_path: Path, record_id: str, quality: str) -> DatasetRecord:
@@ -41,15 +48,12 @@ def _record(tmp_path: Path, record_id: str, quality: str) -> DatasetRecord:
 
 
 def test_review_can_exclude_a_single_image(qtbot, monkeypatch, tmp_path: Path) -> None:
-    pose1 = tmp_path / "pose1"
-    pose2 = tmp_path / "pose2"
-    _source_root(pose1)
-    _source_root(pose2)
+    source = tmp_path / "obb"
+    _source_root(source)
     backend = QSettings(str(tmp_path / "gui.ini"), QSettings.Format.IniFormat)
     dialog = TrainingDialog(SettingsStore(backend))
     qtbot.addWidget(dialog)
-    dialog.pose1_path.setText(str(pose1))
-    dialog.pose2_path.setText(str(pose2))
+    dialog.source_path.setText(str(source))
     dialog.output_path.setText(str(tmp_path / "out"))
     records = [_record(tmp_path, "pass", "PASS"), _record(tmp_path, "review", "REVIEW")]
     monkeypatch.setattr(

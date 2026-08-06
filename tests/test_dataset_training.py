@@ -23,63 +23,76 @@ from automated_image_capture.dataset import (
 from automated_image_capture.training import TrainingConfig, TrainingError
 
 
-def _write_labeled_source(root: Path, old_class: int) -> None:
+def _write_labeled_source(root: Path) -> None:
     image_dir = root / "images" / "old"
     label_dir = root / "labels" / "old"
     image_dir.mkdir(parents=True)
     label_dir.mkdir(parents=True)
     rows: list[dict[str, object]] = []
-    index = 1
-    for pose in sorted(ALL_POSES):
+    for class_id, class_name in ((0, "Pose 1"), (1, "Pose 2")):
+        index = 1
+        for pose in sorted(ALL_POSES):
+            for panel_1 in (0, 50):
+                raw_name = f"img_{index:06d}_ur{pose}_p1-{panel_1:03d}_p2-000_auto.png"
+                positive_name = f"class_{class_id:03d}_{raw_name}"
+                image = np.full((160, 240), 30 + panel_1, dtype=np.uint8)
+                cv2.rectangle(image, (60, 40), (170, 120), 180, -1)
+                assert cv2.imwrite(str(image_dir / positive_name), image)
+                positive_label = f"{Path(positive_name).stem}.txt"
+                (label_dir / positive_label).write_text(
+                    f"{class_id} 0.25 0.25 0.75 0.25 0.75 0.75 0.25 0.75\n",
+                    encoding="ascii",
+                )
+                rows.append(
+                    {
+                        "pose_id": pose,
+                        "panel_1": panel_1,
+                        "panel_2": 0,
+                        "exposure": "auto",
+                        "foreground_file": raw_name,
+                        "background_file": raw_name,
+                        "consensus_iou": 0.2 if panel_1 == 0 else 0.9,
+                        "quality": "REVIEW" if panel_1 == 0 else "PASS",
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "dataset_image": positive_name,
+                        "label_file": positive_label,
+                    }
+                )
+                index += 1
+    for pose_index, pose in enumerate(sorted(ALL_POSES), 1):
         for panel_1 in (0, 50):
-            raw_name = f"img_{index:06d}_ur{pose}_p1-{panel_1:03d}_p2-000_auto.png"
-            positive_name = f"Kk1_{raw_name}"
-            background_name = f"background_{raw_name}"
+            raw_index = (pose_index - 1) * 2 + (1 if panel_1 == 0 else 2)
+            raw_name = f"img_{raw_index:06d}_ur{pose}_p1-{panel_1:03d}_p2-000_auto.png"
+            background_name = f"empty_{raw_name}"
             image = np.full((160, 240), 30 + panel_1, dtype=np.uint8)
-            cv2.rectangle(image, (60, 40), (170, 120), 180, -1)
-            assert cv2.imwrite(str(image_dir / positive_name), image)
             assert cv2.imwrite(str(image_dir / background_name), np.full_like(image, 50))
-            positive_label = f"{Path(positive_name).stem}.txt"
             background_label = f"{Path(background_name).stem}.txt"
-            (label_dir / positive_label).write_text(
-                f"{old_class} 0.25 0.25 0.75 0.25 0.75 0.75 0.25 0.75\n",
-                encoding="ascii",
-            )
             (label_dir / background_label).write_text("", encoding="ascii")
-            rows.append(
-                {
-                    "pose_id": pose,
-                    "panel_1": panel_1,
-                    "panel_2": 0,
-                    "exposure": "auto",
-                    "foreground_file": raw_name,
-                    "background_file": raw_name,
-                    "consensus_iou": 0.2 if panel_1 == 0 else 0.9,
-                    "quality": "REVIEW" if panel_1 == 0 else "PASS",
-                    "dataset_image": positive_name,
-                    "label_file": positive_label,
-                }
-            )
-            index += 1
     with (root / "label_report.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    (root / "label_summary.json").write_text(
+        json.dumps({"classes": {"0": {"name": "Pose 1"}, "1": {"name": "Pose 2"}}}),
+        encoding="utf-8",
+    )
+    (root / "data.yaml").write_text(
+        "path: .\ntrain: images/old\nval: images/old\nnames:\n  0: Pose 1\n  1: Pose 2\n",
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture
-def source_datasets(tmp_path: Path) -> tuple[Path, Path]:
-    pose1 = tmp_path / "pose1"
-    pose2 = tmp_path / "pose2"
-    _write_labeled_source(pose1, 7)
-    _write_labeled_source(pose2, 9)
-    return pose1, pose2
+def source_dataset(tmp_path: Path) -> Path:
+    source = tmp_path / "obb"
+    _write_labeled_source(source)
+    return source
 
 
-def _config(tmp_path: Path, sources: tuple[Path, Path]) -> DatasetBuildConfig:
+def _config(tmp_path: Path, source: Path) -> DatasetBuildConfig:
     return DatasetBuildConfig(
-        pose1_dataset=sources[0],
-        pose2_dataset=sources[1],
+        source_dataset=source,
         output_root=tmp_path / "combined",
         curation_path=tmp_path / "combined" / "curation.json",
         version_name="test_dataset",
@@ -87,9 +100,9 @@ def _config(tmp_path: Path, sources: tuple[Path, Path]) -> DatasetBuildConfig:
 
 
 def test_collects_two_classes_and_deduplicates_empty_images(
-    tmp_path: Path, source_datasets: tuple[Path, Path]
+    tmp_path: Path, source_dataset: Path
 ) -> None:
-    records = collect_dataset_records(_config(tmp_path, source_datasets))
+    records = collect_dataset_records(_config(tmp_path, source_dataset))
 
     assert len(records) == 90
     assert sum(record.class_id == 0 for record in records) == 30
@@ -101,17 +114,17 @@ def test_collects_two_classes_and_deduplicates_empty_images(
     assert sum(record.split == "test" for record in records) == 18
 
 
-def test_build_rewrites_classes_and_keeps_pose_splits_disjoint(
-    tmp_path: Path, source_datasets: tuple[Path, Path]
+def test_build_keeps_classes_and_pose_splits_disjoint(
+    tmp_path: Path, source_dataset: Path
 ) -> None:
-    result = build_curated_dataset(_config(tmp_path, source_datasets))
+    result = build_curated_dataset(_config(tmp_path, source_dataset))
     integrity = verify_curated_dataset(result.dataset_directory)
 
     assert integrity.valid
     assert integrity.image_count == integrity.label_count == 90
     assert integrity.class_counts == {"Pose 1": 30, "Pose 2": 30, "Leere Rutsche": 30}
-    pose1_labels = list((result.dataset_directory / "labels").rglob("pose1_*.txt"))
-    pose2_labels = list((result.dataset_directory / "labels").rglob("pose2_*.txt"))
+    pose1_labels = list((result.dataset_directory / "labels").rglob("class_000_*.txt"))
+    pose2_labels = list((result.dataset_directory / "labels").rglob("class_001_*.txt"))
     assert all(path.read_text(encoding="ascii").startswith("0 ") for path in pose1_labels)
     assert all(path.read_text(encoding="ascii").startswith("1 ") for path in pose2_labels)
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -122,12 +135,16 @@ def test_build_rewrites_classes_and_keeps_pose_splits_disjoint(
 
 
 def test_curation_excludes_only_selected_record(
-    tmp_path: Path, source_datasets: tuple[Path, Path]
+    tmp_path: Path, source_dataset: Path
 ) -> None:
-    config = _config(tmp_path, source_datasets)
+    config = _config(tmp_path, source_dataset)
     records = collect_dataset_records(config)
     excluded = records[0]
-    save_curation(config.curation_path, [excluded.record_id])  # type: ignore[arg-type]
+    save_curation(
+        config.curation_path,
+        [excluded.record_id],
+        config.source_dataset,
+    )  # type: ignore[arg-type]
 
     result = build_curated_dataset(config)
 
@@ -139,9 +156,9 @@ def test_curation_excludes_only_selected_record(
 def test_hardlink_failure_falls_back_to_copy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    source_datasets: tuple[Path, Path],
+    source_dataset: Path,
 ) -> None:
-    config = _config(tmp_path, source_datasets)
+    config = _config(tmp_path, source_dataset)
 
     def fail_link(_source: Path, _target: Path) -> None:
         raise OSError("different volume")
@@ -151,20 +168,20 @@ def test_hardlink_failure_falls_back_to_copy(
     assert result.included_images == 90
 
 
-def test_preview_contains_rgb_overlay(tmp_path: Path, source_datasets: tuple[Path, Path]) -> None:
-    record = collect_dataset_records(_config(tmp_path, source_datasets))[0]
+def test_preview_contains_rgb_overlay(tmp_path: Path, source_dataset: Path) -> None:
+    record = collect_dataset_records(_config(tmp_path, source_dataset))[0]
     preview = render_record_preview(record)
     assert preview.shape == (160, 240, 3)
     assert np.any(preview[:, :, 1] > preview[:, :, 0])
 
 
-def test_unknown_pose_is_rejected(tmp_path: Path, source_datasets: tuple[Path, Path]) -> None:
-    report = source_datasets[0] / "label_report.csv"
+def test_unknown_pose_is_rejected(tmp_path: Path, source_dataset: Path) -> None:
+    report = source_dataset / "label_report.csv"
     text = report.read_text(encoding="utf-8").replace("155,", "999,", 1)
     report.write_text(text, encoding="utf-8")
 
     with pytest.raises(DatasetError, match="keinem Split"):
-        collect_dataset_records(_config(tmp_path, source_datasets))
+        collect_dataset_records(_config(tmp_path, source_dataset))
 
 
 def test_training_config_requires_verified_dataset(tmp_path: Path) -> None:
@@ -173,9 +190,9 @@ def test_training_config_requires_verified_dataset(tmp_path: Path) -> None:
 
 
 def test_resized_training_dataset_preserves_labels_and_is_reused(
-    tmp_path: Path, source_datasets: tuple[Path, Path]
+    tmp_path: Path, source_dataset: Path
 ) -> None:
-    dataset = build_curated_dataset(_config(tmp_path, source_datasets)).dataset_directory
+    dataset = build_curated_dataset(_config(tmp_path, source_dataset)).dataset_directory
 
     first = prepare_resized_training_dataset(dataset, 128)
     second = prepare_resized_training_dataset(dataset, 128)

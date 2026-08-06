@@ -702,7 +702,9 @@ class AcquisitionController(QObject):
 
     def _wait_for_frame(self) -> None:
         self._frame_after = time.time()
-        self._set_phase("frame", 5.0)
+        # The camera worker can recover a temporarily stalled GenTL stream twice.
+        # Keep the capture point alive long enough for that recovery to complete.
+        self._set_phase("frame", 20.0)
         self.status_changed.emit(
             f"Warte auf frisches Kamerabild ({self._index + 1}/{len(self._points)}) …"
         )

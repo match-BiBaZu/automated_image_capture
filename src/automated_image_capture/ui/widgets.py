@@ -29,7 +29,7 @@ from automated_image_capture.acquisition import (
     build_capture_points,
 )
 from automated_image_capture.hardware.robot import ALLOWED_POSES
-from automated_image_capture.models import ConnectionState, LightStatus, RobotStatus
+from automated_image_capture.models import CameraStatus, ConnectionState, LightStatus, RobotStatus
 from automated_image_capture.settings import AppSettings
 
 STATE_COLORS = {
@@ -76,6 +76,77 @@ class DeviceCard(QGroupBox):
         self.action_button.setText(
             "Verbinden" if state is ConnectionState.DISCONNECTED else "Trennen"
         )
+
+
+class CameraControlCard(DeviceCard):
+    exposure_requested = pyqtSignal(float)
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(title, parent)
+        self._status = CameraStatus()
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Belichtungszeit"))
+        self.exposure_time = QSpinBox()
+        self.exposure_time.setRange(1, 2_000_000_000)
+        self.exposure_time.setSuffix(" µs")
+        self.exposure_time.setSingleStep(100)
+        self.exposure_time.setEnabled(False)
+        row.addWidget(self.exposure_time, 1)
+        self.apply_exposure_button = QPushButton("Übernehmen")
+        self.apply_exposure_button.setEnabled(False)
+        self.apply_exposure_button.clicked.connect(self._apply_exposure)
+        row.addWidget(self.apply_exposure_button)
+        self.content_layout.addLayout(row)
+
+        self.exposure_hint = QLabel(
+            "Die Einstellung gilt bis zum Trennen der Kamera; danach wird der "
+            "ursprüngliche Wert wiederhergestellt."
+        )
+        self.exposure_hint.setWordWrap(True)
+        self.content_layout.addWidget(self.exposure_hint)
+
+    def set_status(self, status: CameraStatus) -> None:
+        self._status = status
+        minimum = max(1, round(status.exposure_min_us or 1))
+        maximum = max(minimum, round(status.exposure_max_us or 2_000_000_000))
+        self.exposure_time.setRange(minimum, maximum)
+        if status.exposure_time_us is not None and not self.exposure_time.hasFocus():
+            self.exposure_time.setValue(round(status.exposure_time_us))
+        self._update_exposure_controls()
+
+    def set_state(self, state: ConnectionState) -> None:
+        super().set_state(state)
+        self._update_exposure_controls()
+
+    def _update_exposure_controls(self) -> None:
+        if not hasattr(self, "exposure_time"):
+            return
+        enabled = self.state is ConnectionState.CONNECTED and self._status.exposure_writable
+        self.exposure_time.setEnabled(enabled)
+        self.apply_exposure_button.setEnabled(enabled)
+        if (
+            self._status.exposure_auto.lower() not in {"off", "–", "none"}
+            and enabled
+        ):
+            self.exposure_hint.setText(
+                "Übernehmen deaktiviert ExposureAuto für diese Verbindung. Beim Trennen "
+                "wird der ursprüngliche Automatikmodus wiederhergestellt."
+            )
+        elif self._status.exposure_auto.lower() not in {"off", "–", "none"}:
+            self.exposure_hint.setText(
+                "ExposureAuto ist aktiv und kann von der Kamera aktuell nicht "
+                "deaktiviert werden."
+            )
+        else:
+            self.exposure_hint.setText(
+                "Die Einstellung gilt bis zum Trennen der Kamera; danach wird der "
+                "ursprüngliche Wert wiederhergestellt."
+            )
+
+    def _apply_exposure(self) -> None:
+        if self.apply_exposure_button.isEnabled():
+            self.exposure_requested.emit(float(self.exposure_time.value()))
 
 
 class RobotPoseControlCard(DeviceCard):

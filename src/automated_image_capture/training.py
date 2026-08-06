@@ -485,9 +485,8 @@ def _parser() -> argparse.ArgumentParser:
     defaults = default_build_config()
     parser = argparse.ArgumentParser(description="Kuratierung und YOLO26-OBB-Training")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    prepare = subparsers.add_parser("prepare", help="Kombinierten YOLO-OBB-Datensatz bauen")
-    prepare.add_argument("--pose1", type=Path, default=defaults.pose1_dataset)
-    prepare.add_argument("--pose2", type=Path, default=defaults.pose2_dataset)
+    prepare = subparsers.add_parser("prepare", help="Kuratierten YOLO-OBB-Datensatz bauen")
+    prepare.add_argument("--source", type=Path, default=defaults.source_dataset)
     prepare.add_argument("--output", type=Path, default=defaults.output_root)
     prepare.add_argument("--curation", type=Path, default=defaults.curation_path)
     prepare.add_argument("--copy", action="store_true", help="Kopieren statt Hardlinks verwenden")
@@ -522,8 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "prepare":
             result = build_curated_dataset(
                 DatasetBuildConfig(
-                    pose1_dataset=args.pose1,
-                    pose2_dataset=args.pose2,
+                    source_dataset=args.source,
                     output_root=args.output,
                     curation_path=args.curation,
                     prefer_hardlinks=not args.copy,

@@ -91,6 +91,39 @@ def test_light_controls_follow_connection_state(qtbot, tmp_path) -> None:
     assert window.light_2_card.brightness.isEnabled()
 
 
+def test_camera_exposure_control_follows_status_and_emits_request(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+    spy = QSignalSpy(window.camera_card.exposure_requested)
+
+    window.camera_card.set_state(ConnectionState.CONNECTED)
+    window._camera_status(
+        CameraStatus(
+            exposure_time_us=4_000,
+            exposure_min_us=100,
+            exposure_max_us=100_000,
+            exposure_writable=True,
+            exposure_auto="Off",
+        )
+    )
+
+    assert window.camera_card.exposure_time.isEnabled()
+    assert window.camera_card.exposure_time.value() == 4_000
+    window.camera_card.exposure_time.setValue(7_500)
+    window.camera_card.apply_exposure_button.click()
+    assert len(spy) == 1
+    assert spy[0][0] == 7_500.0
+
+    window._camera_status(
+        CameraStatus(exposure_writable=True, exposure_auto="Continuous")
+    )
+    assert window.camera_card.exposure_time.isEnabled()
+    assert "deaktiviert ExposureAuto" in window.camera_card.exposure_hint.text()
+
+    window._camera_status(CameraStatus(exposure_writable=False, exposure_auto="Continuous"))
+    assert not window.camera_card.exposure_time.isEnabled()
+    assert "ExposureAuto" in window.camera_card.exposure_hint.text()
+
+
 def test_device_failures_do_not_change_other_cards(qtbot, tmp_path) -> None:
     window = make_window(qtbot, tmp_path)
 

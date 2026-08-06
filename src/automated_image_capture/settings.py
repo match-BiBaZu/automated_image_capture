@@ -289,13 +289,9 @@ class SettingsStore:
 
     def load_training_paths(self, defaults) -> dict[str, Path | None]:
         dataset_value = str(self._settings.value("training/dataset_directory", "")).strip()
+        source_value = str(self._settings.value("training/source_dataset", "")).strip()
         return {
-            "pose1_dataset": Path(
-                str(self._settings.value("training/pose1_dataset", str(defaults.pose1_dataset)))
-            ),
-            "pose2_dataset": Path(
-                str(self._settings.value("training/pose2_dataset", str(defaults.pose2_dataset)))
-            ),
+            "source_dataset": Path(source_value) if source_value else defaults.source_dataset,
             "output_root": Path(
                 str(self._settings.value("training/output_root", str(defaults.output_root)))
             ),
@@ -304,13 +300,11 @@ class SettingsStore:
 
     def save_training_paths(
         self,
-        pose1_dataset: Path,
-        pose2_dataset: Path,
+        source_dataset: Path,
         output_root: Path,
         dataset_directory: Path | None,
     ) -> None:
-        self._settings.setValue("training/pose1_dataset", str(pose1_dataset))
-        self._settings.setValue("training/pose2_dataset", str(pose2_dataset))
+        self._settings.setValue("training/source_dataset", str(source_dataset))
         self._settings.setValue("training/output_root", str(output_root))
         self._settings.setValue(
             "training/dataset_directory",

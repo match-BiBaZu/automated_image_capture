@@ -16,7 +16,24 @@ from automated_image_capture.models import CameraFrame, CameraStatus, Connection
 from automated_image_capture.settings import AppSettings
 
 FETCH_TIMEOUT_SECONDS = 0.5
-MAX_CONSECUTIVE_FETCH_TIMEOUTS = 6
+FETCH_TIMEOUT_MARGIN_SECONDS = 0.5
+STREAM_DEGRADED_AFTER_SECONDS = 3.0
+STREAM_RESTART_AFTER_SECONDS = 5.0
+MAX_STREAM_RESTART_ATTEMPTS = 2
+# Kept for callers of the small retry-policy helper. The worker itself uses
+# elapsed time, because a long exposure also increases the individual fetch timeout.
+MAX_CONSECUTIVE_FETCH_TIMEOUTS = 10
+
+
+def camera_fetch_timeout_seconds(exposure_time_us: float | None) -> float:
+    """Allow one exposure plus transfer margin before treating a fetch as late."""
+    if exposure_time_us is None:
+        return FETCH_TIMEOUT_SECONDS
+    return max(
+        FETCH_TIMEOUT_SECONDS,
+        max(0.0, float(exposure_time_us)) / 1_000_000.0
+        + FETCH_TIMEOUT_MARGIN_SECONDS,
+    )
 
 
 def _normalize_to_uint8(image: np.ndarray, pixel_format: str) -> np.ndarray:
@@ -196,7 +213,9 @@ class CameraWorker(QObject):
         harvester = None
         acquirer = None
         exposure_node: Any = None
+        exposure_auto_node: Any = None
         original_exposure: float | None = None
+        original_exposure_auto: str | None = None
         try:
             self.state_changed.emit(ConnectionState.DISCOVERING)
             self.event_message.emit("Suche über den Baumer GenTL-Producer …")
@@ -224,8 +243,10 @@ class CameraWorker(QObject):
             acquirer = harvester.create(selected)
             node_map = acquirer.remote_device.node_map
             exposure_node = _find_node(node_map, "ExposureTime", "ExposureTimeAbs")
+            exposure_auto_node = _find_node(node_map, "ExposureAuto")
             original_exposure = _node_number(exposure_node, "value")
             exposure_auto = str(_node_value(node_map, "ExposureAuto", "–"))
+            original_exposure_auto = exposure_auto
             width = int(_node_value(node_map, "Width", 0))
             height = int(_node_value(node_map, "Height", 0))
             pixel_format = str(_node_value(node_map, "PixelFormat", "Unbekannt"))
@@ -249,8 +270,11 @@ class CameraWorker(QObject):
                 exposure_time_us=original_exposure,
                 exposure_min_us=_node_number(exposure_node, "min"),
                 exposure_max_us=_node_number(exposure_node, "max"),
-                exposure_writable=_node_writable(exposure_node)
-                and exposure_auto.lower() in {"off", "–", "none"},
+                exposure_writable=exposure_node is not None
+                and (
+                    _node_writable(exposure_node)
+                    or _node_writable(exposure_auto_node)
+                ),
                 exposure_auto=exposure_auto,
                 gain=(
                     float(_node_value(node_map, "Gain", 0.0))
@@ -268,6 +292,10 @@ class CameraWorker(QObject):
             fps_window_start = time.monotonic()
             preview_frames = 0
             consecutive_fetch_timeouts = 0
+            stream_restart_attempts = 0
+            outage_started: float | None = None
+            restart_window_started: float | None = None
+            stream_degraded = False
 
             while not self._stop.is_set():
                 try:
@@ -278,16 +306,43 @@ class CameraWorker(QObject):
                                 "Die Belichtungszeit ist an dieser Kamera nicht manuell "
                                 "verstellbar."
                             )
-                        if requested_exposure is None:
+                        restoring = requested_exposure is None
+                        if restoring:
                             if original_exposure is None:
                                 raise RuntimeError("Ursprüngliche Belichtungszeit ist unbekannt.")
                             requested_exposure = original_exposure
+                        current_auto = str(
+                            getattr(exposure_auto_node, "value", status.exposure_auto)
+                        )
+                        if current_auto.lower() not in {"off", "–", "none"}:
+                            if exposure_auto_node is None or not _node_writable(
+                                exposure_auto_node
+                            ):
+                                raise RuntimeError(
+                                    "ExposureAuto ist aktiv und kann nicht deaktiviert werden."
+                                )
+                            exposure_auto_node.value = "Off"
                         minimum = status.exposure_min_us or requested_exposure
                         maximum = status.exposure_max_us or requested_exposure
                         requested_exposure = max(minimum, min(maximum, requested_exposure))
+                        if not _node_writable(exposure_node):
+                            raise RuntimeError(
+                                "ExposureTime ist nach dem Abschalten von ExposureAuto "
+                                "nicht beschreibbar."
+                            )
                         exposure_node.value = requested_exposure
                         applied = float(exposure_node.value)
+                        if (
+                            restoring
+                            and exposure_auto_node is not None
+                            and original_exposure_auto is not None
+                            and original_exposure_auto.lower() not in {"off", "–", "none"}
+                        ):
+                            exposure_auto_node.value = original_exposure_auto
                         status.exposure_time_us = applied
+                        status.exposure_auto = str(
+                            getattr(exposure_auto_node, "value", status.exposure_auto)
+                        )
                         self.status_changed.emit(status)
                         self.exposure_applied.emit(applied)
                 except queue.Empty:
@@ -296,12 +351,18 @@ class CameraWorker(QObject):
                     self.exposure_failed.emit(str(exc) or type(exc).__name__)
 
                 try:
-                    with acquirer.fetch(timeout=FETCH_TIMEOUT_SECONDS) as buffer:
-                        if consecutive_fetch_timeouts:
+                    fetch_timeout = camera_fetch_timeout_seconds(status.exposure_time_us)
+                    with acquirer.fetch(timeout=fetch_timeout) as buffer:
+                        if stream_degraded:
+                            self.state_changed.emit(ConnectionState.CONNECTED)
                             self.event_message.emit(
-                                "Kamerastream nach kurzem Buffer-Timeout wiederhergestellt."
+                                "Kamerastream automatisch wiederhergestellt."
                             )
                         consecutive_fetch_timeouts = 0
+                        stream_restart_attempts = 0
+                        outage_started = None
+                        restart_window_started = None
+                        stream_degraded = False
                         component = buffer.payload.components[0]
                         now = time.monotonic()
                         if now - last_preview < preview_interval:
@@ -319,6 +380,10 @@ class CameraWorker(QObject):
                     elapsed = now - fps_window_start
                     if elapsed >= 1.0:
                         status.preview_fps = preview_frames / elapsed
+                        status.exposure_time_us = _node_number(exposure_node, "value")
+                        status.exposure_auto = str(
+                            getattr(exposure_auto_node, "value", status.exposure_auto)
+                        )
                         self.status_changed.emit(status)
                         fps_window_start = now
                         preview_frames = 0
@@ -327,19 +392,49 @@ class CameraWorker(QObject):
                         break
                     if is_camera_fetch_timeout(exc):
                         consecutive_fetch_timeouts += 1
+                        now = time.monotonic()
+                        if outage_started is None:
+                            outage_started = now
+                            restart_window_started = now
                         if consecutive_fetch_timeouts == 1:
                             self.event_message.emit(
                                 "Ein Kamerabuffer blieb aus; der Stream wird weiter abgefragt."
                             )
-                        if should_retry_camera_fetch(exc, consecutive_fetch_timeouts):
+                        outage_seconds = now - outage_started
+                        if (
+                            not stream_degraded
+                            and outage_seconds >= STREAM_DEGRADED_AFTER_SECONDS
+                        ):
+                            stream_degraded = True
+                            status.preview_fps = 0.0
+                            self.status_changed.emit(status)
+                            self.state_changed.emit(ConnectionState.DEGRADED)
+                            self.event_message.emit(
+                                "Kamerastream vorübergehend unterbrochen; "
+                                "Wiederherstellung läuft."
+                            )
+                        assert restart_window_started is not None
+                        if now - restart_window_started < STREAM_RESTART_AFTER_SECONDS:
                             continue
-                        elapsed_without_frame = (
-                            consecutive_fetch_timeouts * FETCH_TIMEOUT_SECONDS
-                        )
+                        if stream_restart_attempts < MAX_STREAM_RESTART_ATTEMPTS:
+                            stream_restart_attempts += 1
+                            self.event_message.emit(
+                                "Starte den Kamera-Datenstrom neu "
+                                f"(Versuch {stream_restart_attempts}/"
+                                f"{MAX_STREAM_RESTART_ATTEMPTS}) …"
+                            )
+                            try:
+                                acquirer.stop()
+                            except Exception:
+                                pass
+                            acquirer.start()
+                            consecutive_fetch_timeouts = 0
+                            restart_window_started = time.monotonic()
+                            continue
                         raise RuntimeError(
                             "Kamerastream liefert seit "
-                            f"{elapsed_without_frame:.1f} Sekunden kein Bild "
-                            f"({consecutive_fetch_timeouts} aufeinanderfolgende Timeouts)."
+                            f"{outage_seconds:.1f} Sekunden kein Bild; "
+                            "die automatische Wiederherstellung ist fehlgeschlagen."
                         ) from exc
                     raise
         except Exception as exc:
@@ -349,7 +444,18 @@ class CameraWorker(QObject):
             if acquirer is not None:
                 if exposure_node is not None and original_exposure is not None:
                     try:
+                        current_auto = str(
+                            getattr(exposure_auto_node, "value", original_exposure_auto)
+                        )
+                        if (
+                            current_auto.lower() not in {"off", "–", "none"}
+                            and exposure_auto_node is not None
+                            and _node_writable(exposure_auto_node)
+                        ):
+                            exposure_auto_node.value = "Off"
                         exposure_node.value = original_exposure
+                        if exposure_auto_node is not None and original_exposure_auto is not None:
+                            exposure_auto_node.value = original_exposure_auto
                     except Exception:
                         pass
                 try:

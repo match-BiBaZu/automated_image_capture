@@ -46,6 +46,15 @@ from automated_image_capture.settings import SettingsStore
 from automated_image_capture.training import EVENT_PREFIX
 
 
+def _dataset_uses_source(dataset: Path, source: Path) -> bool:
+    try:
+        payload = json.loads((dataset / "dataset_manifest.json").read_text(encoding="utf-8"))
+        configured = Path(str(payload["sources"]["source_dataset"])).resolve()
+        return configured == source.expanduser().resolve()
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
 class DatasetBuildWorker(QObject):
     progress = pyqtSignal(int, int, str)
     completed = pyqtSignal(object)
@@ -87,11 +96,17 @@ class TrainingDialog(QDialog):
         self._records: list[DatasetRecord] = []
         self._excluded_ids: set[str] = set()
         self._dataset_directory: Path | None = paths.get("dataset_directory")
+        source_path = Path(paths["source_dataset"])
+        if self._dataset_directory is not None and not _dataset_uses_source(
+            self._dataset_directory, source_path
+        ):
+            self._dataset_directory = None
         if self._dataset_directory is None:
             candidates = sorted(
                 (
                     path.parent
                     for path in Path(paths["output_root"]).glob("dataset_*/data.yaml")
+                    if _dataset_uses_source(path.parent, source_path)
                 ),
                 key=lambda path: path.stat().st_mtime,
                 reverse=True,
@@ -114,11 +129,12 @@ class TrainingDialog(QDialog):
     def _build_ui(self, paths: dict[str, Path | None]) -> None:
         root = QVBoxLayout(self)
         path_form = QFormLayout()
-        self.pose1_path = QLineEdit(str(paths["pose1_dataset"]))
-        self.pose2_path = QLineEdit(str(paths["pose2_dataset"]))
+        self.source_path = QLineEdit(str(paths["source_dataset"]))
         self.output_path = QLineEdit(str(paths["output_root"]))
-        path_form.addRow("Pose-1-Labels", self._path_row(self.pose1_path, self._browse_pose1))
-        path_form.addRow("Pose-2-Labels", self._path_row(self.pose2_path, self._browse_pose2))
+        path_form.addRow(
+            "OBB-Datensatz",
+            self._path_row(self.source_path, self._browse_source),
+        )
         path_form.addRow("Datensatz-Ausgabe", self._path_row(self.output_path, self._browse_output))
         root.addLayout(path_form)
 
@@ -240,11 +256,8 @@ class TrainingDialog(QDialog):
         if chosen:
             field.setText(chosen)
 
-    def _browse_pose1(self) -> None:
-        self._choose_directory(self.pose1_path, "Pose-1-Labeldatensatz auswählen")
-
-    def _browse_pose2(self) -> None:
-        self._choose_directory(self.pose2_path, "Pose-2-Labeldatensatz auswählen")
+    def _browse_source(self) -> None:
+        self._choose_directory(self.source_path, "Gemeinsamen OBB-Datensatz auswählen")
 
     def _browse_output(self) -> None:
         self._choose_directory(self.output_path, "Ausgabeordner auswählen")
@@ -252,8 +265,7 @@ class TrainingDialog(QDialog):
     def _config(self) -> DatasetBuildConfig:
         output = Path(self.output_path.text().strip())
         return DatasetBuildConfig(
-            pose1_dataset=Path(self.pose1_path.text().strip()),
-            pose2_dataset=Path(self.pose2_path.text().strip()),
+            source_dataset=Path(self.source_path.text().strip()),
             output_root=output,
             curation_path=output / "curation.json",
         ).validated()
@@ -266,11 +278,14 @@ class TrainingDialog(QDialog):
             QMessageBox.critical(self, "Datensatz kann nicht geladen werden", str(exc))
             return
         self._excluded_ids = {record.record_id for record in self._records if record.excluded}
+        self._dataset_directory = None
+        self.train_button.setEnabled(False)
+        self.open_dataset_button.setEnabled(False)
+        self.dataset_status.setText("Review geladen; Datensatz muss neu erzeugt werden.")
         self.settings_store.save_training_paths(
-            config.pose1_dataset,
-            config.pose2_dataset,
+            config.source_dataset,
             config.output_root,
-            self._dataset_directory,
+            None,
         )
         self._populate_table()
         self._update_review_summary()
@@ -401,7 +416,7 @@ class TrainingDialog(QDialog):
                 return
         config = self._config()
         curation_path = config.curation_path or config.output_root / "curation.json"
-        save_curation(curation_path, self._excluded_ids)
+        save_curation(curation_path, self._excluded_ids, config.source_dataset)
         config = replace(config, curation_path=curation_path)
         self._build_thread = QThread(self)
         self._build_worker = DatasetBuildWorker(config)
@@ -445,8 +460,7 @@ class TrainingDialog(QDialog):
         self.train_button.setEnabled(True)
         config = self._config()
         self.settings_store.save_training_paths(
-            config.pose1_dataset,
-            config.pose2_dataset,
+            config.source_dataset,
             config.output_root,
             self._dataset_directory,
         )
@@ -625,8 +639,7 @@ class TrainingDialog(QDialog):
         self.build_button.setEnabled(not busy)
         self.train_button.setEnabled(not busy and self._dataset_directory is not None)
         self.stop_button.setEnabled(busy)
-        self.pose1_path.setEnabled(not busy)
-        self.pose2_path.setEnabled(not busy)
+        self.source_path.setEnabled(not busy)
         self.output_path.setEnabled(not busy)
 
     def _open_dataset(self) -> None:

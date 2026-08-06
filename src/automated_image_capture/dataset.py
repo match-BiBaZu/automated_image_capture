@@ -35,30 +35,26 @@ class DatasetBuildCancelled(DatasetError):
 
 @dataclass(frozen=True, slots=True)
 class DatasetBuildConfig:
-    pose1_dataset: Path
-    pose2_dataset: Path
+    source_dataset: Path
     output_root: Path
     curation_path: Path | None = None
     prefer_hardlinks: bool = True
     version_name: str | None = None
 
     def validated(self) -> DatasetBuildConfig:
-        pose1 = self.pose1_dataset.expanduser().resolve()
-        pose2 = self.pose2_dataset.expanduser().resolve()
+        source = self.source_dataset.expanduser().resolve()
         output = self.output_root.expanduser().resolve()
-        for name, directory in (("Pose 1", pose1), ("Pose 2", pose2)):
-            if not directory.is_dir():
-                raise DatasetError(f"{name}: Datensatzordner nicht gefunden: {directory}")
-            for required in ("label_report.csv", "images", "labels"):
-                if not (directory / required).exists():
-                    raise DatasetError(f"{name}: {required} fehlt in {directory}")
+        if not source.is_dir():
+            raise DatasetError(f"OBB-Datensatzordner nicht gefunden: {source}")
+        for required in ("data.yaml", "label_report.csv", "label_summary.json", "images", "labels"):
+            if not (source / required).exists():
+                raise DatasetError(f"{required} fehlt in {source}")
         curation = self.curation_path
         if curation is not None:
             curation = curation.expanduser().resolve()
         return replace(
             self,
-            pose1_dataset=pose1,
-            pose2_dataset=pose2,
+            source_dataset=source,
             output_root=output,
             curation_path=curation,
         )
@@ -121,10 +117,9 @@ class ResizedDatasetResult:
 def default_build_config() -> DatasetBuildConfig:
     pictures = Path.home() / "Pictures"
     return DatasetBuildConfig(
-        pose1_dataset=pictures / "Kk1_yolo_obb_2",
-        pose2_dataset=pictures / "kk1_flipped" / "label",
-        output_root=pictures / "Kk1_pose12_yolo26_obb",
-        curation_path=pictures / "Kk1_pose12_yolo26_obb" / "curation.json",
+        source_dataset=pictures / "Kl1i" / "OBB",
+        output_root=pictures / "YOLO_Training",
+        curation_path=pictures / "YOLO_Training" / "curation.json",
     )
 
 
@@ -165,27 +160,50 @@ def _float_or_none(value: str | None) -> float | None:
         return None
 
 
-def _collect_positive_records(root: Path, namespace: str, class_id: int) -> list[DatasetRecord]:
+def _load_class_names(root: Path) -> dict[int, str]:
+    try:
+        payload = json.loads((root / "label_summary.json").read_text(encoding="utf-8"))
+        raw_classes = payload["classes"]
+        names = {
+            int(class_id): str(value["name"] if isinstance(value, dict) else value)
+            for class_id, value in raw_classes.items()
+        }
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise DatasetError(
+            f"Klassen können nicht aus label_summary.json gelesen werden: {exc}"
+        ) from exc
+    if not names or sorted(names) != list(range(len(names))):
+        raise DatasetError("Klassen-IDs müssen lückenlos bei 0 beginnen.")
+    return names
+
+
+def _collect_positive_records(root: Path, class_names: dict[int, str]) -> list[DatasetRecord]:
     image_index = _index_files(root, "images", ".png")
     label_index = _index_files(root, "labels", ".txt")
     records: list[DatasetRecord] = []
     with (root / "label_report.csv").open(encoding="utf-8-sig", newline="") as stream:
         for row in csv.DictReader(stream):
             pose_id = _integer(row, "pose_id")
+            class_id = _integer(row, "class_id")
+            if class_id not in class_names:
+                raise DatasetError(f"Unbekannte Klasse {class_id} im Label-Bericht.")
             dataset_image = row.get("dataset_image", "")
             label_file = row.get("label_file", "")
             if dataset_image not in image_index:
                 raise DatasetError(f"Bild aus Label-Bericht fehlt: {dataset_image}")
             if label_file not in label_index:
                 raise DatasetError(f"Label aus Label-Bericht fehlt: {label_file}")
-            foreground_file = row.get("foreground_file", dataset_image)
-            target_name = f"{namespace}_{foreground_file}"
+            parsed = _parse_obb(label_index[label_file])
+            if parsed is None or parsed[0] != class_id:
+                raise DatasetError(
+                    f"Klasse in Bericht und Label stimmt nicht überein: {label_file}"
+                )
             records.append(
                 DatasetRecord(
-                    record_id=f"{namespace}:{foreground_file}",
+                    record_id=f"positive:{dataset_image}",
                     kind="positive",
                     class_id=class_id,
-                    class_name=f"Pose {class_id + 1}",
+                    class_name=class_names[class_id],
                     pose_id=pose_id,
                     panel_1=_integer(row, "panel_1"),
                     panel_2=_integer(row, "panel_2"),
@@ -194,7 +212,7 @@ def _collect_positive_records(root: Path, namespace: str, class_id: int) -> list
                     consensus_iou=_float_or_none(row.get("consensus_iou")),
                     source_image=image_index[dataset_image],
                     source_label=label_index[label_file],
-                    target_name=target_name,
+                    target_name=dataset_image,
                     split=split_for_pose(pose_id),
                 )
             )
@@ -213,7 +231,7 @@ def _collect_empty_records(root: Path) -> list[DatasetRecord]:
                 continue
             seen.add(background_file)
             pose_id = _integer(row, "pose_id")
-            old_image_name = f"background_{background_file}"
+            old_image_name = f"empty_{background_file}"
             old_label_name = f"{Path(old_image_name).stem}.txt"
             if old_image_name not in image_index:
                 raise DatasetError(f"Leerbild fehlt: {old_image_name}")
@@ -233,18 +251,23 @@ def _collect_empty_records(root: Path) -> list[DatasetRecord]:
                     consensus_iou=None,
                     source_image=image_index[old_image_name],
                     source_label=label_index[old_label_name],
-                    target_name=f"empty_{background_file}",
+                    target_name=old_image_name,
                     split=split_for_pose(pose_id),
                 )
             )
     return records
 
 
-def load_curation(path: Path | None) -> set[str]:
+def load_curation(path: Path | None, source_dataset: Path | None = None) -> set[str]:
     if path is None or not path.is_file():
         return set()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        saved_source = str(payload.get("source_dataset", "")).strip()
+        if source_dataset is not None and (
+            not saved_source or Path(saved_source).resolve() != source_dataset.resolve()
+        ):
+            return set()
         values = payload.get("excluded_ids", [])
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise ValueError("excluded_ids muss eine Liste von Zeichenketten sein")
@@ -253,11 +276,16 @@ def load_curation(path: Path | None) -> set[str]:
         raise DatasetError(f"Curation-Datei kann nicht gelesen werden: {path}: {exc}") from exc
 
 
-def save_curation(path: Path, excluded_ids: Iterable[str]) -> None:
+def save_curation(
+    path: Path,
+    excluded_ids: Iterable[str],
+    source_dataset: Path | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format_version": 1,
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_dataset": "" if source_dataset is None else str(source_dataset.resolve()),
         "excluded_ids": sorted(set(excluded_ids)),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -265,10 +293,10 @@ def save_curation(path: Path, excluded_ids: Iterable[str]) -> None:
 
 def collect_dataset_records(config: DatasetBuildConfig) -> list[DatasetRecord]:
     config = config.validated()
+    class_names = _load_class_names(config.source_dataset)
     records = [
-        *_collect_positive_records(config.pose1_dataset, "pose1", 0),
-        *_collect_positive_records(config.pose2_dataset, "pose2", 1),
-        *_collect_empty_records(config.pose1_dataset),
+        *_collect_positive_records(config.source_dataset, class_names),
+        *_collect_empty_records(config.source_dataset),
     ]
     identifiers = [record.record_id for record in records]
     targets = [record.target_name for record in records]
@@ -278,7 +306,7 @@ def collect_dataset_records(config: DatasetBuildConfig) -> list[DatasetRecord]:
         raise DatasetError(f"Doppelte Datensatz-IDs: {duplicate_ids[:3]}")
     if duplicate_targets:
         raise DatasetError(f"Doppelte Zieldateinamen: {duplicate_targets[:3]}")
-    exclusions = load_curation(config.curation_path)
+    exclusions = load_curation(config.curation_path, config.source_dataset)
     known = set(identifiers)
     unknown = exclusions - known
     if unknown:
@@ -351,12 +379,28 @@ def _manifest_record(record: DatasetRecord) -> dict[str, object]:
     return payload
 
 
+def _data_yaml_text(root: Path, class_names: dict[int, str]) -> str:
+    names = "".join(
+        f"  {class_id}: {json.dumps(name, ensure_ascii=False)}\n"
+        for class_id, name in sorted(class_names.items())
+    )
+    return (
+        f"path: {json.dumps(root.as_posix())}\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "test: images/test\n"
+        "names:\n"
+        + names
+    )
+
+
 def build_curated_dataset(
     config: DatasetBuildConfig,
     progress: ProgressCallback | None = None,
     cancelled: CancelCallback | None = None,
 ) -> DatasetBuildResult:
     config = config.validated()
+    class_names = _load_class_names(config.source_dataset)
     records = collect_dataset_records(config)
     included = [record for record in records if not record.excluded]
     if not included:
@@ -391,15 +435,14 @@ def build_curated_dataset(
     manifest = {
         "format_version": 1,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "classes": {"0": "Pose 1", "1": "Pose 2"},
+        "classes": {str(class_id): name for class_id, name in class_names.items()},
         "splits": {
             "train_poses": sorted(TRAIN_POSES),
             "validation_poses": sorted(VALIDATION_POSES),
             "test_poses": sorted(TEST_POSES),
         },
         "sources": {
-            "pose1_dataset": str(config.pose1_dataset),
-            "pose2_dataset": str(config.pose2_dataset),
+            "source_dataset": str(config.source_dataset),
         },
         "included_images": len(included),
         "excluded_images": len(records) - len(included),
@@ -412,16 +455,7 @@ def build_curated_dataset(
     if config.curation_path is not None and config.curation_path.is_file():
         shutil.copy2(config.curation_path, output / "curation.json")
     data_yaml = output / "data.yaml"
-    data_yaml.write_text(
-        f"path: {json.dumps(output.as_posix())}\n"
-        "train: images/train\n"
-        "val: images/val\n"
-        "test: images/test\n"
-        "names:\n"
-        "  0: 'Pose 1'\n"
-        "  1: 'Pose 2'\n",
-        encoding="utf-8",
-    )
+    data_yaml.write_text(_data_yaml_text(output, class_names), encoding="utf-8")
     integrity = verify_curated_dataset(output)
     if not integrity.valid:
         raise DatasetError("Datensatzprüfung fehlgeschlagen: " + "; ".join(integrity.errors[:5]))
@@ -444,12 +478,19 @@ def verify_curated_dataset(directory: Path) -> DatasetIntegrityResult:
     images: dict[tuple[str, str], Path] = {}
     labels: dict[tuple[str, str], Path] = {}
     source_splits: dict[str, str] = {}
+    class_names: dict[int, str] = {}
     manifest_path = directory / "dataset_manifest.json"
     if not manifest_path.is_file():
         errors.append("dataset_manifest.json fehlt")
     else:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            class_names = {
+                int(class_id): str(name)
+                for class_id, name in manifest.get("classes", {}).items()
+            }
+            if not class_names:
+                errors.append("Manifest enthält keine Klassen")
             for record in manifest.get("records", []):
                 if record.get("excluded"):
                     continue
@@ -476,8 +517,8 @@ def verify_curated_dataset(directory: Path) -> DatasetIntegrityResult:
                 parsed = _parse_obb(path)
                 if parsed is None:
                     class_counts["Leere Rutsche"] += 1
-                elif parsed[0] in (0, 1):
-                    class_counts[f"Pose {parsed[0] + 1}"] += 1
+                elif parsed[0] in class_names:
+                    class_counts[class_names[parsed[0]]] += 1
                 else:
                     errors.append(f"Ungültige Klasse {parsed[0]}: {path}")
             except DatasetError as exc:
@@ -574,15 +615,12 @@ def prepare_resized_training_dataset(
     curation = source / "curation.json"
     if curation.is_file():
         shutil.copy2(curation, output / "curation.json")
+    class_names = {
+        int(class_id): str(name)
+        for class_id, name in source_manifest.get("classes", {}).items()
+    }
     (output / "data.yaml").write_text(
-        f"path: {json.dumps(output.as_posix())}\n"
-        "train: images/train\n"
-        "val: images/val\n"
-        "test: images/test\n"
-        "names:\n"
-        "  0: 'Pose 1'\n"
-        "  1: 'Pose 2'\n",
-        encoding="utf-8",
+        _data_yaml_text(output, class_names), encoding="utf-8"
     )
     integrity = verify_curated_dataset(output)
     if not integrity.valid or integrity.image_count != source_integrity.image_count:

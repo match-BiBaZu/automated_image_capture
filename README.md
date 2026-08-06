@@ -52,6 +52,10 @@ Kamera- und Lichtauswahl wird über `QSettings` im Windows-Benutzerprofil gespei
 2. Kamera, Roboter und beide Lichter einschalten.
 3. **Alle verbinden** oder die einzelnen Schaltflächen verwenden.
 4. Das Kamerabild sowie Modell, Seriennummer, Pixelformat und Bildrate prüfen.
+   Die Belichtungszeit kann direkt in der Kamerakarte eingetragen und mit **Übernehmen**
+   gesetzt werden. Falls nötig, wird `ExposureAuto` dabei für diese Verbindung deaktiviert.
+   Beim Trennen werden Belichtungszeit und Automatikmodus vom Verbindungsaufbau
+   wiederhergestellt.
 5. Beim UR die RTDE-/Dashboard-Anzeigen und insbesondere den Safety Mode prüfen.
 6. Für einen Pose-Auftrag das vorbereitete `BiBaZu`-Programm manuell starten, eine Ansicht
    auswählen und die einmalige Bewegungsfreigabe bestätigen.
@@ -138,8 +142,10 @@ nicht automatisch ausgeschaltet oder umgestellt.
 
 ## Kuratierung und YOLO26-OBB-Training
 
-Über **YOLO-Training …** werden die beiden vorhandenen Labeldatensätze als `Pose 1` und
-`Pose 2` zusammengeführt. Leerbilder werden dabei nur einmal übernommen. Der Review zeigt
+Über **YOLO-Training …** wird ein gemeinsamer, vom OBB-Labeltool erzeugter Datensatzordner
+geladen. Klassen und Namen werden aus `label_summary.json` übernommen, sodass neben `Pose 1`
+und `Pose 2` auch weitere Klassen ohne zusätzliche Quellfelder unterstützt werden. Leerbilder
+werden dabei nur einmal übernommen. Der Review zeigt
 automatisch auffällige Aufnahmen zuerst; ein entferntes Häkchen schließt ausschließlich dieses
 Bild aus. Die Entscheidung wird in `curation.json` gespeichert und verändert keine Quelldatei.
 
@@ -157,7 +163,7 @@ angezeigten Ergebnisordner.
 Dieselben Schritte sind ohne GUI reproduzierbar:
 
 ```powershell
-uv run python -m automated_image_capture.training prepare
+uv run python -m automated_image_capture.training prepare --source <OBB-DATENSATZORDNER>
 uv run python -m automated_image_capture.training train --dataset <DATENSATZORDNER>
 uv run python -m automated_image_capture.training diagnose
 ```
@@ -206,6 +212,9 @@ verändert. Roboterbefehle werden auch in Hardwaretests nicht gesendet.
 
 - **Keine Kamera:** CTI-Pfad, dedizierte Netzwerkkarte und Camera Explorer prüfen.
 - **Kamera belegt:** Camera Explorer oder einen anderen GenTL-Client schließen.
+- **Kurzer Kameraaussetzer:** Die Karte wechselt zunächst auf „Eingeschränkt“ und startet den
+  GenTL-Datenstrom automatisch neu. Erst wenn zwei Wiederherstellungsversuche scheitern, wird
+  die laufende Aufnahmeserie unterbrochen und kann anschließend fortgesetzt werden.
 - **Nur ein UR-Kanal:** RTDE kann in den Robot Security Settings deaktiviert sein; Dashboard und
   RTDE werden deshalb getrennt als „eingeschränkt“ dargestellt.
 - **Kein Licht:** Bluetooth-Symbol am Panel aktivieren, Smartphone-App trennen und näher an den

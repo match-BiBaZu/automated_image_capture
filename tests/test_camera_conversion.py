@@ -6,6 +6,7 @@ import pytest
 from automated_image_capture.hardware.camera import (
     MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     camera_error_message,
+    camera_fetch_timeout_seconds,
     convert_to_rgb,
     is_camera_fetch_timeout,
     should_retry_camera_fetch,
@@ -77,3 +78,9 @@ def test_non_timeout_camera_error_is_not_retried() -> None:
 
     assert not is_camera_fetch_timeout(error)
     assert not should_retry_camera_fetch(error, 1)
+
+
+def test_fetch_timeout_accounts_for_exposure_time() -> None:
+    assert camera_fetch_timeout_seconds(None) == 0.5
+    assert camera_fetch_timeout_seconds(4_000) == 0.504
+    assert camera_fetch_timeout_seconds(1_000_000) == 1.5

@@ -46,7 +46,7 @@ from automated_image_capture.ui.training_dialog import TrainingDialog
 from automated_image_capture.ui.widgets import (
     AcquisitionCard,
     AcquisitionDialog,
-    DeviceCard,
+    CameraControlCard,
     LightControlCard,
     RobotPoseControlCard,
     SettingsDialog,
@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         cards_container = QWidget()
         cards_layout = QVBoxLayout(cards_container)
-        self.camera_card = DeviceCard("Baumer Industriekamera")
+        self.camera_card = CameraControlCard("Baumer Industriekamera")
         self.robot_card = RobotPoseControlCard("Universal Robots UR16e")
         self.light_card = LightControlCard("Neewer RGB660 Pro II · Licht 1")
         self.light_2_card = LightControlCard("Neewer RGB660 Pro II · Licht 2")
@@ -252,6 +252,7 @@ class MainWindow(QMainWindow):
             )
         self.camera.status_changed.connect(self._camera_status)
         self.camera.frame_ready.connect(self._camera_frame)
+        self.camera_card.exposure_requested.connect(self.camera.set_exposure_time)
         self.robot.status_changed.connect(self._robot_status)
         self.robot_card.pose_requested.connect(self.robot.request_pose)
         self.light.status_changed.connect(self._light_status)
@@ -301,6 +302,7 @@ class MainWindow(QMainWindow):
 
     def _camera_status(self, status: CameraStatus) -> None:
         self._camera_status_data = status
+        self.camera_card.set_status(status)
         fps = "–" if status.camera_fps is None else f"{status.camera_fps:.1f}"
         self.camera_card.details.setText(
             f"Modell: {status.model}\n"

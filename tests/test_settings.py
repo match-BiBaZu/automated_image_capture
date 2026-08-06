@@ -109,17 +109,15 @@ def test_legacy_labeling_settings_are_migrated_to_source_list(tmp_path) -> None:
 def test_training_paths_round_trip(tmp_path) -> None:
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     store = SettingsStore(backend)
-    pose1 = tmp_path / "pose1"
-    pose2 = tmp_path / "pose2"
+    source = tmp_path / "obb"
     output = tmp_path / "combined"
     dataset = output / "dataset_1"
 
-    store.save_training_paths(pose1, pose2, output, dataset)
+    store.save_training_paths(source, output, dataset)
     loaded = store.load_training_paths(default_build_config())
 
     assert loaded == {
-        "pose1_dataset": pose1,
-        "pose2_dataset": pose2,
+        "source_dataset": source,
         "output_root": output,
         "dataset_directory": dataset,
     }
