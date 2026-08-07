@@ -146,9 +146,14 @@ def camera_error_message(error: BaseException) -> str:
         "access denied",
         "exclusive access",
         "operation is not allowed",
+        "busy",
+        "control channel is locked",
     )
     if any(token in message.lower() for token in busy_tokens):
-        message += " Schließen Sie den Baumer Camera Explorer und versuchen Sie es erneut."
+        message += (
+            " Schließen Sie den Baumer Camera Explorer. Falls er bereits geschlossen ist, "
+            "Kamera in der GUI trennen und erneut verbinden."
+        )
     return message
 
 
@@ -425,8 +430,15 @@ class CameraWorker(QObject):
                             )
                             try:
                                 acquirer.stop()
-                            except Exception:
-                                pass
+                            except Exception as stop_error:
+                                raise RuntimeError(
+                                    "Kamerastream konnte vor dem Neustart nicht sauber "
+                                    "angehalten werden. Kamera kurz trennen und erneut verbinden."
+                                ) from stop_error
+                            # Some GenTL producers release announced buffers just after
+                            # stop() returns. Starting in the same tick can otherwise race
+                            # that release and produce a misleading BusyException.
+                            time.sleep(0.1)
                             acquirer.start()
                             consecutive_fetch_timeouts = 0
                             restart_window_started = time.monotonic()

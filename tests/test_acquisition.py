@@ -411,6 +411,71 @@ def test_two_sample_ramp_captures_on_timeline_and_finishes_at_zero(qtbot, tmp_pa
     controller.close()
 
 
+def test_ramp_capture_does_not_wait_for_slow_png_writer(qtbot, tmp_path: Path) -> None:
+    controller, camera, robot, _light_1, _light_2 = _ready_controller()
+    original_write = controller.writer._write_pair
+
+    def slow_write(*args, **kwargs) -> None:
+        time.sleep(0.4)
+        original_write(*args, **kwargs)
+
+    controller.writer._write_pair = slow_write  # type: ignore[method-assign]
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=180,
+        pose_end=180,
+        ramp_duration_s=2.0,
+        ramp_image_rate_fps=1,
+        robot_settle_ms=0,
+    )
+
+    assert controller.start(settings)
+    qtbot.waitUntil(lambda: robot.requests == [180], timeout=2000)
+    robot.status_changed.emit(
+        _robot_status(command_state_code=3, sequence=10, acknowledged_pose=180)
+    )
+    qtbot.waitUntil(lambda: controller._phase == "ramp_frame", timeout=2000)
+    origin = controller._ramp_origin_wall
+    camera.frame_ready.emit(CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", origin + 0.01))
+
+    assert controller._index == 1
+    assert controller._phase == "ramp_frame"
+    assert controller.writer.pending_count == 1
+    controller.stop()
+    controller.close()
+
+
+def test_ramp_checkpoint_advances_only_across_contiguous_completed_writes(
+    qtbot, tmp_path: Path
+) -> None:
+    controller, *_ = _ready_controller()
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=180,
+        pose_end=180,
+        ramp_duration_s=2.0,
+        ramp_image_rate_fps=1,
+    )
+    controller._settings = settings
+    controller._points = build_capture_points(settings)
+    controller._session_directory = controller.writer.start_session(tmp_path)
+    controller._writer_token = controller.writer.session_token
+    controller._running = True
+    controller._index = 2
+    controller._checkpoint_index = 0
+    controller._ramp_pending_writes = {0, 1}
+
+    controller._on_saved(controller._writer_token, 1, "second.png")
+    assert controller._checkpoint_index == 0
+    controller._on_saved(controller._writer_token, 0, "first.png")
+    assert controller._checkpoint_index == 2
+
+    controller._running = False
+    controller.close()
+
+
 def test_interrupted_sequence_resumes_in_same_directory_without_duplicates(
     qtbot, tmp_path: Path
 ) -> None:

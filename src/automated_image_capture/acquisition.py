@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
@@ -217,9 +218,12 @@ class DatasetWriter(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dataset-writer")
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="dataset-writer")
         self._session_directory: Path | None = None
         self._session_token = 0
+        self._pending = 0
+        self._pending_lock = threading.Lock()
+        self._pending_condition = threading.Condition(self._pending_lock)
 
     @property
     def session_token(self) -> int:
@@ -261,7 +265,23 @@ class DatasetWriter(QObject):
         )
 
     def flush(self, timeout_seconds: float = 30.0) -> None:
-        self._executor.submit(lambda: None).result(timeout=timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+        with self._pending_condition:
+            while self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Ausstehende Bilddateien wurden nicht rechtzeitig gespeichert."
+                    )
+                self._pending_condition.wait(remaining)
+
+    @property
+    def pending_count(self) -> int:
+        with self._pending_lock:
+            return self._pending
+
+    def can_accept(self, maximum_pending: int = 8) -> bool:
+        return self.pending_count < maximum_pending
 
     def submit(
         self,
@@ -290,16 +310,27 @@ class DatasetWriter(QObject):
             if ramp_mono and frame.image.ndim == 3
             else frame.image.copy()
         )
-        future = self._executor.submit(
-            self._write_pair,
-            image_path,
-            yaml_path,
-            image,
-            metadata,
-            point.ramp_sample_id is not None,
-        )
+        with self._pending_lock:
+            self._pending += 1
+        try:
+            future = self._executor.submit(
+                self._write_pair,
+                image_path,
+                yaml_path,
+                image,
+                metadata,
+                point.ramp_sample_id is not None,
+            )
+        except Exception:
+            with self._pending_condition:
+                self._pending -= 1
+                self._pending_condition.notify_all()
+            raise
 
         def done(result: Any) -> None:
+            with self._pending_condition:
+                self._pending -= 1
+                self._pending_condition.notify_all()
             try:
                 result.result()
                 self.saved.emit(token, index, str(image_path))
@@ -366,6 +397,7 @@ class AcquisitionController(QObject):
         self._settings: AcquisitionSettings | None = None
         self._points: tuple[CapturePoint, ...] = ()
         self._index = 0
+        self._checkpoint_index = 0
         self._running = False
         self._phase = "idle"
         self._deadline = 0.0
@@ -387,6 +419,8 @@ class AcquisitionController(QObject):
         self._ramp_sent = [False, False]
         self._ramp_actual_offset_s: float | None = None
         self._ramp_timing_error_s: float | None = None
+        self._ramp_pending_writes: set[int] = set()
+        self._ramp_completed_writes: set[int] = set()
 
         self._phase_timer = QTimer(self)
         self._phase_timer.setSingleShot(True)
@@ -415,7 +449,7 @@ class AcquisitionController(QObject):
 
     @property
     def remaining_count(self) -> int:
-        return max(0, len(self._points) - self._index)
+        return max(0, len(self._points) - self._checkpoint_index)
 
     @property
     def session_directory(self) -> Path | None:
@@ -442,6 +476,7 @@ class AcquisitionController(QObject):
         self._settings = settings
         self._points = points
         self._index = 0
+        self._checkpoint_index = 0
         self._running = True
         self._current_pose = None
         self._applied_lights = None
@@ -479,6 +514,7 @@ class AcquisitionController(QObject):
         try:
             self.writer.flush()
             self._reconcile_saved_points()
+            self._checkpoint_index = self._index
             self.progress_changed.emit(self._index, len(self._points))
             if self._index >= len(self._points):
                 message = f"Aufnahme bereits vollständig: {self._session_directory}"
@@ -543,9 +579,11 @@ class AcquisitionController(QObject):
                 self._settings = settings
                 self._points = points
                 self._index = index
+                self._checkpoint_index = index
                 self._session_directory = manifest.parent
                 self._writer_token = self.writer.session_token
                 self._reconcile_saved_points()
+                self._checkpoint_index = self._index
                 if self._index >= len(self._points):
                     self._write_manifest("completed", "Alle Dateipaare sind vollständig.")
                     continue
@@ -599,7 +637,7 @@ class AcquisitionController(QObject):
         payload = {
             "schema_version": 1,
             "status": status,
-            "next_index": self._index,
+            "next_index": self._checkpoint_index,
             "total": len(self._points),
             "settings": settings,
             "message": message,
@@ -660,6 +698,7 @@ class AcquisitionController(QObject):
             self._session_directory = session
             self._writer_token = self.writer.session_token
             self._reconcile_saved_points()
+            self._checkpoint_index = self._index
             expected_images: set[Path] = set()
             expected_metadata: set[Path] = set()
             for index in range(self._index):
@@ -753,6 +792,13 @@ class AcquisitionController(QObject):
         if not self._running:
             return
         if self._index >= len(self._points):
+            if self._ramp_pending_writes:
+                self._set_phase("ramp_draining", 30.0)
+                self.status_changed.emit(
+                    f"Aufnahmen vollständig; warte auf "
+                    f"{len(self._ramp_pending_writes)} Schreibvorgänge …"
+                )
+                return
             directory = str(self._session_directory or "")
             self._finish(f"Aufnahme abgeschlossen: {directory}", completed=True)
             return
@@ -895,6 +941,8 @@ class AcquisitionController(QObject):
         self._ramp_sent = [False, False]
         self._ramp_actual_offset_s = None
         self._ramp_timing_error_s = None
+        self._ramp_pending_writes.clear()
+        self._ramp_completed_writes.clear()
 
     def _start_ramp_sync(self, point: CapturePoint) -> None:
         # A fresh pass begins at sample zero (0/0). A resumed pass is explicitly
@@ -1020,11 +1068,30 @@ class AcquisitionController(QObject):
             self._ramp_actual_offset_s = actual
             self._ramp_timing_error_s = timing_error
             metadata = self._metadata(point, frame)
-            self._set_phase("ramp_writing", 2.0)
+            if not self.writer.can_accept():
+                self._fail(
+                    "Der PNG-Writer kann mit der Rampen-Bildrate nicht Schritt halten "
+                    "(8 ausstehende Bilder)."
+                )
+                return
+            capture_index = self._index
             try:
-                self.writer.submit(self._index, point, frame, metadata)
+                self.writer.submit(capture_index, point, frame, metadata)
             except Exception as exc:
                 self._fail(f"Speichern konnte nicht gestartet werden: {exc}")
+                return
+            self._ramp_pending_writes.add(capture_index)
+            self._index += 1
+            previous_key = (point.pose, point.exposure_time_us)
+            next_key = (
+                (self._points[self._index].pose, self._points[self._index].exposure_time_us)
+                if self._index < len(self._points)
+                else None
+            )
+            if next_key == previous_key:
+                self._wait_for_ramp_frame()
+            else:
+                self._finish_ramp_pass()
             return
         if (
             not self._running
@@ -1059,6 +1126,8 @@ class AcquisitionController(QObject):
                 "ip_address": camera.ip_address,
                 "exposure_time_us": camera.exposure_time_us,
                 "gain": camera.gain,
+                "configured_frame_rate_fps": camera.camera_fps,
+                "measured_preview_fps": camera.preview_fps,
             },
             "robot": {
                 "requested_pose_id": point.pose,
@@ -1122,36 +1191,42 @@ class AcquisitionController(QObject):
         }
 
     def _on_saved(self, token: int, index: int, image_path: str) -> None:
+        if token != self._writer_token:
+            return
+        if index in self._ramp_pending_writes:
+            self._ramp_pending_writes.remove(index)
+            self._ramp_completed_writes.add(index)
+            while self._checkpoint_index in self._ramp_completed_writes:
+                self._ramp_completed_writes.remove(self._checkpoint_index)
+                self._checkpoint_index += 1
+            self._write_manifest(
+                "running" if self._running else "interrupted",
+                f"Bild {index + 1} gespeichert.",
+            )
+            self.progress_changed.emit(self._checkpoint_index, len(self._points))
+            if self._running and self._phase == "ramp_draining" and not self._ramp_pending_writes:
+                self._advance()
+            return
         if (
-            token != self._writer_token
-            or not self._running
+            not self._running
             or self._phase not in {"writing", "ramp_writing"}
             or index != self._index
         ):
             return
         self._index += 1
+        self._checkpoint_index = self._index
         self._write_manifest("running", f"Bild {self._index} gespeichert.")
         self.progress_changed.emit(self._index, len(self._points))
         self.status_changed.emit(f"Gespeichert: {image_path}")
-        if self._points[index].ramp_sample_id is not None:
-            previous_key = (
-                self._points[index].pose,
-                self._points[index].exposure_time_us,
-            )
-            next_key = (
-                (self._points[self._index].pose, self._points[self._index].exposure_time_us)
-                if self._index < len(self._points)
-                else None
-            )
-            if next_key == previous_key:
-                self._wait_for_ramp_frame()
-            else:
-                self._finish_ramp_pass()
-            return
         self._advance()
 
     def _on_write_failed(self, token: int, index: int, message: str) -> None:
-        if token == self._writer_token and self._running and index == self._index:
+        if (
+            token == self._writer_token
+            and self._running
+            and (index == self._index or index in self._ramp_pending_writes)
+        ):
+            self._ramp_pending_writes.discard(index)
             self._fail(f"Speichern fehlgeschlagen: {message}")
 
     def _check_timeout(self) -> None:
@@ -1164,6 +1239,10 @@ class AcquisitionController(QObject):
                 )
             elif self._phase == "ramp_frame":
                 self._fail("Kein frisches Kamerabild zum geplanten Rampenzeitpunkt empfangen.")
+            elif self._phase == "ramp_draining":
+                self._fail(
+                    "Ausstehende PNG/YAML-Dateien konnten nicht rechtzeitig gespeichert werden."
+                )
             else:
                 self._fail(f"Zeitüberschreitung in Phase '{self._phase}'.")
 
@@ -1186,7 +1265,7 @@ class AcquisitionController(QObject):
         self._watchdog.stop()
         if restore_exposure:
             self.camera.restore_exposure()
-        can_resume = resumable and self._index < len(self._points)
+        can_resume = resumable and self._checkpoint_index < len(self._points)
         self._write_manifest("interrupted" if can_resume else "completed", message)
         self._set_resume_available(can_resume)
         self.running_changed.emit(False)
