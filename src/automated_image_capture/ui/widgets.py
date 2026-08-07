@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -125,18 +126,14 @@ class CameraControlCard(DeviceCard):
         enabled = self.state is ConnectionState.CONNECTED and self._status.exposure_writable
         self.exposure_time.setEnabled(enabled)
         self.apply_exposure_button.setEnabled(enabled)
-        if (
-            self._status.exposure_auto.lower() not in {"off", "–", "none"}
-            and enabled
-        ):
+        if self._status.exposure_auto.lower() not in {"off", "–", "none"} and enabled:
             self.exposure_hint.setText(
                 "Übernehmen deaktiviert ExposureAuto für diese Verbindung. Beim Trennen "
                 "wird der ursprüngliche Automatikmodus wiederhergestellt."
             )
         elif self._status.exposure_auto.lower() not in {"off", "–", "none"}:
             self.exposure_hint.setText(
-                "ExposureAuto ist aktiv und kann von der Kamera aktuell nicht "
-                "deaktiviert werden."
+                "ExposureAuto ist aktiv und kann von der Kamera aktuell nicht deaktiviert werden."
             )
         else:
             self.exposure_hint.setText(
@@ -434,11 +431,21 @@ class AcquisitionCard(QGroupBox):
             if settings.exposure_enabled
             else " · Belichtung unverändert"
         )
+        if settings.capture_mode == "ramp":
+            samples = round(settings.ramp_duration_s * settings.ramp_image_rate_fps)
+            mode = (
+                f"Schnelle Rampe · {samples} Bilder pro Pose/Belichtung · "
+                f"{settings.ramp_duration_s:g} s bei {settings.ramp_image_rate_fps} Bildern/s · "
+                f"Perioden {settings.ramp_light_1_period_s:g}/{settings.ramp_light_2_period_s:g} s"
+            )
+        else:
+            mode = (
+                f"Exaktes Raster · Panel 1 {settings.light_1_start}–{settings.light_1_end} % / "
+                f"Panel 2 {settings.light_2_start}–{settings.light_2_end} %"
+            )
         self.summary.setText(
-            f"UR-Pose {settings.pose_start} bis {settings.pose_end} · "
-            f"Panel 1 {settings.light_1_start}–{settings.light_1_end} % / "
-            f"Panel 2 {settings.light_2_start}–{settings.light_2_end} %"
-            f"{exposure}\n{count} Bilder · Ziel: {settings.output_directory}"
+            f"{mode}\nUR-Pose {settings.pose_start} bis {settings.pose_end}{exposure}\n"
+            f"{count} Bilder · Ziel: {settings.output_directory}"
         )
 
     def set_running(self, running: bool) -> None:
@@ -481,10 +488,16 @@ class AcquisitionDialog(QDialog):
         output_layout.addWidget(self.output_directory, 1)
         output_layout.addWidget(browse)
         output_form.addRow("Speicherort", output_row)
+        self.capture_mode = QComboBox()
+        self.capture_mode.addItem("Exaktes Raster", "grid")
+        self.capture_mode.addItem("Schnelle Rampe", "ramp")
+        self.capture_mode.setCurrentIndex(max(0, self.capture_mode.findData(config.capture_mode)))
+        output_form.addRow("Aufnahmemodus", self.capture_mode)
         layout.addLayout(output_form)
 
         ranges = QGroupBox("Variationen")
         ranges_form = QFormLayout(ranges)
+        self.ranges_form = ranges_form
         self.pose_start = self._pose_combo(config.pose_start)
         self.pose_end = self._pose_combo(config.pose_end)
         ranges_form.addRow("UR Startpose", self.pose_start)
@@ -493,16 +506,18 @@ class AcquisitionDialog(QDialog):
         self.light_1_start, self.light_1_end, self.light_1_step = self._range_row(
             0, 100, config.light_1_start, config.light_1_end, config.light_1_step, "%"
         )
+        self.light_1_row = self._row_widget(self.light_1_start, self.light_1_end, self.light_1_step)
         ranges_form.addRow(
             "Panel 1 Start / Ende / Schritt",
-            self._row_widget(self.light_1_start, self.light_1_end, self.light_1_step),
+            self.light_1_row,
         )
         self.light_2_start, self.light_2_end, self.light_2_step = self._range_row(
             0, 100, config.light_2_start, config.light_2_end, config.light_2_step, "%"
         )
+        self.light_2_row = self._row_widget(self.light_2_start, self.light_2_end, self.light_2_step)
         ranges_form.addRow(
             "Panel 2 Start / Ende / Schritt",
-            self._row_widget(self.light_2_start, self.light_2_end, self.light_2_step),
+            self.light_2_row,
         )
 
         self.exposure_enabled = QCheckBox("Belichtungszeit zusätzlich variieren")
@@ -546,6 +561,24 @@ class AcquisitionDialog(QDialog):
         self.exposure_enabled.toggled.connect(self._update_exposure_controls)
         layout.addWidget(ranges)
 
+        self.ramp_group = QGroupBox("Schnelle zeitbasierte Licht-Rampe")
+        ramp_form = QFormLayout(self.ramp_group)
+        self.ramp_duration = self._double_spin(2.0, 120.0, config.ramp_duration_s, " s")
+        self.ramp_rate = self._spin(1, 10, config.ramp_image_rate_fps, " Bilder/s")
+        self.ramp_light_1_period = self._double_spin(0.8, 120.0, config.ramp_light_1_period_s, " s")
+        self.ramp_light_2_period = self._double_spin(0.8, 120.0, config.ramp_light_2_period_s, " s")
+        ramp_form.addRow("Dauer pro Pose/Belichtung", self.ramp_duration)
+        ramp_form.addRow("Bildrate", self.ramp_rate)
+        ramp_form.addRow("Periode Panel 1", self.ramp_light_1_period)
+        ramp_form.addRow("Periode Panel 2", self.ramp_light_2_period)
+        ramp_note = QLabel(
+            "Beide Panels folgen 0–100–0-Dreieckskurven. Gespeichert werden nominelle "
+            "Sollwerte und der jeweils letzte bestätigte BLE-Befehl."
+        )
+        ramp_note.setWordWrap(True)
+        ramp_form.addRow(ramp_note)
+        layout.addWidget(self.ramp_group)
+
         timing = QGroupBox("Stabilisierungszeiten")
         timing_form = QFormLayout(timing)
         self.light_settle = self._spin(0, 10_000, config.light_settle_ms, " ms")
@@ -571,11 +604,18 @@ class AcquisitionDialog(QDialog):
             self.exposure_start,
             self.exposure_end,
             self.exposure_step,
+            self.ramp_duration,
+            self.ramp_rate,
+            self.ramp_light_1_period,
+            self.ramp_light_2_period,
         ):
             signal = getattr(control, "valueChanged", None) or control.currentIndexChanged
             signal.connect(self._update_estimate)
         self.exposure_enabled.toggled.connect(self._update_estimate)
+        self.capture_mode.currentIndexChanged.connect(self._update_mode_controls)
+        self.capture_mode.currentIndexChanged.connect(self._update_estimate)
         self._update_exposure_controls()
+        self._update_mode_controls()
         self._update_estimate()
 
         buttons = QDialogButtonBox(
@@ -589,6 +629,18 @@ class AcquisitionDialog(QDialog):
     def _spin(minimum: int, maximum: int, value: int, suffix: str = "") -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        spin.setSuffix(suffix)
+        return spin
+
+    @staticmethod
+    def _double_spin(
+        minimum: float, maximum: float, value: float, suffix: str = ""
+    ) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(1)
+        spin.setSingleStep(0.1)
         spin.setValue(value)
         spin.setSuffix(suffix)
         return spin
@@ -640,9 +692,16 @@ class AcquisitionDialog(QDialog):
         for control in (self.exposure_start, self.exposure_end, self.exposure_step):
             control.setEnabled(enabled)
 
+    def _update_mode_controls(self, *_: object) -> None:
+        ramp = self.capture_mode.currentData() == "ramp"
+        self.ramp_group.setVisible(ramp)
+        self.ranges_form.setRowVisible(self.light_1_row, not ramp)
+        self.ranges_form.setRowVisible(self.light_2_row, not ramp)
+
     def _current_config(self) -> AcquisitionSettings:
         return AcquisitionSettings(
             output_directory=Path(self.output_directory.text().strip()),
+            capture_mode=str(self.capture_mode.currentData()),
             pose_start=int(self.pose_start.currentData()),
             pose_end=int(self.pose_end.currentData()),
             light_1_start=self.light_1_start.value(),
@@ -658,12 +717,26 @@ class AcquisitionDialog(QDialog):
             light_settle_ms=self.light_settle.value(),
             robot_settle_ms=self.robot_settle.value(),
             camera_settle_ms=self.camera_settle.value(),
+            ramp_duration_s=self.ramp_duration.value(),
+            ramp_image_rate_fps=self.ramp_rate.value(),
+            ramp_light_1_period_s=self.ramp_light_1_period.value(),
+            ramp_light_2_period_s=self.ramp_light_2_period.value(),
         )
 
     def _update_estimate(self, *_: object) -> None:
         try:
-            count = len(build_capture_points(self._current_config()))
-            self.estimate.setText(f"Geplante Aufnahmen: {count}")
+            config = self._current_config()
+            count = len(build_capture_points(config))
+            if config.capture_mode == "ramp":
+                samples = round(config.ramp_duration_s * config.ramp_image_rate_fps)
+                passes = count // max(1, samples)
+                self.estimate.setText(
+                    f"Geplante Aufnahmen: {count} · {samples} pro Rampe · "
+                    f"geschätzte Rampenzeit {passes * config.ramp_duration_s:.1f} s "
+                    f"zzgl. UR- und Belichtungswechsel"
+                )
+            else:
+                self.estimate.setText(f"Geplante Aufnahmen: {count}")
         except ValueError as exc:
             self.estimate.setText(str(exc))
 

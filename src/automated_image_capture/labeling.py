@@ -15,7 +15,8 @@ import cv2
 import numpy as np
 
 CAPTURE_NAME = re.compile(
-    r"^img_(?P<index>\d+)_ur(?P<pose>\d+)_p1-(?P<p1>\d+)_p2-(?P<p2>\d+)_"
+    r"^img_(?P<index>\d+)_ur(?P<pose>\d+)_(?:ramp-(?P<ramp>\d+)_)?"
+    r"p1-(?P<p1>\d+)_p2-(?P<p2>\d+)_"
     r"(?P<exposure>auto|e\d+us)\.png$",
     re.IGNORECASE,
 )
@@ -35,6 +36,17 @@ class CaptureKey:
     panel_2: int
     panel_1: int
     exposure: str
+    ramp_sample_id: int | None = None
+
+
+def _capture_sort_key(key: CaptureKey) -> tuple[int, str, int, int, int]:
+    return (
+        key.pose_id,
+        key.exposure,
+        -1 if key.ramp_sample_id is None else key.ramp_sample_id,
+        key.panel_2,
+        key.panel_1,
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -172,6 +184,7 @@ def scan_capture(directory: Path) -> dict[CaptureKey, CaptureRecord]:
             panel_2=int(match.group("p2")),
             panel_1=int(match.group("p1")),
             exposure=match.group("exposure").lower(),
+            ramp_sample_id=(None if match.group("ramp") is None else int(match.group("ramp"))),
         )
         if key in records:
             raise LabelingError(
@@ -187,18 +200,33 @@ def match_captures(
     foreground: dict[CaptureKey, CaptureRecord],
     background: dict[CaptureKey, CaptureRecord],
 ) -> list[MatchedPair]:
-    missing_background = sorted(set(foreground) - set(background))
-    extra_background = sorted(set(background) - set(foreground))
+    missing_background = sorted(set(foreground) - set(background), key=_capture_sort_key)
+    extra_background = sorted(set(background) - set(foreground), key=_capture_sort_key)
     if missing_background or extra_background:
         details: list[str] = []
         if missing_background:
             details.append(f"{len(missing_background)} Leerbilder fehlen")
         if extra_background:
             details.append(f"{len(extra_background)} Leerbilder haben kein Bauteilbild")
-        raise LabelingError(
-            "Die Aufnahmeserien sind nicht vollständig paarbar (" + ", ".join(details) + ")."
+        modes = {
+            "ramp" if key.ramp_sample_id is not None else "grid"
+            for key in set(foreground) | set(background)
+        }
+        profile_hint = (
+            " Raster- und Rampenserie wurden gemischt oder die Rampenprofile weichen ab."
+            if len(modes) > 1
+            else " Prüfe Pose, Exposure, Sample-IDs und das verwendete Rampenprofil."
         )
-    return [MatchedPair(foreground[key], background[key]) for key in sorted(foreground)]
+        raise LabelingError(
+            "Die Aufnahmeserien sind nicht vollständig paarbar ("
+            + ", ".join(details)
+            + ")."
+            + profile_hint
+        )
+    return [
+        MatchedPair(foreground[key], background[key])
+        for key in sorted(foreground, key=_capture_sort_key)
+    ]
 
 
 def _read_gray(path: Path) -> np.ndarray:
@@ -213,9 +241,7 @@ def _largest_component(mask: np.ndarray, minimum_area: int = 250) -> np.ndarray:
     if count <= 1:
         return np.zeros_like(mask)
     candidates = [
-        index
-        for index in range(1, count)
-        if stats[index, cv2.CC_STAT_AREA] >= minimum_area
+        index for index in range(1, count) if stats[index, cv2.CC_STAT_AREA] >= minimum_area
     ]
     if not candidates:
         return np.zeros_like(mask)
@@ -384,6 +410,7 @@ def build_pose_consensus(
                 "panel_1": pair.foreground.key.panel_1,
                 "panel_2": pair.foreground.key.panel_2,
                 "exposure": pair.foreground.key.exposure,
+                "ramp_sample_id": pair.foreground.key.ramp_sample_id,
                 "foreground_file": pair.foreground.path.name,
                 "background_file": pair.background.path.name,
                 "difference_threshold": round(measurement.threshold, 3),
@@ -447,10 +474,11 @@ def _make_review_sheet(
         if image is None:
             continue
         cv2.polylines(image, [np.rint(pose.box).astype(np.int32)], True, (0, 255, 0), 5)
+        sample = pair.foreground.key.ramp_sample_id
         cv2.putText(
             image,
             f"Pose {pose.pose_id}  P1={pair.foreground.key.panel_1} "
-            f"P2={pair.foreground.key.panel_2}",
+            f"P2={pair.foreground.key.panel_2}" + ("" if sample is None else f"  Ramp={sample}"),
             (25, 55),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.3,
@@ -596,8 +624,7 @@ def generate_obb_dataset(
         image = _read_gray(pair.foreground.path)
         height, width = image.shape
         positive_name = (
-            f"class_{class_id:03d}_{_filename_slug(source.name)}_"
-            f"{pair.foreground.path.name}"
+            f"class_{class_id:03d}_{_filename_slug(source.name)}_{pair.foreground.path.name}"
         )
         positive_image = output / "images" / split / positive_name
         positive_label = output / "labels" / split / f"{Path(positive_name).stem}.txt"
@@ -683,9 +710,7 @@ def generate_obb_dataset(
                             all_consensuses[(class_id, pose_id)].minimum_iou,
                             6,
                         ),
-                        "flagged_images": all_consensuses[
-                            (class_id, pose_id)
-                        ].flagged_count,
+                        "flagged_images": all_consensuses[(class_id, pose_id)].flagged_count,
                         "obb_pixels": [
                             [round(float(x), 2), round(float(y), 2)]
                             for x, y in all_consensuses[(class_id, pose_id)].box

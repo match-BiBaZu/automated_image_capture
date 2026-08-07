@@ -16,17 +16,23 @@ from automated_image_capture.labeling import (
 )
 
 
-def _write_capture(directory: Path, pose: int, index: int, p1: int, p2: int) -> None:
+def _write_capture(
+    directory: Path,
+    pose: int,
+    index: int,
+    p1: int,
+    p2: int,
+    ramp_sample_id: int | None = None,
+) -> None:
     height, width = 240, 320
     yy, xx = np.indices((height, width))
-    background = (100 + ((xx // 12 + yy // 12) % 2) * 35 + (p1 + p2) // 8).astype(
-        np.uint8
-    )
+    background = (100 + ((xx // 12 + yy // 12) % 2) * 35 + (p1 + p2) // 8).astype(np.uint8)
     foreground = background.copy()
     center = (150 + (pose == 200) * 35, 120)
     rect = (center, (82, 48), 28 if pose == 155 else -22)
     cv2.fillConvexPoly(foreground, np.rint(cv2.boxPoints(rect)).astype(np.int32), 25)
-    name = f"img_{index:06d}_ur{pose}_p1-{p1:03d}_p2-{p2:03d}_auto.png"
+    ramp = "" if ramp_sample_id is None else f"ramp-{ramp_sample_id:03d}_"
+    name = f"img_{index:06d}_ur{pose}_{ramp}p1-{p1:03d}_p2-{p2:03d}_auto.png"
     target = directory / name
     image = foreground if directory.name.startswith("parts") else background
     assert cv2.imwrite(str(target), image)
@@ -51,6 +57,32 @@ def test_capture_pairing_reports_missing_background(tmp_path: Path) -> None:
     next(background.glob("*.png")).unlink()
 
     with pytest.raises(LabelingError, match="Leerbilder fehlen"):
+        match_captures(scan_capture(foreground), scan_capture(background))
+
+
+def test_ramp_pairing_uses_sample_id_even_when_brightness_repeats(tmp_path: Path) -> None:
+    foreground = tmp_path / "parts_ramp"
+    background = tmp_path / "empty_ramp"
+    foreground.mkdir()
+    background.mkdir()
+    for sample_id in (0, 1):
+        _write_capture(foreground, 155, sample_id + 1, 0, 0, sample_id)
+        _write_capture(background, 155, sample_id + 1, 0, 0, sample_id)
+
+    pairs = match_captures(scan_capture(foreground), scan_capture(background))
+
+    assert [pair.foreground.key.ramp_sample_id for pair in pairs] == [0, 1]
+
+
+def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) -> None:
+    foreground = tmp_path / "parts_ramp"
+    background = tmp_path / "empty_grid"
+    foreground.mkdir()
+    background.mkdir()
+    _write_capture(foreground, 155, 1, 0, 0, 0)
+    _write_capture(background, 155, 1, 0, 0)
+
+    with pytest.raises(LabelingError, match="Raster- und Rampenserie"):
         match_captures(scan_capture(foreground), scan_capture(background))
 
 

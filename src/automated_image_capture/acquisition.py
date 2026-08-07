@@ -86,6 +86,7 @@ def poses_between(start: int, end: int) -> tuple[int, ...]:
 @dataclass(slots=True, frozen=True)
 class AcquisitionSettings:
     output_directory: Path
+    capture_mode: str = "grid"
     pose_start: int = 155
     pose_end: int = 210
     light_1_start: int = 0
@@ -101,10 +102,16 @@ class AcquisitionSettings:
     light_settle_ms: int = 350
     robot_settle_ms: int = 500
     camera_settle_ms: int = 150
+    ramp_duration_s: float = 10.0
+    ramp_image_rate_fps: int = 6
+    ramp_light_1_period_s: float = 2.4
+    ramp_light_2_period_s: float = 10.0
 
     def validated(self) -> AcquisitionSettings:
         if not str(self.output_directory):
             raise ValueError("Bitte einen Speicherort auswählen.")
+        if self.capture_mode not in {"grid", "ramp"}:
+            raise ValueError("Der Aufnahmemodus ist ungültig.")
         for value in (
             self.light_1_start,
             self.light_1_end,
@@ -126,6 +133,15 @@ class AcquisitionSettings:
             )
         if min(self.light_settle_ms, self.robot_settle_ms, self.camera_settle_ms) < 0:
             raise ValueError("Stabilisierungszeiten dürfen nicht negativ sein.")
+        if not 2.0 <= self.ramp_duration_s <= 120.0:
+            raise ValueError("Die Rampendauer muss zwischen 2 und 120 Sekunden liegen.")
+        if not 1 <= self.ramp_image_rate_fps <= 10:
+            raise ValueError("Die Rampen-Bildrate muss zwischen 1 und 10 Bildern/s liegen.")
+        if not all(
+            0.8 <= period <= 120.0
+            for period in (self.ramp_light_1_period_s, self.ramp_light_2_period_s)
+        ):
+            raise ValueError("Panelperioden müssen zwischen 0,8 und 120 Sekunden liegen.")
         return self
 
 
@@ -135,6 +151,15 @@ class CapturePoint:
     light_1_brightness: int
     light_2_brightness: int
     exposure_time_us: int | None
+    ramp_sample_id: int | None = None
+    planned_offset_s: float | None = None
+
+
+def triangle_brightness(elapsed_s: float, period_s: float) -> int:
+    """Deterministic triangular waveform from zero to 100 and back."""
+    phase = (float(elapsed_s) % float(period_s)) / float(period_s)
+    normalized = 2.0 * phase if phase <= 0.5 else 2.0 * (1.0 - phase)
+    return max(0, min(100, round(100.0 * normalized)))
 
 
 def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, ...]:
@@ -148,6 +173,27 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
         )
     else:
         exposures = (None,)
+    if settings.capture_mode == "ramp":
+        sample_count = round(settings.ramp_duration_s * settings.ramp_image_rate_fps)
+        return tuple(
+            CapturePoint(
+                pose=pose,
+                light_1_brightness=triangle_brightness(
+                    sample_id / settings.ramp_image_rate_fps,
+                    settings.ramp_light_1_period_s,
+                ),
+                light_2_brightness=triangle_brightness(
+                    sample_id / settings.ramp_image_rate_fps,
+                    settings.ramp_light_2_period_s,
+                ),
+                exposure_time_us=exposure,
+                ramp_sample_id=sample_id,
+                planned_offset_s=sample_id / settings.ramp_image_rate_fps,
+            )
+            for pose in poses_between(settings.pose_start, settings.pose_end)
+            for exposure in exposures
+            for sample_id in range(sample_count)
+        )
     return tuple(
         CapturePoint(pose, light_1, light_2, exposure)
         for pose in poses_between(settings.pose_start, settings.pose_end)
@@ -204,8 +250,9 @@ class DatasetWriter(QObject):
         if self._session_directory is None:
             raise RuntimeError("Keine Aufnahmesitzung gestartet.")
         exposure = "auto" if point.exposure_time_us is None else f"e{point.exposure_time_us}us"
+        ramp = "" if point.ramp_sample_id is None else f"ramp-{point.ramp_sample_id:03d}_"
         stem = (
-            f"img_{index + 1:06d}_ur{point.pose}_"
+            f"img_{index + 1:06d}_ur{point.pose}_{ramp}"
             f"p1-{point.light_1_brightness:03d}_p2-{point.light_2_brightness:03d}_{exposure}"
         )
         return (
@@ -235,13 +282,21 @@ class DatasetWriter(QObject):
             **metadata,
             "image": {**metadata.get("image", {}), "file": image_path.name},
         }
-        image = np.ascontiguousarray(frame.image.copy())
+        ramp_mono = point.ramp_sample_id is not None and frame.pixel_format.lower().startswith(
+            "mono"
+        )
+        image = np.ascontiguousarray(
+            frame.image[..., 0].copy()
+            if ramp_mono and frame.image.ndim == 3
+            else frame.image.copy()
+        )
         future = self._executor.submit(
             self._write_pair,
             image_path,
             yaml_path,
             image,
             metadata,
+            point.ramp_sample_id is not None,
         )
 
         def done(result: Any) -> None:
@@ -257,11 +312,15 @@ class DatasetWriter(QObject):
     def _write_pair(
         image_path: Path,
         yaml_path: Path,
-        rgb_image: np.ndarray,
+        image: np.ndarray,
         metadata: dict[str, Any],
+        fast_lossless: bool = False,
     ) -> None:
-        bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-        success, encoded = cv2.imencode(".png", bgr)
+        encoded_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if image.ndim == 3 else image
+        compression = 1 if fast_lossless else 3
+        success, encoded = cv2.imencode(
+            ".png", encoded_image, [cv2.IMWRITE_PNG_COMPRESSION, compression]
+        )
         if not success:
             raise OSError("PNG-Kodierung ist fehlgeschlagen.")
         image_tmp = image_path.with_suffix(".png.part")
@@ -320,12 +379,23 @@ class AcquisitionController(QObject):
         self._camera_status = CameraStatus()
         self._robot_status = RobotStatus()
         self._light_statuses = [LightStatus(), LightStatus()]
+        self._ramp_pass_key: tuple[int, int | None] | None = None
+        self._ramp_origin_monotonic = 0.0
+        self._ramp_origin_wall = 0.0
+        self._ramp_confirmation_marker = 0.0
+        self._ramp_targets = (0, 0)
+        self._ramp_sent = [False, False]
+        self._ramp_actual_offset_s: float | None = None
+        self._ramp_timing_error_s: float | None = None
 
         self._phase_timer = QTimer(self)
         self._phase_timer.setSingleShot(True)
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(100)
         self._watchdog.timeout.connect(self._check_timeout)
+        self._ramp_timer = QTimer(self)
+        self._ramp_timer.setInterval(50)
+        self._ramp_timer.timeout.connect(self._ramp_tick)
 
         camera.frame_ready.connect(self._on_frame)
         camera.status_changed.connect(self._on_camera_status)
@@ -376,6 +446,7 @@ class AcquisitionController(QObject):
         self._current_pose = None
         self._applied_lights = None
         self._applied_exposure = None
+        self._reset_ramp_state()
         self._session_directory = session
         self._writer_token = self.writer.session_token
         self._set_resume_available(False)
@@ -430,6 +501,7 @@ class AcquisitionController(QObject):
         self._current_pose = None
         self._applied_lights = None
         self._applied_exposure = None
+        self._reset_ramp_state()
         self._writer_token = self.writer.session_token
         self._set_resume_available(False)
         self._write_manifest("running", "Unterbrochene Sitzung wird fortgesetzt.")
@@ -513,8 +585,9 @@ class AcquisitionController(QObject):
     def _settings_from_manifest(payload: object) -> AcquisitionSettings:
         if not isinstance(payload, dict):
             raise ValueError("Aufnahmeeinstellungen im Checkpoint sind ungültig.")
+        defaults = AcquisitionSettings(output_directory=Path("."))
         names = set(AcquisitionSettings.__dataclass_fields__)
-        values = {name: payload[name] for name in names}
+        values = {name: payload.get(name, getattr(defaults, name)) for name in names}
         values["output_directory"] = Path(str(values["output_directory"]))
         return AcquisitionSettings(**values).validated()
 
@@ -620,6 +693,22 @@ class AcquisitionController(QObject):
             raise RuntimeError("Licht 1 ist nicht verbunden.")
         if self.light_2.state is not ConnectionState.CONNECTED:
             raise RuntimeError("Licht 2 ist nicht verbunden.")
+        if settings.capture_mode == "ramp":
+            configured_fps = float(
+                getattr(getattr(self.camera, "config", None), "preview_max_fps", 0)
+            )
+            observed_fps = float(self._camera_status.preview_fps or 0.0)
+            target_fps = float(settings.ramp_image_rate_fps)
+            if configured_fps < target_fps:
+                raise RuntimeError(
+                    f"Die Kamera-Vorschau ist auf {configured_fps:g} FPS begrenzt; "
+                    f"für die Rampe werden {target_fps:g} FPS benötigt."
+                )
+            if observed_fps > 0 and observed_fps + 0.25 < target_fps:
+                raise RuntimeError(
+                    f"Die gemessene Kamera-Vorschau liefert nur {observed_fps:.1f} FPS; "
+                    f"für die Rampe werden {target_fps:g} FPS benötigt."
+                )
         robot_ready = (
             self._robot_status.rtde_connected
             and self._robot_status.command_channel_connected
@@ -678,6 +767,9 @@ class AcquisitionController(QObject):
 
     def _prepare_point(self) -> None:
         point = self._points[self._index]
+        if point.ramp_sample_id is not None:
+            self._apply_exposure()
+            return
         target_lights = (point.light_1_brightness, point.light_2_brightness)
         if self._applied_lights != target_lights:
             self.status_changed.emit(
@@ -693,12 +785,23 @@ class AcquisitionController(QObject):
     def _apply_exposure(self) -> None:
         point = self._points[self._index]
         if point.exposure_time_us is None or self._applied_exposure == point.exposure_time_us:
-            self._wait_for_frame()
+            self._after_exposure_ready()
             return
         self.status_changed.emit(f"Setze Belichtungszeit {point.exposure_time_us} µs …")
         self._set_phase("exposure", 5.0)
         if not self.camera.set_exposure_time(point.exposure_time_us):
             self._fail("Belichtungszeit konnte nicht gesetzt werden.")
+
+    def _after_exposure_ready(self) -> None:
+        point = self._points[self._index]
+        if point.ramp_sample_id is not None:
+            key = (point.pose, point.exposure_time_us)
+            if self._ramp_pass_key == key:
+                self._wait_for_ramp_frame()
+            else:
+                self._start_ramp_sync(point)
+            return
+        self._wait_for_frame()
 
     def _wait_for_frame(self) -> None:
         self._frame_after = time.time()
@@ -722,7 +825,7 @@ class AcquisitionController(QObject):
                 assert self._settings is not None
                 self._schedule(
                     self._settings.camera_settle_ms,
-                    self._wait_for_frame,
+                    self._after_exposure_ready,
                     "exposure_settle",
                 )
 
@@ -754,6 +857,7 @@ class AcquisitionController(QObject):
         self._light_statuses[index] = replace(status)
         self._maybe_power_ready()
         self._maybe_lights_ready()
+        self._maybe_ramp_transition_ready()
 
     def _maybe_power_ready(self) -> None:
         if not self._running or self._phase != "power":
@@ -781,7 +885,147 @@ class AcquisitionController(QObject):
                 "light_settle",
             )
 
+    def _reset_ramp_state(self) -> None:
+        self._ramp_timer.stop()
+        self._ramp_pass_key = None
+        self._ramp_origin_monotonic = 0.0
+        self._ramp_origin_wall = 0.0
+        self._ramp_confirmation_marker = 0.0
+        self._ramp_targets = (0, 0)
+        self._ramp_sent = [False, False]
+        self._ramp_actual_offset_s = None
+        self._ramp_timing_error_s = None
+
+    def _start_ramp_sync(self, point: CapturePoint) -> None:
+        # A fresh pass begins at sample zero (0/0). A resumed pass is explicitly
+        # synchronized to its next missing deterministic sample.
+        self._ramp_targets = (point.light_1_brightness, point.light_2_brightness)
+        self._ramp_confirmation_marker = time.time()
+        self._ramp_sent = [False, False]
+        self._set_phase("ramp_sync", 1.0)
+        self.status_changed.emit(
+            f"Synchronisiere Licht-Rampe bei Sample {point.ramp_sample_id}: "
+            f"{self._ramp_targets[0]} % / {self._ramp_targets[1]} % …"
+        )
+        self._ramp_timer.start()
+        self._ramp_tick()
+
+    def _ramp_tick(self) -> None:
+        if not self._running:
+            self._ramp_timer.stop()
+            return
+        if self._phase in {"ramp_sync", "ramp_finalize"}:
+            for index, (adapter, target) in enumerate(
+                zip((self.light_1, self.light_2), self._ramp_targets, strict=True)
+            ):
+                if not self._ramp_sent[index]:
+                    self._ramp_sent[index] = adapter.try_set_ramp_brightness(target)
+            self._maybe_ramp_transition_ready()
+            return
+        if self._ramp_pass_key is None or self._phase not in {"ramp_frame", "ramp_writing"}:
+            return
+        assert self._settings is not None
+        elapsed = max(0.0, time.monotonic() - self._ramp_origin_monotonic)
+        targets = (
+            triangle_brightness(elapsed, self._settings.ramp_light_1_period_s),
+            triangle_brightness(elapsed, self._settings.ramp_light_2_period_s),
+        )
+        now_wall = time.time()
+        for adapter, status, target in zip(
+            (self.light_1, self.light_2), self._light_statuses, targets, strict=True
+        ):
+            if not status.connected:
+                self._fail("Ein Panel hat während der Licht-Rampe die Verbindung verloren.")
+                return
+            confirmed_at = status.last_command_confirmed_at or self._ramp_origin_wall
+            if getattr(adapter, "command_busy", False) and now_wall - confirmed_at > 1.0:
+                self._fail("Ein Panel hat einen Rampenbefehl länger als 1 Sekunde nicht bestätigt.")
+                return
+            if status.brightness != target:
+                adapter.try_set_ramp_brightness(target)
+                if now_wall - confirmed_at > 1.0:
+                    self._fail(
+                        "Ein Panel hat einen Rampenbefehl länger als 1 Sekunde nicht bestätigt."
+                    )
+                    return
+
+    def _maybe_ramp_transition_ready(self) -> None:
+        if not self._running or self._phase not in {"ramp_sync", "ramp_finalize"}:
+            return
+        ready = all(
+            sent
+            and status.connected
+            and status.values_are_confirmed_commands
+            and status.brightness == target
+            and (status.last_command_confirmed_at or 0.0) >= self._ramp_confirmation_marker
+            for sent, status, target in zip(
+                self._ramp_sent, self._light_statuses, self._ramp_targets, strict=True
+            )
+        )
+        if not ready:
+            return
+        if self._phase == "ramp_finalize":
+            self._ramp_timer.stop()
+            self._ramp_pass_key = None
+            self._applied_lights = (0, 0)
+            self.status_changed.emit("Licht-Rampe beendet; beide Panels bestätigt auf 0 %.")
+            self._advance()
+            return
+        point = self._points[self._index]
+        planned = float(point.planned_offset_s or 0.0)
+        now_monotonic = time.monotonic()
+        now_wall = time.time()
+        self._ramp_origin_monotonic = now_monotonic - planned
+        self._ramp_origin_wall = now_wall - planned
+        self._ramp_pass_key = (point.pose, point.exposure_time_us)
+        self.status_changed.emit(
+            f"Licht-Rampe gestartet: UR {point.pose}, "
+            f"{self._settings.ramp_duration_s:g} s bei "
+            f"{self._settings.ramp_image_rate_fps} Bildern/s."
+        )
+        self._wait_for_ramp_frame()
+
+    def _wait_for_ramp_frame(self) -> None:
+        point = self._points[self._index]
+        assert point.ramp_sample_id is not None
+        self._set_phase("ramp_frame", 2.0)
+        self.status_changed.emit(
+            f"Rampe: Pose {point.pose} · Sample {point.ramp_sample_id + 1}/"
+            f"{round(self._settings.ramp_duration_s * self._settings.ramp_image_rate_fps)} · "
+            f"bestätigt {self._light_statuses[0].brightness} % / "
+            f"{self._light_statuses[1].brightness} %"
+        )
+
+    def _finish_ramp_pass(self) -> None:
+        self._ramp_targets = (0, 0)
+        self._ramp_confirmation_marker = time.time()
+        self._ramp_sent = [False, False]
+        self._set_phase("ramp_finalize", 1.0)
+        self._ramp_tick()
+
     def _on_frame(self, frame: object) -> None:
+        if self._running and self._phase == "ramp_frame" and isinstance(frame, CameraFrame):
+            point = self._points[self._index]
+            planned = float(point.planned_offset_s or 0.0)
+            actual = frame.timestamp - self._ramp_origin_wall
+            if actual < planned:
+                return
+            timing_error = actual - planned
+            if timing_error > 0.5:
+                self._fail(
+                    f"Kamerabild für Rampen-Sample {point.ramp_sample_id} kam "
+                    f"{timing_error * 1000:.0f} ms zu spät (maximal 500 ms)."
+                )
+                return
+            self._ramp_actual_offset_s = actual
+            self._ramp_timing_error_s = timing_error
+            metadata = self._metadata(point, frame)
+            self._set_phase("ramp_writing", 2.0)
+            try:
+                self.writer.submit(self._index, point, frame, metadata)
+            except Exception as exc:
+                self._fail(f"Speichern konnte nicht gestartet werden: {exc}")
+            return
         if (
             not self._running
             or self._phase != "frame"
@@ -801,7 +1045,7 @@ class AcquisitionController(QObject):
         camera = self._camera_status
         robot = self._robot_status
         lights = self._light_statuses
-        return {
+        metadata = {
             "schema_version": 1,
             "captured_at": datetime.fromtimestamp(frame.timestamp).astimezone().isoformat(),
             "image": {
@@ -827,22 +1071,48 @@ class AcquisitionController(QObject):
                 "tcp_pose": list(robot.tcp_pose),
             },
             "lights": {
-                "panel_1": self._light_metadata(lights[0], point.light_1_brightness),
-                "panel_2": self._light_metadata(lights[1], point.light_2_brightness),
+                "panel_1": self._light_metadata(
+                    lights[0], point.light_1_brightness, frame.timestamp
+                ),
+                "panel_2": self._light_metadata(
+                    lights[1], point.light_2_brightness, frame.timestamp
+                ),
             },
             "sequence": {
                 "index": self._index + 1,
                 "total": len(self._points),
             },
         }
+        if point.ramp_sample_id is not None:
+            metadata["ramp"] = {
+                "sample_id": point.ramp_sample_id,
+                "planned_offset_s": point.planned_offset_s,
+                "actual_capture_offset_s": self._ramp_actual_offset_s,
+                "timing_error_ms": None
+                if self._ramp_timing_error_s is None
+                else self._ramp_timing_error_s * 1000.0,
+                "panel_1_nominal_target_percent": point.light_1_brightness,
+                "panel_2_nominal_target_percent": point.light_2_brightness,
+            }
+        return metadata
 
     @staticmethod
-    def _light_metadata(status: LightStatus, requested_brightness: int) -> dict[str, Any]:
+    def _light_metadata(
+        status: LightStatus, requested_brightness: int, captured_at: float
+    ) -> dict[str, Any]:
+        confirmed_at = status.last_command_confirmed_at
         return {
             "name": status.name,
             "address": status.address,
             "requested_brightness_percent": requested_brightness,
             "confirmed_brightness_percent": status.brightness,
+            "last_confirmed_command_percent": status.brightness,
+            "last_command_confirmed_at": None
+            if confirmed_at is None
+            else datetime.fromtimestamp(confirmed_at).astimezone().isoformat(),
+            "confirmed_command_age_ms": None
+            if confirmed_at is None
+            else max(0.0, (captured_at - confirmed_at) * 1000.0),
             "mode": status.mode,
             "cct_kelvin": status.cct_kelvin if status.mode == "CCT" else None,
             "hue_degrees": status.hue if status.mode == "HSI" else None,
@@ -855,7 +1125,7 @@ class AcquisitionController(QObject):
         if (
             token != self._writer_token
             or not self._running
-            or self._phase != "writing"
+            or self._phase not in {"writing", "ramp_writing"}
             or index != self._index
         ):
             return
@@ -863,6 +1133,21 @@ class AcquisitionController(QObject):
         self._write_manifest("running", f"Bild {self._index} gespeichert.")
         self.progress_changed.emit(self._index, len(self._points))
         self.status_changed.emit(f"Gespeichert: {image_path}")
+        if self._points[index].ramp_sample_id is not None:
+            previous_key = (
+                self._points[index].pose,
+                self._points[index].exposure_time_us,
+            )
+            next_key = (
+                (self._points[self._index].pose, self._points[self._index].exposure_time_us)
+                if self._index < len(self._points)
+                else None
+            )
+            if next_key == previous_key:
+                self._wait_for_ramp_frame()
+            else:
+                self._finish_ramp_pass()
+            return
         self._advance()
 
     def _on_write_failed(self, token: int, index: int, message: str) -> None:
@@ -871,7 +1156,16 @@ class AcquisitionController(QObject):
 
     def _check_timeout(self) -> None:
         if self._running and time.monotonic() > self._deadline:
-            self._fail(f"Zeitüberschreitung in Phase '{self._phase}'.")
+            if self._phase in {"ramp_sync", "ramp_finalize"}:
+                self._fail("Ein Panel hat den Lichtbefehl länger als 1 Sekunde nicht bestätigt.")
+            elif self._phase == "ramp_writing":
+                self._fail(
+                    "Das Speichern des PNG/YAML-Paars ist zu langsam für die Rampen-Bildrate."
+                )
+            elif self._phase == "ramp_frame":
+                self._fail("Kein frisches Kamerabild zum geplanten Rampenzeitpunkt empfangen.")
+            else:
+                self._fail(f"Zeitüberschreitung in Phase '{self._phase}'.")
 
     def _fail(self, message: str) -> None:
         self.error.emit(message)
@@ -884,12 +1178,11 @@ class AcquisitionController(QObject):
         completed: bool = False,
         resumable: bool = False,
     ) -> None:
-        restore_exposure = (
-            self._settings is not None and self._settings.exposure_enabled
-        )
+        restore_exposure = self._settings is not None and self._settings.exposure_enabled
         self._running = False
         self._phase = "idle"
         self._phase_timer.stop()
+        self._ramp_timer.stop()
         self._watchdog.stop()
         if restore_exposure:
             self.camera.restore_exposure()

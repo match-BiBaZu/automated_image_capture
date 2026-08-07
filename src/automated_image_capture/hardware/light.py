@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -63,6 +64,8 @@ class LightAdapter(DeviceAdapter):
         self._desired_connection = False
         self._operation_task: asyncio.Task[Any] | None = None
         self._reconnect_task: asyncio.Task[Any] | None = None
+        self._command_busy = False
+        self._last_command_started_at = 0.0
         self._monitor = QTimer(self)
         self._monitor.setInterval(2000)
         self._monitor.timeout.connect(self._check_connection)
@@ -145,6 +148,7 @@ class LightAdapter(DeviceAdapter):
         light = NeewerLight(connection_target, name=profile_name)
         await light.connect()
         self._light = light
+        self._command_busy = False
         self._status.name = selected.name
         self._status.address = selected.address
         self._status.rssi = selected.rssi
@@ -161,6 +165,9 @@ class LightAdapter(DeviceAdapter):
         if self._reconnect_task is not None:
             self._reconnect_task.cancel()
             self._reconnect_task = None
+        if self._operation_task is not None and not self._operation_task.done():
+            self._operation_task.cancel()
+        self._command_busy = False
         self._operation_task = self._start_task(self.disconnect_async())
 
     async def disconnect_async(self) -> None:
@@ -170,6 +177,7 @@ class LightAdapter(DeviceAdapter):
                 await light.disconnect()
         self._status.connected = False
         self._status.values_are_confirmed_commands = False
+        self._command_busy = False
         self.status_changed.emit(self._status)
         self._set_state(ConnectionState.DISCONNECTED)
         self._emit_event("Bluetooth getrennt; der Lichtzustand wurde nicht verändert.")
@@ -228,18 +236,30 @@ class LightAdapter(DeviceAdapter):
         self._run_command(command, f"Licht {'ein' if enabled else 'aus'}")
 
     def set_brightness(self, brightness: int) -> None:
+        self._set_brightness(brightness, quiet=False)
+
+    @property
+    def command_busy(self) -> bool:
+        return self._command_busy
+
+    def try_set_ramp_brightness(self, brightness: int) -> bool:
+        """Send when BLE is free; the caller retries later with its newest target."""
+        now = time.monotonic()
+        if self._command_busy or now - self._last_command_started_at < 0.1:
+            return False
+        return self._set_brightness(brightness, quiet=True)
+
+    def _set_brightness(self, brightness: int, *, quiet: bool) -> bool:
         brightness = max(0, min(100, int(brightness)))
 
         async def command() -> None:
             if self._status.mode == "HSI":
-                await self._light.set_rgb(
-                    self._status.hue, self._status.saturation, brightness
-                )
+                await self._light.set_rgb(self._status.hue, self._status.saturation, brightness)
             else:
                 await self._light.set_cct(self._status.cct_kelvin, brightness, gm=50)
             self._status.brightness = brightness
 
-        self._run_command(command, f"Helligkeit {brightness} %")
+        return self._run_command(command, f"Helligkeit {brightness} %", quiet=quiet)
 
     def set_cct(self, kelvin: int, brightness: int) -> None:
         kelvin = max(3200, min(5600, int(kelvin)))
@@ -271,17 +291,28 @@ class LightAdapter(DeviceAdapter):
         self,
         operation: Callable[[], Awaitable[None]],
         description: str,
-    ) -> None:
+        *,
+        quiet: bool = False,
+    ) -> bool:
         if self._light is None or self.state is not ConnectionState.CONNECTED:
             self._emit_error("Lichtbefehl verworfen: Das Panel ist nicht verbunden.")
-            return
+            return False
+        if self._command_busy:
+            if not quiet:
+                self._emit_error("Lichtbefehl verworfen: Das Panel verarbeitet noch einen Befehl.")
+            return False
+
+        self._command_busy = True
+        self._last_command_started_at = time.monotonic()
 
         async def execute() -> None:
             try:
                 await operation()
                 self._status.values_are_confirmed_commands = True
+                self._status.last_command_confirmed_at = time.time()
                 self.status_changed.emit(self._status)
-                self._emit_event(f"Bestätigter Befehl: {description}.")
+                if not quiet:
+                    self._emit_event(f"Bestätigter Befehl: {description}.")
             except Exception as exc:
                 self._set_state(ConnectionState.ERROR)
                 self._emit_error(f"Lichtbefehl fehlgeschlagen: {exc}")
@@ -289,5 +320,11 @@ class LightAdapter(DeviceAdapter):
                 self.status_changed.emit(self._status)
                 self._light = None
                 self._schedule_reconnect()
+            finally:
+                self._command_busy = False
 
         self._operation_task = self._start_task(execute())
+        if self._operation_task is None:
+            self._command_busy = False
+            return False
+        return True

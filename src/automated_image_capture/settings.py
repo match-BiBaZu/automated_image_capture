@@ -93,6 +93,9 @@ class SettingsStore:
                     )
                 )
             ),
+            capture_mode=str(
+                self._settings.value("acquisition/capture_mode", defaults.capture_mode)
+            ),
             pose_start=int(self._settings.value("acquisition/pose_start", defaults.pose_start)),
             pose_end=int(self._settings.value("acquisition/pose_end", defaults.pose_end)),
             light_1_start=int(
@@ -130,12 +133,31 @@ class SettingsStore:
             camera_settle_ms=int(
                 self._settings.value("acquisition/camera_settle_ms", defaults.camera_settle_ms)
             ),
+            ramp_duration_s=float(
+                self._settings.value("acquisition/ramp_duration_s", defaults.ramp_duration_s)
+            ),
+            ramp_image_rate_fps=int(
+                self._settings.value(
+                    "acquisition/ramp_image_rate_fps", defaults.ramp_image_rate_fps
+                )
+            ),
+            ramp_light_1_period_s=float(
+                self._settings.value(
+                    "acquisition/ramp_light_1_period_s", defaults.ramp_light_1_period_s
+                )
+            ),
+            ramp_light_2_period_s=float(
+                self._settings.value(
+                    "acquisition/ramp_light_2_period_s", defaults.ramp_light_2_period_s
+                )
+            ),
         ).validated()
 
     def save_acquisition(self, config) -> None:
         config = config.validated()
         for field_name in (
             "output_directory",
+            "capture_mode",
             "pose_start",
             "pose_end",
             "light_1_start",
@@ -151,6 +173,10 @@ class SettingsStore:
             "light_settle_ms",
             "robot_settle_ms",
             "camera_settle_ms",
+            "ramp_duration_s",
+            "ramp_image_rate_fps",
+            "ramp_light_1_period_s",
+            "ramp_light_2_period_s",
         ):
             value = getattr(config, field_name)
             if field_name == "output_directory":

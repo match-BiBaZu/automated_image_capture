@@ -99,6 +99,43 @@ async def test_light_hsi_values_are_clamped(qtbot, monkeypatch) -> None:
     await adapter.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_ramp_commands_are_serialized_and_stale_targets_are_skipped(
+    qtbot, monkeypatch
+) -> None:
+    class SlowFakeLight(FakeLight):
+        active = 0
+        maximum_active = 0
+
+        async def set_cct(self, kelvin: int, brightness: int, gm: int = 50) -> None:
+            type(self).active += 1
+            type(self).maximum_active = max(type(self).maximum_active, type(self).active)
+            await asyncio.sleep(0.05)
+            self.commands.append(("cct", kelvin, brightness, gm))
+            type(self).active -= 1
+
+    FakeLight.instances.clear()
+    fake_module = SimpleNamespace(NeewerScanner=FakeScanner, NeewerLight=SlowFakeLight)
+    monkeypatch.setitem(sys.modules, "neewerlite", fake_module)
+    adapter = LightAdapter(AppSettings(auto_reconnect=False))
+    adapter.connect()
+    await wait_for(lambda: adapter.state is ConnectionState.CONNECTED)
+    light = FakeLight.instances[-1]
+
+    assert adapter.try_set_ramp_brightness(10)
+    assert not adapter.try_set_ramp_brightness(20)
+    assert not adapter.try_set_ramp_brightness(30)
+    await wait_for(lambda: not adapter.command_busy)
+    await asyncio.sleep(0.06)
+    assert adapter.try_set_ramp_brightness(30)
+    await wait_for(lambda: not adapter.command_busy)
+
+    assert [command[2] for command in light.commands] == [10, 30]
+    assert SlowFakeLight.maximum_active == 1
+    assert adapter._status.last_command_confirmed_at is not None
+    await adapter.shutdown()
+
+
 def test_second_light_selection_excludes_first_address() -> None:
     config = AppSettings(light_address="AA:01", light_2_address="AA:02")
     second = LightAdapter(

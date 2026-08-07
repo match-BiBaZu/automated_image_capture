@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import cv2
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtTest import QSignalSpy
@@ -11,8 +13,11 @@ from PyQt6.QtTest import QSignalSpy
 from automated_image_capture.acquisition import (
     AcquisitionController,
     AcquisitionSettings,
+    CapturePoint,
+    DatasetWriter,
     build_capture_points,
     dump_yaml,
+    triangle_brightness,
 )
 from automated_image_capture.models import (
     CameraFrame,
@@ -66,6 +71,101 @@ def test_exposure_is_innermost_variation(tmp_path: Path) -> None:
     assert [point.light_1_brightness for point in points] == [10, 10, 20, 20]
 
 
+def test_default_ramp_has_60_unique_samples_and_triangle_extremes(tmp_path: Path) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=155,
+        pose_end=155,
+    )
+
+    points = build_capture_points(settings)
+
+    assert len(points) == 60
+    assert [point.ramp_sample_id for point in points] == list(range(60))
+    assert len({(point.light_1_brightness, point.light_2_brightness) for point in points}) == 60
+    assert points[0].planned_offset_s == 0.0
+    assert min(point.light_1_brightness for point in points) == 0
+    assert max(point.light_1_brightness for point in points) == 100
+    assert min(point.light_2_brightness for point in points) == 0
+    assert max(point.light_2_brightness for point in points) == 100
+    assert triangle_brightness(0.0, 2.4) == 0
+    assert triangle_brightness(1.2, 2.4) == 100
+    assert triangle_brightness(2.4, 2.4) == 0
+
+
+def test_ramp_order_is_pose_then_exposure_then_sample(tmp_path: Path) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=155,
+        pose_end=160,
+        ramp_duration_s=2,
+        ramp_image_rate_fps=1,
+        exposure_enabled=True,
+        exposure_start_us=1000,
+        exposure_end_us=2000,
+        exposure_step_us=1000,
+    )
+    points = build_capture_points(settings)
+
+    assert [(p.pose, p.exposure_time_us, p.ramp_sample_id) for p in points] == [
+        (155, 1000, 0),
+        (155, 1000, 1),
+        (155, 2000, 0),
+        (155, 2000, 1),
+        (160, 1000, 0),
+        (160, 1000, 1),
+        (160, 2000, 0),
+        (160, 2000, 1),
+    ]
+
+
+def test_ramp_writer_uses_unique_name_and_lossless_grayscale_png(tmp_path: Path) -> None:
+    writer = DatasetWriter()
+    session = writer.start_session(tmp_path)
+    point = CapturePoint(155, 0, 0, None, ramp_sample_id=0, planned_offset_s=0.0)
+    rgb_gray = np.repeat(np.arange(80, dtype=np.uint8).reshape(8, 10, 1), 3, axis=2)
+    frame = CameraFrame(rgb_gray, "Mono8", time.time())
+
+    writer.submit(0, point, frame, {"image": {}})
+    writer.flush()
+    writer.close()
+
+    images = list(session.glob("*.png"))
+    assert images[0].name == "img_000001_ur155_ramp-000_p1-000_p2-000_auto.png"
+    decoded = cv2.imread(str(images[0]), cv2.IMREAD_UNCHANGED)
+    assert decoded.ndim == 2
+    assert np.array_equal(decoded, rgb_gray[..., 0])
+
+
+def test_old_checkpoint_settings_receive_ramp_defaults(tmp_path: Path) -> None:
+    # Slotted dataclasses have no __dict__; this mirrors the original schema explicitly.
+    old = {
+        "output_directory": str(tmp_path),
+        "pose_start": 155,
+        "pose_end": 155,
+        "light_1_start": 0,
+        "light_1_end": 0,
+        "light_1_step": 10,
+        "light_2_start": 0,
+        "light_2_end": 0,
+        "light_2_step": 10,
+        "exposure_enabled": False,
+        "exposure_start_us": 5000,
+        "exposure_end_us": 5000,
+        "exposure_step_us": 1000,
+        "light_settle_ms": 350,
+        "robot_settle_ms": 500,
+        "camera_settle_ms": 150,
+    }
+
+    restored = AcquisitionController._settings_from_manifest(old)
+
+    assert restored.capture_mode == "grid"
+    assert restored.ramp_duration_s == 10.0
+
+
 def test_new_named_poses_follow_configured_order(tmp_path: Path) -> None:
     settings = AcquisitionSettings(
         output_directory=tmp_path,
@@ -111,11 +211,10 @@ class FakeCamera(QObject):
     def __init__(self) -> None:
         super().__init__()
         self.state = ConnectionState.CONNECTED
+        self.config = SimpleNamespace(preview_max_fps=15)
 
     def set_exposure_time(self, value: float) -> bool:
-        self.status_changed.emit(
-            CameraStatus(exposure_time_us=value, exposure_writable=True)
-        )
+        self.status_changed.emit(CameraStatus(exposure_time_us=value, exposure_writable=True))
         return True
 
     def restore_exposure(self) -> bool:
@@ -150,7 +249,12 @@ class FakeLight(QObject):
     def set_brightness(self, brightness: int) -> None:
         self.status.brightness = brightness
         self.status.values_are_confirmed_commands = True
+        self.status.last_command_confirmed_at = time.time()
         self.status_changed.emit(self.status)
+
+    def try_set_ramp_brightness(self, brightness: int) -> bool:
+        self.set_brightness(brightness)
+        return True
 
 
 def _ready_controller() -> tuple[
@@ -191,6 +295,7 @@ def _robot_status(
         acknowledged_pose=acknowledged_pose,
         command_pending=False,
     )
+
 
 def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None:
     camera = FakeCamera()
@@ -261,6 +366,51 @@ def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None
     assert "requested_brightness_percent: 20" in yaml_text
 
 
+def test_two_sample_ramp_captures_on_timeline_and_finishes_at_zero(qtbot, tmp_path: Path) -> None:
+    controller, camera, robot, light_1, light_2 = _ready_controller()
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=180,
+        pose_end=180,
+        ramp_duration_s=2.0,
+        ramp_image_rate_fps=1,
+        ramp_light_1_period_s=2.0,
+        ramp_light_2_period_s=2.0,
+        robot_settle_ms=0,
+    )
+
+    assert controller.start(settings)
+    qtbot.waitUntil(lambda: robot.requests == [180], timeout=2000)
+    robot.status_changed.emit(
+        _robot_status(command_state_code=3, sequence=9, acknowledged_pose=180)
+    )
+    qtbot.waitUntil(lambda: controller._phase == "ramp_frame", timeout=2000)
+    first_origin = controller._ramp_origin_wall
+    camera.frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", first_origin + 0.01)
+    )
+    qtbot.waitUntil(
+        lambda: controller._index == 1 and controller._phase == "ramp_frame",
+        timeout=3000,
+    )
+    camera.frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 120, np.uint8), "Mono8", first_origin + 1.01)
+    )
+    qtbot.waitUntil(lambda: not controller.running, timeout=3000)
+
+    session = controller.session_directory
+    assert session is not None
+    assert len(list(session.glob("*.png"))) == 2
+    assert light_1.status.brightness == light_2.status.brightness == 0
+    yaml_text = sorted(session.glob("*.yaml"))[1].read_text(encoding="utf-8")
+    assert "sample_id: 1" in yaml_text
+    assert "planned_offset_s: 1.0" in yaml_text
+    assert "timing_error_ms:" in yaml_text
+    assert "last_confirmed_command_percent:" in yaml_text
+    controller.close()
+
+
 def test_interrupted_sequence_resumes_in_same_directory_without_duplicates(
     qtbot, tmp_path: Path
 ) -> None:
@@ -296,9 +446,10 @@ def test_interrupted_sequence_resumes_in_same_directory_without_duplicates(
     assert controller.resume_available
     assert controller.remaining_count == 1
     assert session is not None
-    assert json.loads((session / "capture_session.json").read_text(encoding="utf-8"))[
-        "status"
-    ] == "interrupted"
+    assert (
+        json.loads((session / "capture_session.json").read_text(encoding="utf-8"))["status"]
+        == "interrupted"
+    )
 
     camera.state = ConnectionState.ERROR
     assert not controller.resume()

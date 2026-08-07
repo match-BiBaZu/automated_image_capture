@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from PyQt6.QtCore import QSettings
 from PyQt6.QtTest import QSignalSpy
 
+from automated_image_capture.acquisition import AcquisitionSettings
 from automated_image_capture.inference import InferenceDetection, InferenceFrame
 from automated_image_capture.models import (
     CameraStatus,
@@ -13,6 +16,7 @@ from automated_image_capture.models import (
 )
 from automated_image_capture.settings import SettingsStore
 from automated_image_capture.ui.main_window import MainWindow
+from automated_image_capture.ui.widgets import AcquisitionDialog
 
 
 def make_window(qtbot, tmp_path) -> MainWindow:
@@ -113,9 +117,7 @@ def test_camera_exposure_control_follows_status_and_emits_request(qtbot, tmp_pat
     assert len(spy) == 1
     assert spy[0][0] == 7_500.0
 
-    window._camera_status(
-        CameraStatus(exposure_writable=True, exposure_auto="Continuous")
-    )
+    window._camera_status(CameraStatus(exposure_writable=True, exposure_auto="Continuous"))
     assert window.camera_card.exposure_time.isEnabled()
     assert "deaktiviert ExposureAuto" in window.camera_card.exposure_hint.text()
 
@@ -170,6 +172,28 @@ def test_resume_button_is_only_enabled_for_interrupted_sequence(qtbot, tmp_path)
     assert window.acquisition_card.resume_button.isEnabled()
     window.acquisition_card.set_resume_available(False)
     assert not window.acquisition_card.resume_button.isEnabled()
+
+
+def test_acquisition_dialog_switches_to_persistable_ramp_settings(qtbot, tmp_path) -> None:
+    dialog = AcquisitionDialog(
+        AcquisitionSettings(output_directory=Path(tmp_path)),
+        CameraStatus(exposure_writable=True),
+    )
+    qtbot.addWidget(dialog)
+
+    dialog.capture_mode.setCurrentIndex(dialog.capture_mode.findData("ramp"))
+    dialog.ramp_duration.setValue(12.5)
+    dialog.ramp_rate.setValue(8)
+    dialog.ramp_light_1_period.setValue(1.6)
+    dialog.ramp_light_2_period.setValue(12.5)
+    config = dialog._current_config().validated()
+
+    assert dialog.ramp_group.isVisibleTo(dialog)
+    assert not dialog.light_1_row.isVisibleTo(dialog)
+    assert config.capture_mode == "ramp"
+    assert config.ramp_duration_s == 12.5
+    assert config.ramp_image_rate_fps == 8
+    assert "100" in dialog.estimate.text()
 
 
 def test_robot_pose_requires_running_program_and_one_time_consent(qtbot, tmp_path) -> None:

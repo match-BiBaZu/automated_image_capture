@@ -88,6 +88,7 @@ class LightStatus:
     saturation: int = 100
     capabilities: LightCapabilities = field(default_factory=LightCapabilities)
     values_are_confirmed_commands: bool = False
+    last_command_confirmed_at: float | None = None
 
 
 @dataclass(slots=True, frozen=True)

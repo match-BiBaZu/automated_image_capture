@@ -47,6 +47,7 @@ def test_acquisition_settings_round_trip(tmp_path) -> None:
     store = SettingsStore(backend)
     expected = AcquisitionSettings(
         output_directory=tmp_path / "dataset",
+        capture_mode="ramp",
         pose_start=160,
         pose_end=200,
         light_1_start=10,
@@ -59,6 +60,10 @@ def test_acquisition_settings_round_trip(tmp_path) -> None:
         exposure_start_us=2000,
         exposure_end_us=8000,
         exposure_step_us=2000,
+        ramp_duration_s=12.5,
+        ramp_image_rate_fps=8,
+        ramp_light_1_period_s=1.6,
+        ramp_light_2_period_s=12.5,
     )
 
     store.save_acquisition(expected)
@@ -101,9 +106,7 @@ def test_legacy_labeling_settings_are_migrated_to_source_list(tmp_path) -> None:
     loaded = store.load_labeling()
 
     assert loaded.sources[0] == LabelSource("Pose 1", tmp_path / "old_parts")
-    assert loaded.sources[-1] == LabelSource(
-        "Leere Rutsche", tmp_path / "old_empty", is_empty=True
-    )
+    assert loaded.sources[-1] == LabelSource("Leere Rutsche", tmp_path / "old_empty", is_empty=True)
 
 
 def test_training_paths_round_trip(tmp_path) -> None:
