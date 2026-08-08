@@ -97,6 +97,32 @@ frei. Eine UR-Fahrt wird weiterhin nicht extern abgebrochen. Beim Fortsetzen wir
 SPS-Position gegen den gespeicherten Nullpunkt geprüft. Abweichungen erfordern eine separat
 bestätigte Korrekturfahrt.
 
+## Kamera-Bildrate
+
+Der Kamera-Worker leert den GenTL-Datenstrom stets mit der von Belichtung, Kamera und Netzwerk
+erreichbaren Rohbildrate. Unter **Einstellungen** kann das kameraseitige
+`AcquisitionFrameRate`-Limit abgeschaltet werden; dies ist standardmäßig aktiv. Die dort separat
+konfigurierte **Maximale Vorschau-FPS** begrenzt nur die Darstellung in der GUI. Während einer
+automatischen Aufnahme erhält der Aufnahmecontroller einen eigenen Framepfad mit der im
+Aufnahmedialog gewählten Bildrate. Mono-Bilder bleiben dort einkanalig und werden nicht unnötig
+zu RGB verdreifacht. Die
+YOLO-Liveerkennung besitzt weiterhin ihr eigenes FPS-Limit.
+
+Die Belichtungszeit begrenzt die physikalisch mögliche Bildrate unmittelbar: 250000 µs erlauben
+höchstens etwa 4 FPS, 5000 µs belichtungsseitig bis zu 200 FPS. Die tatsächlich gemessenen Werte
+zeigt die Kamerakarte als **Kamera / Rohabruf / Vorschau**. Die schnelle Rampenaufnahme kann mit
+bis zu 240 Bildern/s konfiguriert werden, startet aber nur, wenn der gemessene Rohabruf die
+gewählte Rate erreicht. Bei zeitgesteuerten Hochgeschwindigkeitsaufnahmen werden weiterhin
+verlustfreie, aber unkomprimierte PNGs geschrieben. Damit wird CPU-Kompression vermieden; der
+Datenträger muss bei 1920 × 1200 Mono8 ungefähr 2,3 MB pro Bild aufnehmen können. Die
+Writer-Warteschlange bricht kontrolliert ab, statt Arbeitsspeicher unbegrenzt zu belegen.
+
+Für eine isolierte Messung bei geschlossener GUI:
+
+```powershell
+uv run python scripts/benchmark_camera.py --frames 300
+```
+
 ## YOLO im Kamera-Livebild
 
 Oberhalb des Kamerabilds lässt sich **YOLO Live-Erkennung** zuschalten. Beim ersten Start

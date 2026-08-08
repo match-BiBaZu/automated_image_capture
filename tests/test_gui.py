@@ -40,6 +40,7 @@ def test_dashboard_renders_status_without_hardware(qtbot, tmp_path) -> None:
             height=1200,
             pixel_format="Mono8",
             camera_fps=30.0,
+            stream_fps=25.0,
             preview_fps=15.0,
         )
     )
@@ -73,6 +74,7 @@ def test_dashboard_renders_status_without_hardware(qtbot, tmp_path) -> None:
     )
 
     assert "TestCam" in window.camera_card.details.text()
+    assert "30.0 / 25.0 / 15.0 FPS" in window.camera_card.details.text()
     assert "RUNNING" in window.robot_card.details.text()
     assert "35 %" in window.light_card.details.text()
     assert "70 %" in window.light_2_card.details.text()

@@ -30,6 +30,7 @@ class CameraStatus:
     height: int = 0
     pixel_format: str = "–"
     camera_fps: float | None = None
+    stream_fps: float = 0.0
     preview_fps: float = 0.0
     exposure_time_us: float | None = None
     exposure_min_us: float | None = None

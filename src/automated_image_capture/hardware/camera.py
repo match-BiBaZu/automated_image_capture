@@ -25,6 +25,18 @@ MAX_STREAM_RESTART_ATTEMPTS = 2
 MAX_CONSECUTIVE_FETCH_TIMEOUTS = 10
 
 
+def advance_frame_deadline(deadline: float, interval: float, now: float) -> float:
+    """Advance a rate-limit deadline without accumulating frame-period quantization."""
+    if interval <= 0.0:
+        return now
+    if deadline <= 0.0:
+        return now + interval
+    if deadline > now:
+        return deadline
+    missed_intervals = int((now - deadline) // interval) + 1
+    return deadline + missed_intervals * interval
+
+
 def camera_fetch_timeout_seconds(exposure_time_us: float | None) -> float:
     """Allow one exposure plus transfer margin before treating a fetch as late."""
     if exposure_time_us is None:
@@ -85,6 +97,34 @@ def convert_to_rgb(
         return np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
     raise ValueError(f"Nicht unterstütztes Pixelformat: {fmt}")
+
+
+def convert_for_capture(
+    data: np.ndarray | Any,
+    width: int,
+    height: int,
+    pixel_format: str,
+) -> np.ndarray:
+    """Copy a buffer into an efficient, persistent image for background capture."""
+    array = np.asarray(data)
+    fmt = str(pixel_format)
+    lower = fmt.lower()
+    if "packed" in lower or lower.endswith("p"):
+        raise ValueError(f"Gepacktes Pixelformat wird noch nicht unterstützt: {fmt}")
+    if lower.startswith("mono"):
+        if array.size != width * height:
+            raise ValueError(f"Unerwartete Datenmenge für {fmt}: {array.size}")
+        mono = _normalize_to_uint8(array.reshape(height, width), fmt)
+        # A GenTL buffer becomes invalid immediately after the fetch context exits.
+        return np.array(mono, dtype=np.uint8, order="C", copy=True)
+    return convert_to_rgb(array, width, height, fmt).copy()
+
+
+def capture_to_rgb(image: np.ndarray) -> np.ndarray:
+    """Create the RGB preview representation from a persistent capture image."""
+    if image.ndim == 2:
+        return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB))
+    return np.ascontiguousarray(image)
 
 
 def _device_field(device: Any, name: str, default: str = "") -> str:
@@ -174,6 +214,7 @@ class CameraWorker(QObject):
     state_changed = pyqtSignal(object)
     status_changed = pyqtSignal(object)
     frame_ready = pyqtSignal(object)
+    capture_frame_ready = pyqtSignal(object)
     error = pyqtSignal(str)
     event_message = pyqtSignal(str)
     finished = pyqtSignal()
@@ -184,6 +225,8 @@ class CameraWorker(QObject):
         super().__init__()
         self._config = config
         self._stop = threading.Event()
+        self._capture_stream_enabled = threading.Event()
+        self._capture_interval = 0.0
         self._exposure_commands: queue.Queue[float | None] = queue.Queue()
 
     def enqueue_exposure(self, exposure_time_us: float) -> None:
@@ -194,6 +237,17 @@ class CameraWorker(QObject):
 
     def stop(self) -> None:
         self._stop.set()
+
+    def set_capture_stream_enabled(
+        self, enabled: bool, target_fps: float | None = None
+    ) -> None:
+        if enabled:
+            self._capture_interval = (
+                0.0 if target_fps is None else 1.0 / max(1.0, float(target_fps))
+            )
+            self._capture_stream_enabled.set()
+        else:
+            self._capture_stream_enabled.clear()
 
     def _select_device(self, devices: list[Any]) -> Any:
         if self._config.camera_serial:
@@ -219,8 +273,12 @@ class CameraWorker(QObject):
         acquirer = None
         exposure_node: Any = None
         exposure_auto_node: Any = None
+        frame_rate_node: Any = None
+        frame_rate_enable_node: Any = None
         original_exposure: float | None = None
         original_exposure_auto: str | None = None
+        original_frame_rate: float | None = None
+        original_frame_rate_enable: bool | None = None
         try:
             self.state_changed.emit(ConnectionState.DISCOVERING)
             self.event_message.emit("Suche über den Baumer GenTL-Producer …")
@@ -249,16 +307,44 @@ class CameraWorker(QObject):
             node_map = acquirer.remote_device.node_map
             exposure_node = _find_node(node_map, "ExposureTime", "ExposureTimeAbs")
             exposure_auto_node = _find_node(node_map, "ExposureAuto")
+            frame_rate_node = _find_node(node_map, "AcquisitionFrameRate")
+            frame_rate_enable_node = _find_node(node_map, "AcquisitionFrameRateEnable")
             original_exposure = _node_number(exposure_node, "value")
             exposure_auto = str(_node_value(node_map, "ExposureAuto", "–"))
             original_exposure_auto = exposure_auto
+            original_frame_rate = _node_number(frame_rate_node, "value")
+            if frame_rate_enable_node is not None:
+                try:
+                    original_frame_rate_enable = bool(frame_rate_enable_node.value)
+                except Exception:
+                    original_frame_rate_enable = None
+            if self._config.maximize_camera_frame_rate:
+                try:
+                    if _node_writable(frame_rate_enable_node):
+                        frame_rate_enable_node.value = False
+                        self.event_message.emit(
+                            "Kameraseitiges Bildratenlimit deaktiviert; Rohabruf läuft frei."
+                        )
+                    elif _node_writable(frame_rate_node):
+                        maximum = _node_number(frame_rate_node, "max")
+                        if maximum is not None:
+                            frame_rate_node.value = maximum
+                            self.event_message.emit(
+                                f"Kamera-Bildrate auf Maximum {float(frame_rate_node.value):.1f} "
+                                "FPS gesetzt."
+                            )
+                except Exception as exc:
+                    self.event_message.emit(
+                        "Kameraseitiges Bildratenlimit konnte nicht verändert werden: "
+                        f"{str(exc) or type(exc).__name__}"
+                    )
             width = int(_node_value(node_map, "Width", 0))
             height = int(_node_value(node_map, "Height", 0))
             pixel_format = str(_node_value(node_map, "PixelFormat", "Unbekannt"))
             camera_fps_raw = _node_value(
                 node_map,
-                "AcquisitionFrameRate",
-                _node_value(node_map, "ResultingFrameRate", None),
+                "ResultingFrameRate",
+                _node_value(node_map, "AcquisitionFrameRate", None),
             )
             camera_fps = float(camera_fps_raw) if camera_fps_raw is not None else None
             camera_ip = _format_camera_ip(
@@ -293,8 +379,10 @@ class CameraWorker(QObject):
             self.state_changed.emit(ConnectionState.CONNECTED)
             self.event_message.emit("Liveaufnahme gestartet.")
             preview_interval = 1.0 / max(1, self._config.preview_max_fps)
-            last_preview = 0.0
+            next_preview = 0.0
+            next_capture = 0.0
             fps_window_start = time.monotonic()
+            stream_frames = 0
             preview_frames = 0
             consecutive_fetch_timeouts = 0
             stream_restart_attempts = 0
@@ -357,6 +445,8 @@ class CameraWorker(QObject):
 
                 try:
                     fetch_timeout = camera_fetch_timeout_seconds(status.exposure_time_us)
+                    capture_image: np.ndarray | None = None
+                    preview_image: np.ndarray | None = None
                     with acquirer.fetch(timeout=fetch_timeout) as buffer:
                         if stream_degraded:
                             self.state_changed.emit(ConnectionState.CONNECTED)
@@ -370,27 +460,71 @@ class CameraWorker(QObject):
                         stream_degraded = False
                         component = buffer.payload.components[0]
                         now = time.monotonic()
-                        if now - last_preview < preview_interval:
-                            continue
+                        frame_timestamp = time.time()
+                        stream_frames += 1
                         fmt = str(getattr(component, "data_format", pixel_format))
-                        rgb = convert_to_rgb(
-                            component.data,
-                            int(component.width),
-                            int(component.height),
-                            fmt,
-                        ).copy()
-                    last_preview = now
-                    preview_frames += 1
-                    self.frame_ready.emit(CameraFrame(rgb, fmt, time.time()))
+                        width = int(component.width)
+                        height = int(component.height)
+                        preview_due = now >= next_preview
+                        capture_due = (
+                            self._capture_stream_enabled.is_set()
+                            and (
+                                self._capture_interval <= 0.0
+                                or now >= next_capture
+                            )
+                        )
+                        if capture_due:
+                            capture_image = convert_for_capture(
+                                component.data,
+                                width,
+                                height,
+                                fmt,
+                            )
+                        if preview_due:
+                            preview_image = (
+                                capture_to_rgb(capture_image)
+                                if capture_image is not None
+                                else convert_to_rgb(
+                                    component.data,
+                                    width,
+                                    height,
+                                    fmt,
+                                ).copy()
+                            )
+                    if capture_image is not None:
+                        next_capture = advance_frame_deadline(
+                            next_capture, self._capture_interval, now
+                        )
+                        self.capture_frame_ready.emit(
+                            CameraFrame(capture_image, fmt, frame_timestamp)
+                        )
+                    if preview_image is not None:
+                        next_preview = advance_frame_deadline(
+                            next_preview, preview_interval, now
+                        )
+                        preview_frames += 1
+                        self.frame_ready.emit(
+                            CameraFrame(preview_image, fmt, frame_timestamp)
+                        )
                     elapsed = now - fps_window_start
                     if elapsed >= 1.0:
+                        status.stream_fps = stream_frames / elapsed
                         status.preview_fps = preview_frames / elapsed
+                        camera_fps_raw = _node_value(
+                            node_map,
+                            "ResultingFrameRate",
+                            _node_value(node_map, "AcquisitionFrameRate", None),
+                        )
+                        status.camera_fps = (
+                            float(camera_fps_raw) if camera_fps_raw is not None else None
+                        )
                         status.exposure_time_us = _node_number(exposure_node, "value")
                         status.exposure_auto = str(
                             getattr(exposure_auto_node, "value", status.exposure_auto)
                         )
                         self.status_changed.emit(status)
                         fps_window_start = now
+                        stream_frames = 0
                         preview_frames = 0
                 except Exception as exc:
                     if self._stop.is_set():
@@ -411,6 +545,7 @@ class CameraWorker(QObject):
                             and outage_seconds >= STREAM_DEGRADED_AFTER_SECONDS
                         ):
                             stream_degraded = True
+                            status.stream_fps = 0.0
                             status.preview_fps = 0.0
                             self.status_changed.emit(status)
                             self.state_changed.emit(ConnectionState.DEGRADED)
@@ -470,6 +605,17 @@ class CameraWorker(QObject):
                             exposure_auto_node.value = original_exposure_auto
                     except Exception:
                         pass
+                if self._config.maximize_camera_frame_rate:
+                    try:
+                        if original_frame_rate is not None and _node_writable(frame_rate_node):
+                            frame_rate_node.value = original_frame_rate
+                        if (
+                            original_frame_rate_enable is not None
+                            and _node_writable(frame_rate_enable_node)
+                        ):
+                            frame_rate_enable_node.value = original_frame_rate_enable
+                    except Exception:
+                        pass
                 try:
                     acquirer.stop()
                 except Exception:
@@ -491,6 +637,7 @@ class CameraWorker(QObject):
 
 class CameraAdapter(DeviceAdapter):
     frame_ready = pyqtSignal(object)
+    capture_frame_ready = pyqtSignal(object)
     exposure_applied = pyqtSignal(float)
 
     def __init__(self, config: AppSettings, parent: QObject | None = None) -> None:
@@ -510,6 +657,7 @@ class CameraAdapter(DeviceAdapter):
         self._worker.state_changed.connect(self._set_state)
         self._worker.status_changed.connect(self._camera_status)
         self._worker.frame_ready.connect(self._forward_frame)
+        self._worker.capture_frame_ready.connect(self._forward_capture_frame)
         self._worker.exposure_applied.connect(self.exposure_applied)
         self._worker.exposure_failed.connect(self._emit_error)
         self._worker.error.connect(self._emit_error)
@@ -528,6 +676,10 @@ class CameraAdapter(DeviceAdapter):
     @pyqtSlot(object)
     def _forward_frame(self, frame: object) -> None:
         self.frame_ready.emit(frame)
+
+    @pyqtSlot(object)
+    def _forward_capture_frame(self, frame: object) -> None:
+        self.capture_frame_ready.emit(frame)
 
     @pyqtSlot(object)
     def _camera_status(self, status: object) -> None:
@@ -551,9 +703,17 @@ class CameraAdapter(DeviceAdapter):
         self._worker.enqueue_exposure_restore()
         return True
 
+    def set_capture_stream_enabled(
+        self, enabled: bool, target_fps: float | None = None
+    ) -> None:
+        worker = self._worker
+        if worker is not None:
+            worker.set_capture_stream_enabled(enabled, target_fps)
+
     def disconnect(self) -> None:
         worker, thread = self._worker, self._thread
         if worker is not None:
+            worker.set_capture_stream_enabled(False)
             worker.stop()
         if thread is not None and thread.isRunning():
             thread.quit()

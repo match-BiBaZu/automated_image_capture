@@ -25,6 +25,7 @@ class AppSettings:
     light_2_address: str = ""
     light_2_name: str = ""
     preview_max_fps: int = 15
+    maximize_camera_frame_rate: bool = True
     auto_reconnect: bool = True
 
     def validated(self) -> AppSettings:
@@ -85,6 +86,11 @@ class SettingsStore:
             preview_max_fps=int(
                 self._settings.value("camera/preview_max_fps", defaults.preview_max_fps)
             ),
+            maximize_camera_frame_rate=self._settings.value(
+                "camera/maximize_frame_rate",
+                defaults.maximize_camera_frame_rate,
+                type=bool,
+            ),
             auto_reconnect=self._settings.value(
                 "connections/auto_reconnect", defaults.auto_reconnect, type=bool
             ),
@@ -107,6 +113,9 @@ class SettingsStore:
         self._settings.setValue("light_2/address", config.light_2_address)
         self._settings.setValue("light_2/name", config.light_2_name)
         self._settings.setValue("camera/preview_max_fps", config.preview_max_fps)
+        self._settings.setValue(
+            "camera/maximize_frame_rate", config.maximize_camera_frame_rate
+        )
         self._settings.setValue("connections/auto_reconnect", config.auto_reconnect)
         self._settings.sync()
 

@@ -409,12 +409,19 @@ def test_yaml_serializer_handles_nested_metadata() -> None:
 
 class FakeCamera(QObject):
     frame_ready = pyqtSignal(object)
+    capture_frame_ready = pyqtSignal(object)
     status_changed = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
         self.state = ConnectionState.CONNECTED
         self.config = SimpleNamespace(preview_max_fps=15)
+        self.capture_stream_enabled = False
+
+    def set_capture_stream_enabled(
+        self, enabled: bool, target_fps: float | None = None
+    ) -> None:
+        self.capture_stream_enabled = enabled
 
     def set_exposure_time(self, value: float) -> bool:
         self.status_changed.emit(CameraStatus(exposure_time_us=value, exposure_writable=True))
@@ -759,6 +766,7 @@ def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None
     light_2.status_changed.emit(light_2.status)
 
     assert controller.start(settings)
+    assert camera.capture_stream_enabled
     qtbot.waitUntil(lambda: robot.requests == [180], timeout=2000)
     robot.status_changed.emit(
         RobotStatus(
@@ -775,7 +783,7 @@ def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None
         timeout=2000,
     )
     qtbot.waitUntil(lambda: controller._phase == "frame", timeout=2000)
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(
             np.full((8, 10, 3), 127, dtype=np.uint8),
             "RGB8",
@@ -816,14 +824,14 @@ def test_two_sample_ramp_captures_on_timeline_and_finishes_at_zero(qtbot, tmp_pa
     )
     qtbot.waitUntil(lambda: controller._phase == "ramp_frame", timeout=2000)
     first_origin = controller._ramp_origin_wall
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", first_origin + 0.01)
     )
     qtbot.waitUntil(
         lambda: controller._index == 1 and controller._phase == "ramp_frame",
         timeout=3000,
     )
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(np.full((8, 10, 3), 120, np.uint8), "Mono8", first_origin + 1.01)
     )
     qtbot.waitUntil(lambda: not controller.running, timeout=3000)
@@ -886,7 +894,7 @@ def test_synchronized_sweep_moves_out_and_back_while_capturing(qtbot, tmp_path: 
     first_origin = controller._sweep_origin_wall
     conveyor.status.logical_offset_mm = 1.0
     conveyor.status.sampled_at = time.time()
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", first_origin + 0.51)
     )
     qtbot.waitUntil(lambda: controller._phase == "sweep_wait_out", timeout=2000)
@@ -906,7 +914,7 @@ def test_synchronized_sweep_moves_out_and_back_while_capturing(qtbot, tmp_path: 
     return_origin = controller._sweep_origin_wall
     conveyor.status.logical_offset_mm = 1.0
     conveyor.status.sampled_at = time.time()
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(np.full((8, 10, 3), 120, np.uint8), "Mono8", return_origin + 1.51)
     )
     qtbot.waitUntil(lambda: controller._phase == "sweep_wait_return", timeout=2000)
@@ -949,12 +957,15 @@ def test_ramp_capture_does_not_wait_for_slow_png_writer(qtbot, tmp_path: Path) -
     )
     qtbot.waitUntil(lambda: controller._phase == "ramp_frame", timeout=2000)
     origin = controller._ramp_origin_wall
-    camera.frame_ready.emit(CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", origin + 0.01))
+    camera.capture_frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", origin + 0.01)
+    )
 
     assert controller._index == 1
     assert controller._phase == "ramp_frame"
     assert controller.writer.pending_count == 1
     controller.stop()
+    assert not camera.capture_stream_enabled
     controller.close()
 
 
@@ -1011,7 +1022,7 @@ def test_interrupted_sequence_resumes_in_same_directory_without_duplicates(
         _robot_status(command_state_code=3, sequence=7, acknowledged_pose=180)
     )
     qtbot.waitUntil(lambda: controller._phase == "frame", timeout=2000)
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(np.full((8, 10, 3), 90, dtype=np.uint8), "RGB8", time.time() + 0.01)
     )
     qtbot.waitUntil(lambda: controller._index == 1, timeout=3000)
@@ -1038,7 +1049,7 @@ def test_interrupted_sequence_resumes_in_same_directory_without_duplicates(
         _robot_status(command_state_code=3, sequence=8, acknowledged_pose=180)
     )
     qtbot.waitUntil(lambda: controller._phase == "frame", timeout=2000)
-    camera.frame_ready.emit(
+    camera.capture_frame_ready.emit(
         CameraFrame(np.full((8, 10, 3), 120, dtype=np.uint8), "RGB8", time.time() + 0.01)
     )
     qtbot.waitUntil(lambda: not controller.running, timeout=5000)

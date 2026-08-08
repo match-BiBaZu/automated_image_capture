@@ -26,6 +26,7 @@ def test_settings_round_trip(tmp_path) -> None:
         light_2_address="11:22:33:44:55:66",
         light_2_name="RGB660-2",
         preview_max_fps=12,
+        maximize_camera_frame_rate=False,
         auto_reconnect=False,
     )
 

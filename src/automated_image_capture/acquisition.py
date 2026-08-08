@@ -31,6 +31,8 @@ from automated_image_capture.models import (
 RAMP_BLE_COMMAND_TIMEOUT_SECONDS = LIGHT_COMMAND_TIMEOUT_SECONDS
 SYNCHRONIZED_FRAME_LATE_TOLERANCE_SECONDS = 1.5
 SYNCHRONIZED_TARGET_TOLERANCE_FULL_STEPS = 3
+DATASET_WRITER_WORKERS = min(8, max(3, (os.cpu_count() or 4) // 2))
+DATASET_WRITER_MAX_PENDING = 64
 
 
 def ramp_command_timed_out(adapter: object) -> bool:
@@ -213,8 +215,8 @@ class AcquisitionSettings:
             raise ValueError("Stabilisierungszeiten dürfen nicht negativ sein.")
         if not 2.0 <= self.ramp_duration_s <= 120.0:
             raise ValueError("Die Rampendauer muss zwischen 2 und 120 Sekunden liegen.")
-        if not 1 <= self.ramp_image_rate_fps <= 10:
-            raise ValueError("Die Rampen-Bildrate muss zwischen 1 und 10 Bildern/s liegen.")
+        if not 1 <= self.ramp_image_rate_fps <= 240:
+            raise ValueError("Die Rampen-Bildrate muss zwischen 1 und 240 Bildern/s liegen.")
         if not all(
             0.8 <= period <= 120.0
             for period in (self.ramp_light_1_period_s, self.ramp_light_2_period_s)
@@ -449,7 +451,10 @@ class DatasetWriter(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="dataset-writer")
+        self._executor = ThreadPoolExecutor(
+            max_workers=DATASET_WRITER_WORKERS,
+            thread_name_prefix="dataset-writer",
+        )
         self._session_directory: Path | None = None
         self._session_token = 0
         self._pending = 0
@@ -523,7 +528,7 @@ class DatasetWriter(QObject):
         with self._pending_lock:
             return self._pending
 
-    def can_accept(self, maximum_pending: int = 8) -> bool:
+    def can_accept(self, maximum_pending: int = DATASET_WRITER_MAX_PENDING) -> bool:
         return self.pending_count < maximum_pending
 
     def submit(
@@ -592,7 +597,9 @@ class DatasetWriter(QObject):
         fast_lossless: bool = False,
     ) -> None:
         encoded_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if image.ndim == 3 else image
-        compression = 1 if fast_lossless else 3
+        # Level 0 is still a valid, lossless PNG. Avoiding DEFLATE is roughly three
+        # times faster for high-rate Mono8 sequences and shifts the bottleneck to SSD I/O.
+        compression = 0 if fast_lossless else 3
         success, encoded = cv2.imencode(
             ".png", encoded_image, [cv2.IMWRITE_PNG_COMPRESSION, compression]
         )
@@ -694,7 +701,8 @@ class AcquisitionController(QObject):
         self._ramp_timer.setInterval(50)
         self._ramp_timer.timeout.connect(self._ramp_tick)
 
-        camera.frame_ready.connect(self._on_frame)
+        capture_signal = getattr(camera, "capture_frame_ready", camera.frame_ready)
+        capture_signal.connect(self._on_frame)
         camera.status_changed.connect(self._on_camera_status)
         robot.status_changed.connect(self._on_robot_status)
         if conveyor is not None:
@@ -760,6 +768,7 @@ class AcquisitionController(QObject):
         self._set_resume_available(False)
         self._write_manifest("running", "Neue Sitzung gestartet.")
         self._watchdog.start()
+        self._set_camera_capture_stream(True, settings.ramp_image_rate_fps)
         self.running_changed.emit(True)
         self.progress_changed.emit(0, len(points))
         self.status_changed.emit(f"Sitzung gestartet: {session}")
@@ -824,6 +833,7 @@ class AcquisitionController(QObject):
         self._set_resume_available(False)
         self._write_manifest("running", "Unterbrochene Sitzung wird fortgesetzt.")
         self._watchdog.start()
+        self._set_camera_capture_stream(True, self._settings.ramp_image_rate_fps)
         self.running_changed.emit(True)
         self.progress_changed.emit(self._index, len(self._points))
         self.status_changed.emit(
@@ -896,7 +906,15 @@ class AcquisitionController(QObject):
 
     def close(self) -> None:
         self.stop()
+        self._set_camera_capture_stream(False)
         self.writer.close()
+
+    def _set_camera_capture_stream(
+        self, enabled: bool, target_fps: float | None = None
+    ) -> None:
+        setter = getattr(self.camera, "set_capture_stream_enabled", None)
+        if callable(setter):
+            setter(enabled, target_fps)
 
     @property
     def alignment_required(self) -> bool:
@@ -1160,22 +1178,16 @@ class AcquisitionController(QObject):
             settings.conveyor_enabled
             and settings.conveyor_motion_mode == "synchronized"
         ):
-            configured_fps = float(
-                getattr(getattr(self.camera, "config", None), "preview_max_fps", 0)
-            )
-            observed_fps = float(self._camera_status.preview_fps or 0.0)
+            observed_fps = float(self._camera_status.stream_fps or 0.0)
             target_fps = float(settings.ramp_image_rate_fps)
-            fps_ready = configured_fps >= target_fps and (
-                observed_fps <= 0 or observed_fps + 0.25 >= target_fps
-            )
+            fps_ready = observed_fps <= 0 or observed_fps + 0.25 >= target_fps
             checks.append(
                 PreflightCheck(
                     "camera_fps",
                     "Kamera-Bildrate",
                     fps_ready,
                     (
-                        f"Soll {target_fps:g}, Vorschau {observed_fps:.1f}, "
-                        f"Limit {configured_fps:g} FPS"
+                        f"Soll {target_fps:g}, Rohabruf {observed_fps:.1f} FPS"
                     ),
                 )
             )
@@ -2057,7 +2069,7 @@ class AcquisitionController(QObject):
                     f"Kamerabild für Band-Sample {point.conveyor_station_id} kam "
                     f"{timing_error * 1000:.0f} ms zu spät "
                     f"(maximal {SYNCHRONIZED_FRAME_LATE_TOLERANCE_SECONDS * 1000:.0f} ms; "
-                    f"Vorschau {self._camera_status.preview_fps:.1f} FPS)."
+                    f"Rohabruf {self._camera_status.stream_fps:.1f} FPS)."
                 )
                 return
             conveyor_status = (
@@ -2076,7 +2088,7 @@ class AcquisitionController(QObject):
             if not self.writer.can_accept():
                 self._fail(
                     "Der PNG-Writer kann mit der synchronisierten Bildrate nicht Schritt "
-                    "halten (8 ausstehende Bilder)."
+                    f"halten ({DATASET_WRITER_MAX_PENDING} ausstehende Bilder)."
                 )
                 return
             capture_index = self._index
@@ -2123,7 +2135,7 @@ class AcquisitionController(QObject):
             if not self.writer.can_accept():
                 self._fail(
                     "Der PNG-Writer kann mit der Rampen-Bildrate nicht Schritt halten "
-                    "(8 ausstehende Bilder)."
+                    f"({DATASET_WRITER_MAX_PENDING} ausstehende Bilder)."
                 )
                 return
             capture_index = self._index
@@ -2183,6 +2195,7 @@ class AcquisitionController(QObject):
                 "exposure_time_us": camera.exposure_time_us,
                 "gain": camera.gain,
                 "configured_frame_rate_fps": camera.camera_fps,
+                "measured_stream_fps": camera.stream_fps,
                 "measured_preview_fps": camera.preview_fps,
             },
             "robot": {
@@ -2421,6 +2434,7 @@ class AcquisitionController(QObject):
         restore_exposure = self._settings is not None and self._settings.exposure_enabled
         self._last_finish_message = message
         self._running = False
+        self._set_camera_capture_stream(False)
         self._phase = "idle"
         self._phase_timer.stop()
         self._ramp_timer.stop()

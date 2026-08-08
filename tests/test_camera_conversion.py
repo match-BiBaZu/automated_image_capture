@@ -5,8 +5,11 @@ import pytest
 
 from automated_image_capture.hardware.camera import (
     MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+    advance_frame_deadline,
     camera_error_message,
     camera_fetch_timeout_seconds,
+    capture_to_rgb,
+    convert_for_capture,
     convert_to_rgb,
     is_camera_fetch_timeout,
     should_retry_camera_fetch,
@@ -21,6 +24,18 @@ def test_mono8_to_rgb() -> None:
     assert result.dtype == np.uint8
     np.testing.assert_array_equal(result[..., 0], source)
     np.testing.assert_array_equal(result[..., 1], source)
+
+
+def test_mono_capture_stays_single_channel_and_owns_its_buffer() -> None:
+    source = np.array([[0, 64], [128, 255]], dtype=np.uint8)
+    capture = convert_for_capture(source.ravel(), 2, 2, "Mono8")
+    source.fill(7)
+
+    assert capture.shape == (2, 2)
+    assert capture.flags.c_contiguous
+    np.testing.assert_array_equal(capture, np.array([[0, 64], [128, 255]], dtype=np.uint8))
+    preview = capture_to_rgb(capture)
+    assert preview.shape == (2, 2, 3)
 
 
 def test_mono12_scales_for_preview() -> None:
@@ -84,3 +99,16 @@ def test_fetch_timeout_accounts_for_exposure_time() -> None:
     assert camera_fetch_timeout_seconds(None) == 0.5
     assert camera_fetch_timeout_seconds(4_000) == 0.504
     assert camera_fetch_timeout_seconds(1_000_000) == 1.5
+
+
+def test_frame_deadline_preserves_fractional_rate_against_camera_frames() -> None:
+    interval = 1.0 / 15.0
+    deadline = 0.0
+    emitted = []
+    for index in range(26):  # 25 FPS source for one second
+        now = index / 25.0
+        if now >= deadline:
+            emitted.append(now)
+            deadline = advance_frame_deadline(deadline, interval, now)
+
+    assert 15 <= len(emitted) <= 16

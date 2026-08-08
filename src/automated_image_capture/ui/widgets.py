@@ -816,7 +816,7 @@ class AcquisitionDialog(QDialog):
             "Bei synchronisierter Bandfahrt wird die Dauer automatisch aus Weg und "
             "Bandgeschwindigkeit berechnet."
         )
-        self.ramp_rate = self._spin(1, 10, config.ramp_image_rate_fps, " Bilder/s")
+        self.ramp_rate = self._spin(1, 240, config.ramp_image_rate_fps, " Bilder/s")
         self.ramp_light_1_period = self._double_spin(0.8, 120.0, config.ramp_light_1_period_s, " s")
         self.ramp_light_2_period = self._double_spin(0.8, 120.0, config.ramp_light_2_period_s, " s")
         ramp_form.addRow("Dauer pro Pose/Belichtung", self.ramp_duration)
@@ -1105,6 +1105,10 @@ class SettingsDialog(QDialog):
         self.preview_fps = QSpinBox()
         self.preview_fps.setRange(1, 60)
         self.preview_fps.setValue(config.preview_max_fps)
+        self.maximize_camera_fps = QCheckBox(
+            "Kameraseitiges Bildratenlimit abschalten (maximale Rohbildrate)"
+        )
+        self.maximize_camera_fps.setChecked(config.maximize_camera_frame_rate)
         self.auto_reconnect = QCheckBox("Verlorene Verbindungen erneut aufbauen")
         self.auto_reconnect.setChecked(config.auto_reconnect)
 
@@ -1117,6 +1121,7 @@ class SettingsDialog(QDialog):
         form.addRow("Licht 1 BLE-Adresse", self.light_1_address)
         form.addRow("Licht 2 BLE-Adresse", self.light_2_address)
         form.addRow("Maximale Vorschau-FPS", self.preview_fps)
+        form.addRow("Kamera-Rohdatenstrom", self.maximize_camera_fps)
         form.addRow("Wiederverbindung", self.auto_reconnect)
         layout.addLayout(form)
 
@@ -1160,6 +1165,7 @@ class SettingsDialog(QDialog):
                 light_2_address=self.light_2_address.text().strip(),
                 light_2_name=self._source_config.light_2_name,
                 preview_max_fps=self.preview_fps.value(),
+                maximize_camera_frame_rate=self.maximize_camera_fps.isChecked(),
                 auto_reconnect=self.auto_reconnect.isChecked(),
             ).validated()
             if not Path(config.camera_cti_path).is_file():
