@@ -136,7 +136,9 @@ class LabelingDialog(QDialog):
         explanation = QLabel(
             "Jede Pose in der Liste wird eine eigene YOLO-Klasse. Das Tool paart ihre "
             "Aufnahmen mit dem Leerbild derselben UR-Ansicht und Beleuchtung. Aus allen "
-            "Beleuchtungen entsteht je Klasse und UR-Ansicht eine gemeinsame OBB."
+            "Beleuchtungen entsteht je Klasse und UR-Ansicht eine gemeinsame OBB. Bei "
+            "Förderbandaufnahmen wird automatisch die gemessene ADS-Position aus den "
+            "YAML-Dateien verwendet, um die OBB-Bahn zu stabilisieren und Ausreißer zu markieren."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -365,7 +367,9 @@ class LabelingDialog(QDialog):
         self.status.setText(
             f"Fertig: {result.positive_images} positive und {result.negative_images} negative "
             f"Bilder, {result.classes} Klassen und {result.poses} UR-Ansichten, "
-            f"{result.flagged_images} Bilder zur Nachprüfung.\n"
+            f"{result.flagged_images} Bilder zur Nachprüfung. "
+            f"Positionsbahn: {result.position_tracked_images} Bilder, "
+            f"davon {result.position_corrected_images} stabilisiert.\n"
             f"Bericht: {result.report_path}"
         )
         self.open_button.setEnabled(True)

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 
 CAPTURE_NAME = re.compile(
     r"^img_(?P<index>\d+)_(?:ur(?P<pose>\d+)|ura-(?P<angle>\d+))_"
@@ -65,6 +66,9 @@ class CaptureRecord:
     path: Path
     key: CaptureKey
     sequence_index: int
+    measured_conveyor_position_mm: float | None = None
+    nominal_conveyor_position_mm: float | None = None
+    position_sampled_at: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -178,10 +182,39 @@ class LabelingResult:
     flagged_images: int
     review_directory: Path
     report_path: Path
+    position_tracked_images: int = 0
+    position_corrected_images: int = 0
 
 
 ProgressCallback = Callable[[int, int, str], None]
 CancelCallback = Callable[[], bool]
+
+
+def _optional_finite_float(value: object) -> float | None:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _capture_metadata(path: Path) -> tuple[float | None, float | None, str | None]:
+    sidecar = path.with_suffix(".yaml")
+    if not sidecar.is_file():
+        return None, None, None
+    try:
+        payload = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise LabelingError(f"Metadaten konnten nicht gelesen werden: {sidecar}: {exc}") from exc
+    if not isinstance(payload, dict):
+        return None, None, None
+    conveyor = payload.get("conveyor")
+    if not isinstance(conveyor, dict):
+        return None, None, None
+    measured = _optional_finite_float(conveyor.get("measured_logical_offset_mm"))
+    nominal = _optional_finite_float(conveyor.get("nominal_offset_mm"))
+    sampled_at = conveyor.get("position_sampled_at")
+    return measured, nominal, str(sampled_at) if sampled_at is not None else None
 
 
 def scan_capture(directory: Path) -> dict[CaptureKey, CaptureRecord]:
@@ -207,7 +240,15 @@ def scan_capture(directory: Path) -> dict[CaptureKey, CaptureRecord]:
             raise LabelingError(
                 f"Doppelte Parameterkombination für Pose {key.pose_id}: {path.name}"
             )
-        records[key] = CaptureRecord(path, key, int(match.group("index")))
+        measured, nominal, sampled_at = _capture_metadata(path)
+        records[key] = CaptureRecord(
+            path,
+            key,
+            int(match.group("index")),
+            measured,
+            nominal,
+            sampled_at,
+        )
     if not records:
         raise LabelingError(f"Keine passenden Aufnahmebilder in {directory} gefunden.")
     return records
@@ -371,6 +412,175 @@ def _box_from_mask(mask: np.ndarray, margin: int) -> np.ndarray:
     return box
 
 
+def _box_features(box: np.ndarray) -> tuple[float, float, float, float, float]:
+    center, size, angle_degrees = cv2.minAreaRect(box.astype(np.float32))
+    major, minor = float(size[0]), float(size[1])
+    angle = math.radians(float(angle_degrees))
+    if major < minor:
+        major, minor = minor, major
+        angle += math.pi / 2.0
+    angle = (angle + math.pi / 2.0) % math.pi - math.pi / 2.0
+    return float(center[0]), float(center[1]), major, minor, angle
+
+
+def _box_from_features(
+    center_x: float,
+    center_y: float,
+    major: float,
+    minor: float,
+    angle: float,
+    image_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    direction = np.asarray((math.cos(angle), math.sin(angle)), dtype=np.float32)
+    normal = np.asarray((-direction[1], direction[0]), dtype=np.float32)
+    center = np.asarray((center_x, center_y), dtype=np.float32)
+    half_major = direction * (major / 2.0)
+    half_minor = normal * (minor / 2.0)
+    box = np.asarray(
+        (
+            center - half_major - half_minor,
+            center + half_major - half_minor,
+            center + half_major + half_minor,
+            center - half_major + half_minor,
+        ),
+        dtype=np.float32,
+    )
+    if image_shape is not None:
+        height, width = image_shape
+        box[:, 0] = np.clip(box[:, 0], 0, width - 1)
+        box[:, 1] = np.clip(box[:, 1], 0, height - 1)
+    return _ordered_box(cv2.minAreaRect(box))
+
+
+def _convex_box_iou(left: np.ndarray, right: np.ndarray) -> float:
+    left = cv2.convexHull(left.astype(np.float32))
+    right = cv2.convexHull(right.astype(np.float32))
+    intersection, _ = cv2.intersectConvexConvex(left, right)
+    union = float(cv2.contourArea(left) + cv2.contourArea(right) - intersection)
+    return float(intersection / union) if union > 0 else 0.0
+
+
+def _robust_position_model(
+    positions: np.ndarray,
+    values: np.ndarray,
+    minimum_residual: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a deterministic quadratic trend and reject isolated segmentation errors."""
+    normalized = positions - float(np.median(positions))
+    scale = max(float(np.ptp(normalized)), 1.0)
+    normalized /= scale
+    degree = 2 if len(np.unique(positions)) >= 6 else 1
+    inliers = np.ones(len(positions), dtype=bool)
+    coefficients = np.polyfit(normalized, values, degree)
+    for _ in range(5):
+        coefficients = np.polyfit(normalized[inliers], values[inliers], degree)
+        residuals = np.abs(values - np.polyval(coefficients, normalized))
+        median = float(np.median(residuals[inliers]))
+        mad = float(np.median(np.abs(residuals[inliers] - median)))
+        limit = max(minimum_residual, median + max(minimum_residual, 3.5 * 1.4826 * mad))
+        updated = residuals <= limit
+        if int(np.count_nonzero(updated)) < degree + 2 or np.array_equal(updated, inliers):
+            break
+        inliers = updated
+    return np.polyval(coefficients, normalized), inliers
+
+
+@dataclass(slots=True, frozen=True)
+class ConveyorTrackSummary:
+    active: bool
+    tracked_images: int = 0
+    corrected_images: int = 0
+    review_images: int = 0
+    measured_position_min_mm: float | None = None
+    measured_position_max_mm: float | None = None
+    median_center_residual_pixels: float | None = None
+
+
+def stabilize_boxes_by_conveyor_position(
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray]],
+) -> tuple[dict[Path, np.ndarray], ConveyorTrackSummary]:
+    """Stabilize per-image OBBs along the measured conveyor trajectory.
+
+    The foreground/background segmentation remains the visual measurement.  Only when
+    enough *measured* ADS positions span a useful distance do we fit a robust trajectory.
+    This keeps old captures and stationary grids byte-for-byte compatible.
+    """
+    result = {pair.foreground.path: raw_box for _, pair, raw_box in entries}
+    usable = [
+        (row, pair, raw_box)
+        for row, pair, raw_box in entries
+        if pair.foreground.measured_conveyor_position_mm is not None
+        and pair.foreground.key.conveyor_direction in {"out", "back"}
+    ]
+    if len(usable) < 8:
+        return result, ConveyorTrackSummary(False)
+    positions = np.asarray(
+        [pair.foreground.measured_conveyor_position_mm for _, pair, _ in usable],
+        dtype=np.float64,
+    )
+    if float(np.ptp(positions)) < 5.0:
+        return result, ConveyorTrackSummary(False)
+
+    features = np.asarray([_box_features(raw_box) for _, _, raw_box in usable])
+    predicted_x, inliers_x = _robust_position_model(positions, features[:, 0], 10.0)
+    predicted_y, inliers_y = _robust_position_model(positions, features[:, 1], 10.0)
+    center_residuals = np.hypot(features[:, 0] - predicted_x, features[:, 1] - predicted_y)
+    center_median = float(np.median(center_residuals))
+    center_mad = float(np.median(np.abs(center_residuals - center_median)))
+    center_limit = max(18.0, center_median + max(12.0, 3.5 * 1.4826 * center_mad))
+    center_inliers = inliers_x & inliers_y & (center_residuals <= center_limit)
+    if int(np.count_nonzero(center_inliers)) < 6:
+        return result, ConveyorTrackSummary(False)
+
+    major = float(np.median(features[center_inliers, 2]))
+    minor = float(np.median(features[center_inliers, 3]))
+    cos_double = float(np.median(np.cos(2.0 * features[center_inliers, 4])))
+    sin_double = float(np.median(np.sin(2.0 * features[center_inliers, 4])))
+    angle = math.atan2(sin_double, cos_double) / 2.0
+
+    corrected = 0
+    reviewed = 0
+    for index, (row, pair, raw_box) in enumerate(usable):
+        predicted = _box_from_features(
+            float(predicted_x[index]),
+            float(predicted_y[index]),
+            major,
+            minor,
+            angle,
+        )
+        box_iou = _convex_box_iou(raw_box, predicted)
+        is_outlier = bool(center_residuals[index] > center_limit or box_iou < 0.35)
+        was_corrected = bool(center_residuals[index] > 2.0 or box_iou < 0.92)
+        result[pair.foreground.path] = predicted
+        row["conveyor_track_used"] = True
+        row["track_center_residual_pixels"] = round(float(center_residuals[index]), 3)
+        row["track_raw_box_iou"] = round(box_iou, 6)
+        row["track_correction_applied"] = was_corrected
+        row["obb_center_x_pixels"] = round(float(predicted_x[index]), 3)
+        row["obb_center_y_pixels"] = round(float(predicted_y[index]), 3)
+        if was_corrected:
+            corrected += 1
+        if is_outlier:
+            row["quality"] = "REVIEW"
+            previous = str(row.get("quality_reason", "")).strip()
+            reason = "OBB-Kandidat weicht von der gemessenen Förderbandbahn ab"
+            row["quality_reason"] = f"{previous}; {reason}".strip("; ")
+            reviewed += 1
+
+    return (
+        result,
+        ConveyorTrackSummary(
+            True,
+            len(usable),
+            corrected,
+            reviewed,
+            float(np.min(positions)),
+            float(np.max(positions)),
+            center_median,
+        ),
+    )
+
+
 def build_pose_consensus(
     pose_id: int,
     pairs: list[MatchedPair],
@@ -428,6 +638,18 @@ def build_pose_consensus(
                 "panel_2": pair.foreground.key.panel_2,
                 "exposure": pair.foreground.key.exposure,
                 "ramp_sample_id": pair.foreground.key.ramp_sample_id,
+                "conveyor_measured_position_mm": pair.foreground.measured_conveyor_position_mm,
+                "conveyor_nominal_metadata_position_mm": (
+                    pair.foreground.nominal_conveyor_position_mm
+                ),
+                "conveyor_position_sampled_at": pair.foreground.position_sampled_at,
+                "conveyor_track_used": False,
+                "track_center_residual_pixels": None,
+                "track_raw_box_iou": None,
+                "track_correction_applied": False,
+                "obb_center_x_pixels": None,
+                "obb_center_y_pixels": None,
+                "quality_reason": "",
                 "foreground_file": pair.foreground.path.name,
                 "background_file": pair.background.path.name,
                 "difference_threshold": round(measurement.threshold, 3),
@@ -482,6 +704,7 @@ def _make_review_sheet(
     pose: PoseConsensus,
     pairs: list[MatchedPair],
     destination: Path,
+    boxes: dict[Path, np.ndarray] | None = None,
 ) -> None:
     selection = np.linspace(0, len(pairs) - 1, min(6, len(pairs)), dtype=int)
     tiles: list[np.ndarray] = []
@@ -490,12 +713,20 @@ def _make_review_sheet(
         image = cv2.imread(str(pair.foreground.path), cv2.IMREAD_COLOR)
         if image is None:
             continue
-        cv2.polylines(image, [np.rint(pose.box).astype(np.int32)], True, (0, 255, 0), 5)
+        box = pose.box if boxes is None else boxes.get(pair.foreground.path, pose.box)
+        cv2.polylines(image, [np.rint(box).astype(np.int32)], True, (0, 255, 0), 5)
         sample = pair.foreground.key.ramp_sample_id
+        measured_position = pair.foreground.measured_conveyor_position_mm
         cv2.putText(
             image,
             f"Pose {pose.pose_id}  P1={pair.foreground.key.panel_1} "
-            f"P2={pair.foreground.key.panel_2}" + ("" if sample is None else f"  Ramp={sample}"),
+            f"P2={pair.foreground.key.panel_2}"
+            + ("" if sample is None else f"  Ramp={sample}")
+            + (
+                ""
+                if measured_position is None
+                else f"  Band={measured_position:.1f} mm (gemessen)"
+            ),
             (25, 55),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.3,
@@ -519,6 +750,7 @@ def _make_pose_overview(
     consensuses: dict[int | tuple[int, int], PoseConsensus],
     grouped: dict[int | tuple[int, int], list[MatchedPair]],
     destination: Path,
+    boxes: dict[Path, np.ndarray] | None = None,
 ) -> None:
     tiles: list[np.ndarray] = []
     for view_id, consensus in consensuses.items():
@@ -527,7 +759,8 @@ def _make_pose_overview(
         image = cv2.imread(str(pair.foreground.path), cv2.IMREAD_COLOR)
         if image is None:
             continue
-        cv2.polylines(image, [np.rint(consensus.box).astype(np.int32)], True, (0, 255, 0), 6)
+        box = consensus.box if boxes is None else boxes.get(pair.foreground.path, consensus.box)
+        cv2.polylines(image, [np.rint(box).astype(np.int32)], True, (0, 255, 0), 6)
         cv2.putText(
             image,
             (
@@ -606,6 +839,8 @@ def generate_obb_dataset(
         total_steps += len(background)
     completed = 0
     all_consensuses: dict[tuple[int, int, int], PoseConsensus] = {}
+    output_boxes: dict[tuple[int, Path], np.ndarray] = {}
+    track_summaries: dict[tuple[int, int], ConveyorTrackSummary] = {}
     report_rows: list[dict[str, object]] = []
     write_records: list[tuple[dict[str, object], MatchedPair, int, LabelSource]] = []
     for class_id, source, _, grouped in source_data:
@@ -634,6 +869,33 @@ def generate_obb_dataset(
                 report_rows.append(row)
                 write_records.append((row, pair, class_id, source))
 
+    for class_id, source, pairs, _ in source_data:
+        del source
+        by_pose: dict[int, list[tuple[dict[str, object], MatchedPair, np.ndarray]]] = defaultdict(
+            list
+        )
+        rows_by_path = {
+            pair.foreground.path: row
+            for row, pair, record_class_id, _ in write_records
+            if record_class_id == class_id
+        }
+        for pair in pairs:
+            raw_box = all_consensuses[
+                (
+                    class_id,
+                    pair.foreground.key.pose_id,
+                    pair.foreground.key.conveyor_station_id,
+                )
+            ].box
+            by_pose[pair.foreground.key.pose_id].append(
+                (rows_by_path[pair.foreground.path], pair, raw_box)
+            )
+        for pose_id, entries in by_pose.items():
+            stabilized, summary = stabilize_boxes_by_conveyor_position(entries)
+            track_summaries[(class_id, pose_id)] = summary
+            for image_path, box in stabilized.items():
+                output_boxes[(class_id, image_path)] = box
+
     output = config.output_directory
     output.mkdir(parents=True, exist_ok=True)
     review = output / "review"
@@ -659,7 +921,7 @@ def generate_obb_dataset(
         _link_or_copy(pair.foreground.path, positive_image, config.prefer_hardlinks)
         positive_label.write_text(
             _normalized_obb(
-                all_consensuses[(class_id, pose_id, station_id)].box,
+                output_boxes[(class_id, pair.foreground.path)],
                 width,
                 height,
                 class_id,
@@ -709,11 +971,21 @@ def generate_obb_dataset(
                 consensus,
                 grouped[view_id],
                 review / f"{prefix}_ur_{pose_id}_belt_{station_id}_obb.jpg",
+                {
+                    path: box
+                    for (box_class_id, path), box in output_boxes.items()
+                    if box_class_id == class_id
+                },
             )
         _make_pose_overview(
             class_consensuses,
             grouped,
             review / f"{prefix}_all_poses_obb.jpg",
+            {
+                path: box
+                for (box_class_id, path), box in output_boxes.items()
+                if box_class_id == class_id
+            },
         )
 
     _write_csv(output / "label_report.csv", report_rows)
@@ -723,7 +995,19 @@ def generate_obb_dataset(
         "negative_images": negative_count,
         "validation_poses": sorted(validation_poses),
         "train_poses": sorted(set(pose_ids) - validation_poses),
-        "flagged_images": sum(item.flagged_count for item in all_consensuses.values()),
+        "flagged_images": sum(row["quality"] == "REVIEW" for row in report_rows),
+        "conveyor_position_tracking": {
+            f"class-{class_id}/pose-{pose_id}": {
+                "active": item.active,
+                "tracked_images": item.tracked_images,
+                "corrected_images": item.corrected_images,
+                "review_images": item.review_images,
+                "measured_position_min_mm": item.measured_position_min_mm,
+                "measured_position_max_mm": item.measured_position_max_mm,
+                "median_center_residual_pixels": item.median_center_residual_pixels,
+            }
+            for (class_id, pose_id), item in sorted(track_summaries.items())
+        },
         "classes": {
             str(class_id): {
                 "name": source.name,
@@ -766,7 +1050,9 @@ def generate_obb_dataset(
         "path: .\ntrain: images/train\nval: images/val\nnames:\n" + names_yaml,
         encoding="utf-8",
     )
-    flagged = sum(item.flagged_count for item in all_consensuses.values())
+    flagged = sum(row["quality"] == "REVIEW" for row in report_rows)
+    position_tracked = sum(item.tracked_images for item in track_summaries.values())
+    position_corrected = sum(item.corrected_images for item in track_summaries.values())
     return LabelingResult(
         output,
         positive_count,
@@ -776,4 +1062,6 @@ def generate_obb_dataset(
         flagged,
         review,
         output / "label_report.csv",
+        position_tracked,
+        position_corrected,
     )

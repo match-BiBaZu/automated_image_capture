@@ -758,7 +758,10 @@ class MainWindow(QMainWindow):
     def _refresh_acquisition_preflight(self, *_: object) -> None:
         if self.acquisition.running:
             return
-        checks = self.acquisition.preflight_checks(self.acquisition_config)
+        checks = self.acquisition.preflight_checks(
+            self.acquisition_config,
+            resuming=self.acquisition.resume_available,
+        )
         self.acquisition_card.set_preflight(checks)
 
     def _show_error(self, device: str, message: str) -> None:

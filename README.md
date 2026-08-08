@@ -153,6 +153,13 @@ Fortsetzen die nächste benötigte freigegebene Pose erneut über den normalen H
 
 ## Automatische OBB-Labels
 
+Bei synchronen Förderbandaufnahmen liest das Labeling zusätzlich
+`conveyor.measured_logical_offset_mm` aus jeder Bild-YAML. Die OBB-Mittelpunkte werden pro
+UR-Orientierung robust über der gemessenen Bandposition modelliert; fehlerhafte
+Einzelsegmentierungen werden durch die Bahn stabilisiert und im `label_report.csv` weiterhin
+als `REVIEW` nachvollziehbar markiert. Fehlen Positionsmetadaten, bleibt das bisherige
+Konsensverfahren unverändert aktiv.
+
 Über **OBB-Labels …** lässt sich aus beliebig vielen Bauteilserien und einer parametrisch
 identischen Leerbildserie ein gemeinsamer YOLO-OBB-Datensatz erzeugen. Die Quellenliste startet
 mit `Pose 1`, `Pose 2` und `Leere Rutsche`; weitere Posen lassen sich hinzufügen oder wieder

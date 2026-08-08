@@ -30,6 +30,7 @@ from automated_image_capture.models import (
 
 RAMP_BLE_COMMAND_TIMEOUT_SECONDS = LIGHT_COMMAND_TIMEOUT_SECONDS
 SYNCHRONIZED_FRAME_LATE_TOLERANCE_SECONDS = 1.5
+SYNCHRONIZED_TARGET_TOLERANCE_FULL_STEPS = 3
 
 
 def ramp_command_timed_out(adapter: object) -> bool:
@@ -803,7 +804,7 @@ class AcquisitionController(QObject):
                 "interrupted",
                 "Vorhandene Dateipaare vor dem Fortsetzen abgeglichen.",
             )
-            self._validate_hardware(self._settings)
+            self._validate_hardware(self._settings, resuming=True)
             self._points = self._with_conveyor_quantization(self._points, self._settings)
             if not self._validate_resume_conveyor_position():
                 return False
@@ -1088,13 +1089,21 @@ class AcquisitionController(QObject):
         except Exception:
             return False
 
-    def _validate_hardware(self, settings: AcquisitionSettings) -> None:
-        failed = [check for check in self.preflight_checks(settings) if not check.ready]
+    def _validate_hardware(
+        self, settings: AcquisitionSettings, *, resuming: bool = False
+    ) -> None:
+        failed = [
+            check
+            for check in self.preflight_checks(settings, resuming=resuming)
+            if not check.ready
+        ]
         if failed:
             details = "\n".join(f"• {check.label}: {check.detail}" for check in failed)
             raise RuntimeError(f"Startfreigabe fehlt:\n{details}")
 
-    def preflight_checks(self, settings: AcquisitionSettings) -> tuple[PreflightCheck, ...]:
+    def preflight_checks(
+        self, settings: AcquisitionSettings, *, resuming: bool = False
+    ) -> tuple[PreflightCheck, ...]:
         checks: list[PreflightCheck] = []
         try:
             settings = settings.validated()
@@ -1362,6 +1371,39 @@ class AcquisitionController(QObject):
                     ),
                 )
             )
+            if settings.conveyor_motion_mode == "synchronized":
+                actual_offset = conveyor.logical_offset_mm
+                tolerance_mm = max(
+                    1.0,
+                    SYNCHRONIZED_TARGET_TOLERANCE_FULL_STEPS
+                    * max(0.0, conveyor.mm_per_full_step),
+                )
+                start_at_zero = (
+                    actual_offset is not None and abs(actual_offset) <= tolerance_mm
+                )
+                start_ready = resuming or start_at_zero
+                if resuming:
+                    start_detail = (
+                        "Fortsetzung: Die Position wird gegen das nächste "
+                        "Checkpoint-Sample geprüft"
+                    )
+                elif actual_offset is None:
+                    start_detail = "Logischer Ist-Offset ist nicht lesbar"
+                elif start_at_zero:
+                    start_detail = f"Ist {actual_offset:.3f} mm"
+                else:
+                    start_detail = (
+                        f"Ist {actual_offset:.3f} mm statt 0 mm. Band zurückfahren oder "
+                        "die gewünschte Startposition neu als 0 mm übernehmen"
+                    )
+                checks.append(
+                    PreflightCheck(
+                        "conveyor_sweep_start",
+                        "Förderband-Startposition",
+                        start_ready,
+                        start_detail,
+                    )
+                )
 
         return tuple(checks)
 
@@ -1600,10 +1642,28 @@ class AcquisitionController(QObject):
                     if direction == "out" and self._settings is not None
                     else 0.0
                 )
-                if self.conveyor is None or not self.conveyor.position_matches(target):
+                if self.conveyor is None or not self.conveyor.position_matches(
+                    target,
+                    tolerance_full_steps=SYNCHRONIZED_TARGET_TOLERANCE_FULL_STEPS,
+                ):
+                    actual = status.logical_offset_mm
+                    calibration = status.mm_per_full_step
+                    tolerance_mm = SYNCHRONIZED_TARGET_TOLERANCE_FULL_STEPS * calibration
+                    difference = (
+                        None if actual is None else abs(float(actual) - float(target))
+                    )
                     self._fail(
-                        "Synchronisierte Förderbandfahrt quittiert, "
-                        "Zielposition stimmt jedoch nicht überein."
+                        f"Synchronisierte Förderbandfahrt #{sequence} quittiert, aber "
+                        f"Ziel {target:.3f} mm und Ist "
+                        f"{'unbekannt' if actual is None else f'{actual:.3f} mm'} stimmen "
+                        f"nicht überein"
+                        + (
+                            ""
+                            if difference is None
+                            else f" (Abweichung {difference:.3f} mm, "
+                            f"Toleranz {tolerance_mm:.3f} mm)"
+                        )
+                        + "."
                     )
                     return
                 self._pending_conveyor_sequence = None
@@ -1720,6 +1780,21 @@ class AcquisitionController(QObject):
 
     def _start_sweep_sync(self, point: CapturePoint) -> None:
         assert self._settings is not None
+        if (
+            point.conveyor_station_id == 0
+            and self.conveyor is not None
+            and not self.conveyor.position_matches(
+                0.0,
+                tolerance_full_steps=SYNCHRONIZED_TARGET_TOLERANCE_FULL_STEPS,
+            )
+        ):
+            actual = self.conveyor.status.logical_offset_mm
+            self._fail(
+                "Synchronisierter Bandlauf kann nicht beginnen: Erwartet 0 mm, Ist "
+                f"{'unbekannt' if actual is None else f'{actual:.3f} mm'}. "
+                "Band zurückfahren oder Startposition neu als 0 mm übernehmen."
+            )
+            return
         self._sweep_duration_s, self._sweep_effective_speed_mm_s, _ = (
             synchronized_sweep_profile(self._settings)
         )

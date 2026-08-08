@@ -21,6 +21,8 @@ IDLE_POLL_SECONDS = 0.5
 ACTIVE_POLL_SECONDS = 0.1
 INCREMENTS_PER_FULL_STEP = 64
 UINT32_MODULUS = 1 << 32
+ENDPOINT_FEEDBACK_TOLERANCE_FULL_STEPS = 3
+ENDPOINT_FEEDBACK_TIMEOUT_SECONDS = 2.0
 
 STATUS_SYMBOLS = {
     "MAIN.CalibrationBusy": "busy",
@@ -69,6 +71,30 @@ def effective_direction_sign(plc_direction: str, conveyor_reverse: bool) -> int:
     return -1 if negative else 1
 
 
+def expected_move_internal_position(
+    move: ConveyorMove,
+    conveyor_reverse: bool,
+) -> int | None:
+    if move.start_internal_position is None:
+        return None
+    sign = effective_direction_sign(move.plc_direction, conveyor_reverse)
+    increments = sign * abs(move.delta_full_steps) * INCREMENTS_PER_FULL_STEP
+    return (int(move.start_internal_position) + increments) % UINT32_MODULUS
+
+
+def move_position_matches(
+    move: ConveyorMove,
+    internal_position: int | None,
+    conveyor_reverse: bool,
+    tolerance_full_steps: int = ENDPOINT_FEEDBACK_TOLERANCE_FULL_STEPS,
+) -> bool:
+    expected = expected_move_internal_position(move, conveyor_reverse)
+    if expected is None or internal_position is None:
+        return False
+    difference = abs(signed_u32_delta(internal_position, expected))
+    return difference <= max(0, tolerance_full_steps) * INCREMENTS_PER_FULL_STEP
+
+
 def diagnose_plc_network(host: str, port: int = 48898, timeout: float = 0.4) -> str:
     """Give a useful hint without modifying routes or network settings."""
     try:
@@ -101,6 +127,7 @@ class ConveyorWorker(QObject):
         self._enable_deadline = 0.0
         self._movement_started_at: float | None = None
         self._movement_started_sequence: int | None = None
+        self._completion_feedback_wait_started: float | None = None
 
     def enqueue_move(self, move: ConveyorMove) -> None:
         self._commands.put(("move", move))
@@ -140,6 +167,7 @@ class ConveyorWorker(QObject):
             self._move_command_sent = False
             self._movement_started_at = None
             self._movement_started_sequence = None
+            self._completion_feedback_wait_started = None
             self.event_message.emit("Förderband-Stop an die SPS gesendet.")
             return
         if command == "release":
@@ -149,6 +177,7 @@ class ConveyorWorker(QObject):
             self._move_command_sent = False
             self._movement_started_at = None
             self._movement_started_sequence = None
+            self._completion_feedback_wait_started = None
             self.event_message.emit("Förderbandsteuerung freigegeben und gestoppt.")
             return
         if command != "move" or not isinstance(payload, ConveyorMove):
@@ -168,6 +197,7 @@ class ConveyorWorker(QObject):
         self._move_command_sent = False
         self._movement_started_at = None
         self._movement_started_sequence = None
+        self._completion_feedback_wait_started = None
         self._enable_deadline = time.monotonic() + DRIVE_ENABLE_TIMEOUT_SECONDS
         self.event_message.emit(
             f"Aktiviere Positioniermodus für Förderbandfahrt #{payload.sequence} …"
@@ -211,6 +241,7 @@ class ConveyorWorker(QObject):
         self._saw_busy = False
         self._movement_started_at = None
         self._movement_started_sequence = None
+        self._completion_feedback_wait_started = None
         if move is not None:
             self.move_failed.emit(move.sequence, message)
 
@@ -345,19 +376,65 @@ class ConveyorWorker(QObject):
                             and not status.busy
                             and time.monotonic() >= self._move_not_before
                         ):
-                            self._completed_sequence = self._requested_move.sequence
-                            self._completed_internal_position = status.internal_position
-                            self._completed_at = time.time()
-                            status.completed_sequence = self._completed_sequence
-                            status.completed_internal_position = self._completed_internal_position
-                            status.completed_at = self._completed_at
-                            status.last_move = self._requested_move
-                            self.event_message.emit(
-                                f"Förderbandfahrt #{self._completed_sequence} abgeschlossen."
+                            move = self._requested_move
+                            feedback_matches = move_position_matches(
+                                move,
+                                status.internal_position,
+                                status.conveyor_reverse,
                             )
-                            self._requested_move = None
-                            self._move_command_sent = False
-                            self._saw_busy = False
+                            if feedback_matches or move.start_internal_position is None:
+                                self._completed_sequence = move.sequence
+                                self._completed_internal_position = status.internal_position
+                                self._completed_at = time.time()
+                                status.completed_sequence = self._completed_sequence
+                                status.completed_internal_position = (
+                                    self._completed_internal_position
+                                )
+                                status.completed_at = self._completed_at
+                                status.last_move = move
+                                self.event_message.emit(
+                                    f"Förderbandfahrt #{self._completed_sequence} abgeschlossen."
+                                )
+                                self._requested_move = None
+                                self._move_command_sent = False
+                                self._saw_busy = False
+                                self._completion_feedback_wait_started = None
+                            elif self._completion_feedback_wait_started is None:
+                                self._completion_feedback_wait_started = time.monotonic()
+                                self.event_message.emit(
+                                    f"Förderbandfahrt #{move.sequence} von der SPS quittiert; "
+                                    "warte auf die nachlaufende Positionsrückmeldung …"
+                                )
+                            elif (
+                                time.monotonic() - self._completion_feedback_wait_started
+                                >= ENDPOINT_FEEDBACK_TIMEOUT_SECONDS
+                            ):
+                                expected = expected_move_internal_position(
+                                    move, status.conveyor_reverse
+                                )
+                                actual = status.internal_position
+                                difference = (
+                                    None
+                                    if expected is None or actual is None
+                                    else abs(signed_u32_delta(actual, expected))
+                                    / INCREMENTS_PER_FULL_STEP
+                                )
+                                self._fail_move(
+                                    plc,
+                                    pyads,
+                                    f"Förderbandfahrt #{move.sequence}: SPS meldet fertig, "
+                                    "aber die Positionsrückmeldung hat den Endpunkt auch nach "
+                                    f"{ENDPOINT_FEEDBACK_TIMEOUT_SECONDS:g} s nicht erreicht"
+                                    + (
+                                        "."
+                                        if difference is None
+                                        else f" (Rest {difference:.1f} Vollschritte)."
+                                    ),
+                                )
+                                status.requested_sequence = None
+                                status.requested_offset_mm = None
+                                status.actual_target_offset_mm = None
+                                status.preparing_drive = False
                     self.status_changed.emit(status)
                     self.state_changed.emit(ConnectionState.CONNECTED)
                     last_error = ""

@@ -76,6 +76,13 @@ class DatasetRecord:
     source_label: Path
     target_name: str
     split: Split
+    conveyor_station_id: int | None = None
+    conveyor_direction: str = "fixed"
+    conveyor_nominal_position_mm: float | None = None
+    conveyor_measured_position_mm: float | None = None
+    ramp_sample_id: int | None = None
+    conveyor_track_used: bool = False
+    track_correction_applied: bool = False
     excluded: bool = False
 
     @property
@@ -160,6 +167,19 @@ def _float_or_none(value: str | None) -> float | None:
         return None
 
 
+def _integer_or_none(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _csv_bool(value: str | None) -> bool:
+    return str(value).strip().casefold() in {"1", "true", "yes", "ja"}
+
+
 def _load_class_names(root: Path) -> dict[int, str]:
     try:
         payload = json.loads((root / "label_summary.json").read_text(encoding="utf-8"))
@@ -214,6 +234,18 @@ def _collect_positive_records(root: Path, class_names: dict[int, str]) -> list[D
                     source_label=label_index[label_file],
                     target_name=dataset_image,
                     split=split_for_pose(pose_id),
+                    conveyor_station_id=_integer_or_none(row.get("conveyor_station_id")),
+                    conveyor_direction=row.get("conveyor_direction", "fixed"),
+                    conveyor_nominal_position_mm=_float_or_none(
+                        row.get("conveyor_nominal_metadata_position_mm")
+                        or row.get("conveyor_position_mm")
+                    ),
+                    conveyor_measured_position_mm=_float_or_none(
+                        row.get("conveyor_measured_position_mm")
+                    ),
+                    ramp_sample_id=_integer_or_none(row.get("ramp_sample_id")),
+                    conveyor_track_used=_csv_bool(row.get("conveyor_track_used")),
+                    track_correction_applied=_csv_bool(row.get("track_correction_applied")),
                 )
             )
     return records
@@ -253,6 +285,16 @@ def _collect_empty_records(root: Path) -> list[DatasetRecord]:
                     source_label=label_index[old_label_name],
                     target_name=old_image_name,
                     split=split_for_pose(pose_id),
+                    conveyor_station_id=_integer_or_none(row.get("conveyor_station_id")),
+                    conveyor_direction=row.get("conveyor_direction", "fixed"),
+                    conveyor_nominal_position_mm=_float_or_none(
+                        row.get("conveyor_nominal_metadata_position_mm")
+                        or row.get("conveyor_position_mm")
+                    ),
+                    conveyor_measured_position_mm=_float_or_none(
+                        row.get("conveyor_measured_position_mm")
+                    ),
+                    ramp_sample_id=_integer_or_none(row.get("ramp_sample_id")),
                 )
             )
     return records

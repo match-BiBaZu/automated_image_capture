@@ -679,6 +679,53 @@ def test_synchronized_preflight_requires_position_feedback_test(tmp_path: Path) 
     controller.close()
 
 
+def test_new_synchronized_session_requires_belt_at_zero_but_resume_does_not(
+    tmp_path: Path,
+) -> None:
+    controller, _camera, _robot, _light_1, _light_2 = _ready_controller()
+    controller.conveyor = SimpleNamespace(
+        state=ConnectionState.CONNECTED,
+        status=ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=0.32960026,
+            internal_position=13389,
+            logical_offset_mm=65.0,
+            position_feedback_verified=True,
+        ),
+        config=SimpleNamespace(conveyor_forward_direction="right"),
+        origin_position=768,
+    )
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        pose_start=155,
+        pose_end=155,
+        light_1_start=0,
+        light_1_end=0,
+        light_2_start=0,
+        light_2_end=0,
+    )
+
+    fresh = next(
+        check
+        for check in controller.preflight_checks(settings)
+        if check.key == "conveyor_sweep_start"
+    )
+    resumed = next(
+        check
+        for check in controller.preflight_checks(settings, resuming=True)
+        if check.key == "conveyor_sweep_start"
+    )
+
+    assert not fresh.ready
+    assert "65.000 mm statt 0 mm" in fresh.detail
+    assert resumed.ready
+    assert "Checkpoint" in resumed.detail
+    controller.close()
+
+
 def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None:
     camera = FakeCamera()
     robot = FakeRobot()

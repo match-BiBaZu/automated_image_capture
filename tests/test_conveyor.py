@@ -225,3 +225,20 @@ def test_adapter_marks_position_feedback_verified_only_after_observed_change() -
         )
     )
     assert adapter.status.position_feedback_verified
+
+
+def test_position_match_tolerance_can_cover_small_drive_residual() -> None:
+    adapter = ConveyorAdapter(AppSettings(conveyor_forward_direction="right"))
+    adapter._origin_position = 1000
+    adapter._status = ConveyorStatus(
+        connected=True,
+        calibration_valid=True,
+        mm_per_full_step=0.32960026,
+        internal_position=1000 + 455 * 64 + 2 * 64,
+        forward_direction="right",
+        origin_position=1000,
+    )
+    adapter._decorate_status()
+
+    assert not adapter.position_matches(150.0, tolerance_full_steps=1)
+    assert adapter.position_matches(150.0, tolerance_full_steps=3)

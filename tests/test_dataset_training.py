@@ -53,6 +53,14 @@ def _write_labeled_source(root: Path) -> None:
                         "background_file": raw_name,
                         "consensus_iou": 0.2 if panel_1 == 0 else 0.9,
                         "quality": "REVIEW" if panel_1 == 0 else "PASS",
+                        "conveyor_station_id": 7,
+                        "conveyor_direction": "out",
+                        "conveyor_position_mm": 20.0,
+                        "conveyor_nominal_metadata_position_mm": 20.0,
+                        "conveyor_measured_position_mm": 20.7,
+                        "ramp_sample_id": 7,
+                        "conveyor_track_used": True,
+                        "track_correction_applied": panel_1 == 0,
                         "class_id": class_id,
                         "class_name": class_name,
                         "dataset_image": positive_name,
@@ -112,6 +120,13 @@ def test_collects_two_classes_and_deduplicates_empty_images(
     assert sum(record.split == "train" for record in records) == 54
     assert sum(record.split == "val" for record in records) == 18
     assert sum(record.split == "test" for record in records) == 18
+    positive = next(record for record in records if record.kind == "positive")
+    assert positive.conveyor_station_id == 7
+    assert positive.conveyor_direction == "out"
+    assert positive.conveyor_nominal_position_mm == 20.0
+    assert positive.conveyor_measured_position_mm == 20.7
+    assert positive.ramp_sample_id == 7
+    assert positive.conveyor_track_used
 
 
 def test_build_keeps_classes_and_pose_splits_disjoint(

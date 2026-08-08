@@ -7,12 +7,16 @@ import numpy as np
 import pytest
 
 from automated_image_capture.labeling import (
+    CaptureKey,
+    CaptureRecord,
     LabelingConfig,
     LabelingError,
     LabelSource,
+    MatchedPair,
     generate_obb_dataset,
     match_captures,
     scan_capture,
+    stabilize_boxes_by_conveyor_position,
 )
 
 
@@ -93,6 +97,61 @@ def test_continuous_angle_and_belt_station_are_part_of_capture_key(tmp_path: Pat
     assert [key.conveyor_station_id for key in keys] == [1, 9]
     assert [key.conveyor_direction for key in keys] == ["out", "back"]
     assert keys[0].view_id != keys[1].view_id
+
+
+def test_scan_capture_reads_measured_conveyor_position_from_yaml(tmp_path: Path) -> None:
+    image_path = (
+        tmp_path / "img_000001_ura-0155_belt-001_pos-0100_out_ramp-001_"
+        "p1-020_p2-030_auto.png"
+    )
+    assert cv2.imwrite(str(image_path), np.zeros((20, 30), dtype=np.uint8))
+    image_path.with_suffix(".yaml").write_text(
+        "conveyor:\n"
+        "  nominal_offset_mm: 10.0\n"
+        "  measured_logical_offset_mm: 10.73\n"
+        '  position_sampled_at: "2026-08-08T16:00:00+02:00"\n',
+        encoding="utf-8",
+    )
+
+    record = next(iter(scan_capture(tmp_path).values()))
+
+    assert record.nominal_conveyor_position_mm == 10.0
+    assert record.measured_conveyor_position_mm == 10.73
+    assert record.position_sampled_at == "2026-08-08T16:00:00+02:00"
+
+
+def test_measured_conveyor_track_stabilizes_bad_single_box(tmp_path: Path) -> None:
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray]] = []
+    bad_index = 5
+    for index in range(10):
+        path = tmp_path / f"sample_{index}.png"
+        assert cv2.imwrite(str(path), np.zeros((240, 400), dtype=np.uint8))
+        key = CaptureKey(
+            pose_id=155,
+            panel_2=0,
+            panel_1=0,
+            exposure="auto",
+            robot_mode="angle",
+            conveyor_station_id=index,
+            conveyor_position_tenths_mm=index * 100,
+            conveyor_direction="out",
+        )
+        record = CaptureRecord(path, key, index, float(index * 10), float(index * 10))
+        pair = MatchedPair(record, record)
+        expected_x = 70.0 + index * 12.0
+        raw_x = 330.0 if index == bad_index else expected_x
+        raw_box = cv2.boxPoints(((raw_x, 120.0), (70.0, 35.0), 12.0)).astype(np.float32)
+        entries.append(({"quality": "PASS", "quality_reason": ""}, pair, raw_box))
+
+    boxes, summary = stabilize_boxes_by_conveyor_position(entries)
+
+    corrected_center = boxes[entries[bad_index][1].foreground.path].mean(axis=0)
+    assert summary.active
+    assert summary.tracked_images == 10
+    assert summary.corrected_images >= 1
+    assert corrected_center[0] == pytest.approx(70.0 + bad_index * 12.0, abs=5.0)
+    assert entries[bad_index][0]["quality"] == "REVIEW"
+    assert entries[bad_index][0]["conveyor_track_used"] is True
 
 
 def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) -> None:
