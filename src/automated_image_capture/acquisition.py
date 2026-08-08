@@ -157,6 +157,7 @@ class AcquisitionSettings:
     angle_end_deg: float = 21.0
     angle_step_deg: float = 0.5
     conveyor_enabled: bool = False
+    conveyor_motion_mode: str = "stations"
     conveyor_max_offset_mm: float = 50.0
     conveyor_step_mm: float = 10.0
     conveyor_speed_mm_per_s: float = 10.0
@@ -182,6 +183,16 @@ class AcquisitionSettings:
             raise ValueError("Der UR-Steuerungsmodus ist ungültig.")
         angle_values(self.angle_start_deg, self.angle_end_deg, self.angle_step_deg)
         conveyor_positions(self.conveyor_max_offset_mm, self.conveyor_step_mm)
+        if self.conveyor_motion_mode not in {"stations", "synchronized"}:
+            raise ValueError("Der Förderband-Aufnahmemodus ist ungültig.")
+        if (
+            self.conveyor_enabled
+            and self.conveyor_motion_mode == "synchronized"
+            and self.conveyor_max_offset_mm <= 0.0
+        ):
+            raise ValueError(
+                "Für die synchronisierte Fahrt muss der maximale Offset größer als 0 mm sein."
+            )
         if not 0.1 <= self.conveyor_speed_mm_per_s <= 5000.0:
             raise ValueError(
                 "Die Förderbandgeschwindigkeit muss zwischen 0,1 und 5000 mm/s liegen."
@@ -224,6 +235,7 @@ class CapturePoint:
     conveyor_offset_mm: float = 0.0
     conveyor_actual_offset_mm: float | None = None
     conveyor_direction: str = "fixed"
+    conveyor_motion_mode: str = "stations"
 
     @property
     def robot_raw_value(self) -> int:
@@ -253,6 +265,43 @@ def triangle_brightness(elapsed_s: float, period_s: float) -> int:
     return max(0, min(100, round(100.0 * normalized)))
 
 
+def synchronized_sweep_profile(
+    settings: AcquisitionSettings,
+) -> tuple[float, float, int]:
+    """Return active-motion duration, effective speed and samples per round trip."""
+    natural_duration = 2.0 * settings.conveyor_max_offset_mm / settings.conveyor_speed_mm_per_s
+    if settings.capture_mode == "ramp":
+        sample_count = max(2, round(natural_duration * settings.ramp_image_rate_fps))
+        duration = natural_duration
+    else:
+        light_count = len(
+            inclusive_values(settings.light_1_start, settings.light_1_end, settings.light_1_step)
+        ) * len(
+            inclusive_values(settings.light_2_start, settings.light_2_end, settings.light_2_step)
+        )
+        # The selected speed is an upper bound. Slow the belt when necessary so
+        # discrete BLE targets are never scheduled faster than the chosen sample rate.
+        duration = max(natural_duration, light_count / settings.ramp_image_rate_fps)
+        sample_count = max(2, round(duration * settings.ramp_image_rate_fps))
+    effective_speed = 2.0 * settings.conveyor_max_offset_mm / duration
+    return duration, effective_speed, sample_count
+
+
+def _sweep_sample(
+    sample_id: int,
+    sample_count: int,
+    duration_s: float,
+    maximum_mm: float,
+) -> tuple[float, float, str]:
+    # Samples sit in the middle of equal time slots. This avoids taking a nominally
+    # moving image before the first motion or after the return has already completed.
+    planned_s = (sample_id + 0.5) * duration_s / sample_count
+    phase = planned_s / duration_s
+    if phase < 0.5:
+        return planned_s, maximum_mm * phase * 2.0, "out"
+    return planned_s, maximum_mm * (2.0 - phase * 2.0), "back"
+
+
 def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, ...]:
     settings = settings.validated()
     exposures: tuple[int | None, ...]
@@ -274,6 +323,62 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
         robot_targets = tuple(
             (pose, None) for pose in poses_between(settings.pose_start, settings.pose_end)
         )
+    synchronized = settings.conveyor_enabled and settings.conveyor_motion_mode == "synchronized"
+    if synchronized:
+        duration, _effective_speed, sample_count = synchronized_sweep_profile(settings)
+        light_pairs = tuple(
+            (light_1, light_2)
+            for light_2 in inclusive_values(
+                settings.light_2_start, settings.light_2_end, settings.light_2_step
+            )
+            for light_1 in inclusive_values(
+                settings.light_1_start, settings.light_1_end, settings.light_1_step
+            )
+        )
+        scale = duration / settings.ramp_duration_s
+        panel_periods = (
+            settings.ramp_light_1_period_s * scale,
+            settings.ramp_light_2_period_s * scale,
+        )
+        points: list[CapturePoint] = []
+        for raw, angle in robot_targets:
+            for exposure in exposures:
+                for sample_id in range(sample_count):
+                    planned_s, offset_mm, direction = _sweep_sample(
+                        sample_id,
+                        sample_count,
+                        duration,
+                        settings.conveyor_max_offset_mm,
+                    )
+                    if settings.capture_mode == "ramp":
+                        light_1 = triangle_brightness(planned_s, panel_periods[0])
+                        light_2 = triangle_brightness(planned_s, panel_periods[1])
+                        ramp_sample_id: int | None = sample_id
+                    else:
+                        pair_index = min(
+                            len(light_pairs) - 1,
+                            sample_id * len(light_pairs) // sample_count,
+                        )
+                        light_1, light_2 = light_pairs[pair_index]
+                        ramp_sample_id = None
+                    points.append(
+                        CapturePoint(
+                            pose=raw,
+                            light_1_brightness=light_1,
+                            light_2_brightness=light_2,
+                            exposure_time_us=exposure,
+                            ramp_sample_id=ramp_sample_id,
+                            planned_offset_s=planned_s,
+                            robot_control_mode=settings.robot_control_mode,
+                            angle_tenths=angle,
+                            conveyor_station_id=sample_id,
+                            conveyor_offset_mm=offset_mm,
+                            conveyor_direction=direction,
+                            conveyor_motion_mode="synchronized",
+                        )
+                    )
+        return tuple(points)
+
     belt_positions = (
         conveyor_positions(settings.conveyor_max_offset_mm, settings.conveyor_step_mm)
         if settings.conveyor_enabled
@@ -300,6 +405,7 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
                 conveyor_station_id=station_id,
                 conveyor_offset_mm=offset_mm,
                 conveyor_direction=direction,
+                conveyor_motion_mode=settings.conveyor_motion_mode,
             )
             for raw, angle in robot_targets
             for station_id, offset_mm, direction in belt_positions
@@ -317,6 +423,7 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
             conveyor_station_id=station_id,
             conveyor_offset_mm=offset_mm,
             conveyor_direction=direction,
+            conveyor_motion_mode=settings.conveyor_motion_mode,
         )
         for raw, angle in robot_targets
         for station_id, offset_mm, direction in belt_positions
@@ -436,7 +543,8 @@ class DatasetWriter(QObject):
             **metadata,
             "image": {**metadata.get("image", {}), "file": image_path.name},
         }
-        ramp_mono = point.ramp_sample_id is not None and frame.pixel_format.lower().startswith(
+        timed_capture = point.planned_offset_s is not None
+        ramp_mono = timed_capture and frame.pixel_format.lower().startswith(
             "mono"
         )
         image = np.ascontiguousarray(
@@ -453,7 +561,7 @@ class DatasetWriter(QObject):
                 yaml_path,
                 image,
                 metadata,
-                point.ramp_sample_id is not None,
+                timed_capture,
             )
         except Exception:
             with self._pending_condition:
@@ -565,6 +673,15 @@ class AcquisitionController(QObject):
         self._ramp_timing_error_s: float | None = None
         self._ramp_pending_writes: set[int] = set()
         self._ramp_completed_writes: set[int] = set()
+        self._sweep_pass_key: tuple[tuple[str, int], int | None] | None = None
+        self._sweep_duration_s = 0.0
+        self._sweep_effective_speed_mm_s = 0.0
+        self._sweep_origin_monotonic = 0.0
+        self._sweep_origin_wall = 0.0
+        self._sweep_out_completed = False
+        self._sweep_return_completed = False
+        self._sweep_samples_finished = False
+        self._sweep_resuming_midpass = False
 
         self._phase_timer = QTimer(self)
         self._phase_timer.setSingleShot(True)
@@ -1029,7 +1146,10 @@ class AcquisitionController(QObject):
             )
         )
 
-        if settings.capture_mode == "ramp":
+        if settings.capture_mode == "ramp" or (
+            settings.conveyor_enabled
+            and settings.conveyor_motion_mode == "synchronized"
+        ):
             configured_fps = float(
                 getattr(getattr(self.camera, "config", None), "preview_max_fps", 0)
             )
@@ -1049,7 +1169,6 @@ class AcquisitionController(QObject):
                     ),
                 )
             )
-
         if settings.exposure_enabled:
             minimum = self._camera_status.exposure_min_us
             maximum = self._camera_status.exposure_max_us
@@ -1149,6 +1268,25 @@ class AcquisitionController(QObject):
                 )
             )
             conveyor = self.conveyor.status if self.conveyor is not None else ConveyorStatus()
+            if settings.conveyor_motion_mode == "synchronized":
+                position_ready = (
+                    conveyor_connected
+                    and conveyor.internal_position is not None
+                    and conveyor.position_feedback_verified
+                )
+                checks.append(
+                    PreflightCheck(
+                        "conveyor_position_feedback",
+                        "Förderband-Positionsrückmeldung",
+                        position_ready,
+                        (
+                            "SPS-Positionswert durch eine Positionsänderung bestätigt"
+                            if position_ready
+                            else "Bitte nach dem PDO-Mapping eine 1-mm-Testfahrt ausführen; "
+                            "MAIN.StepperInternalPosition muss sich dabei ändern"
+                        ),
+                    )
+                )
             calibration_ready = (
                 conveyor_connected
                 and conveyor.calibration_valid
@@ -1289,7 +1427,11 @@ class AcquisitionController(QObject):
             if not requested:
                 self._fail("UR-Ziel konnte nicht angefordert werden.")
             return
-        if self._settings is not None and self._settings.conveyor_enabled:
+        if (
+            self._settings is not None
+            and self._settings.conveyor_enabled
+            and self._settings.conveyor_motion_mode == "stations"
+        ):
             if self._current_conveyor_key != point.conveyor_key:
                 self._move_conveyor(point)
                 return
@@ -1324,6 +1466,9 @@ class AcquisitionController(QObject):
 
     def _prepare_point(self) -> None:
         point = self._points[self._index]
+        if self._synchronized_conveyor():
+            self._apply_exposure()
+            return
         if point.ramp_sample_id is not None:
             self._apply_exposure()
             return
@@ -1351,6 +1496,13 @@ class AcquisitionController(QObject):
 
     def _after_exposure_ready(self) -> None:
         point = self._points[self._index]
+        if self._synchronized_conveyor():
+            key = self._sweep_key(point)
+            if self._sweep_pass_key == key:
+                self._wait_for_sweep_frame()
+            else:
+                self._start_sweep_sync(point)
+            return
         if point.ramp_sample_id is not None:
             key = (point.robot_key, point.conveyor_key, point.exposure_time_us)
             if self._ramp_pass_key == key:
@@ -1429,6 +1581,47 @@ class AcquisitionController(QObject):
                         self.status_changed.emit(
                             "Förderbandposition korrigiert; die Aufnahme kann fortgesetzt werden."
                         )
+            return
+        if self._running and self._synchronized_conveyor():
+            if status.error or status.status_code in {4, 5}:
+                self._fail(f"Förderbandfehler (SPS-Status {status.status_code}).")
+                return
+            sequence = self._pending_conveyor_sequence
+            started_sequence = status.requested_sequence
+            if (
+                started_sequence is None
+                and status.movement_started_at is not None
+                and status.last_move is not None
+            ):
+                started_sequence = status.last_move.sequence
+            if sequence is not None and started_sequence == sequence:
+                if self._phase == "sweep_out_start" and status.movement_started_at:
+                    self._begin_sweep_timeline(status, "out")
+                elif self._phase == "sweep_back_start" and status.movement_started_at:
+                    self._begin_sweep_timeline(status, "back")
+            if sequence is not None and status.completed_sequence == sequence:
+                direction = "out" if not self._sweep_out_completed else "back"
+                target = (
+                    self._settings.conveyor_max_offset_mm
+                    if direction == "out" and self._settings is not None
+                    else 0.0
+                )
+                if self.conveyor is None or not self.conveyor.position_matches(target):
+                    self._fail(
+                        "Synchronisierte Förderbandfahrt quittiert, "
+                        "Zielposition stimmt jedoch nicht überein."
+                    )
+                    return
+                self._pending_conveyor_sequence = None
+                if direction == "out":
+                    self._sweep_out_completed = True
+                    self._wait_for_sweep_frame()
+                else:
+                    self._sweep_return_completed = True
+                    if self._sweep_samples_finished:
+                        self._finish_sweep_pass()
+                    else:
+                        self._wait_for_sweep_frame()
             return
         if not self._running or self._phase != "conveyor":
             return
@@ -1510,6 +1703,135 @@ class AcquisitionController(QObject):
         self._ramp_timing_error_s = None
         self._ramp_pending_writes.clear()
         self._ramp_completed_writes.clear()
+        self._sweep_pass_key = None
+        self._sweep_duration_s = 0.0
+        self._sweep_effective_speed_mm_s = 0.0
+        self._sweep_origin_monotonic = 0.0
+        self._sweep_origin_wall = 0.0
+        self._sweep_out_completed = False
+        self._sweep_return_completed = False
+        self._sweep_samples_finished = False
+        self._sweep_resuming_midpass = False
+
+    def _synchronized_conveyor(self) -> bool:
+        return bool(
+            self._settings is not None
+            and self._settings.conveyor_enabled
+            and self._settings.conveyor_motion_mode == "synchronized"
+        )
+
+    @staticmethod
+    def _sweep_key(point: CapturePoint) -> tuple[tuple[str, int], int | None]:
+        return point.robot_key, point.exposure_time_us
+
+    def _start_sweep_sync(self, point: CapturePoint) -> None:
+        assert self._settings is not None
+        self._sweep_duration_s, self._sweep_effective_speed_mm_s, _ = (
+            synchronized_sweep_profile(self._settings)
+        )
+        self._sweep_pass_key = self._sweep_key(point)
+        self._sweep_out_completed = point.conveyor_direction == "back"
+        self._sweep_return_completed = False
+        self._sweep_samples_finished = False
+        self._sweep_resuming_midpass = point.conveyor_station_id != 0
+        self._ramp_targets = (point.light_1_brightness, point.light_2_brightness)
+        self._ramp_confirmation_marker = time.time()
+        self._ramp_sent = [False, False]
+        self._set_phase("sweep_sync", RAMP_BLE_COMMAND_TIMEOUT_SECONDS)
+        self.status_changed.emit(
+            f"Synchronisiere Licht für Band-Sweep bei Sample "
+            f"{point.conveyor_station_id + 1}: {self._ramp_targets[0]} % / "
+            f"{self._ramp_targets[1]} % …"
+        )
+        self._ramp_timer.start()
+        self._ramp_tick()
+
+    def _request_sweep_leg(self, direction: str) -> None:
+        if self.conveyor is None or self._settings is None:
+            self._fail("Förderbandadapter ist nicht verfügbar.")
+            return
+        target = self._settings.conveyor_max_offset_mm if direction == "out" else 0.0
+        sequence = self.conveyor.request_offset(target, self._sweep_effective_speed_mm_s)
+        if sequence is None:
+            self._fail("Synchronisierte Förderbandfahrt konnte nicht angefordert werden.")
+            return
+        if sequence == 0:
+            # This is normally only possible when resuming exactly at a reversal point.
+            if direction == "out":
+                self._sweep_out_completed = True
+                self._request_sweep_leg("back")
+            else:
+                self._sweep_return_completed = True
+                if self._sweep_samples_finished:
+                    self._finish_sweep_pass()
+                else:
+                    self._wait_for_sweep_frame()
+            return
+        self._pending_conveyor_sequence = sequence
+        remaining = abs(
+            target - float(self.conveyor.status.logical_offset_mm or 0.0)
+        )
+        timeout = remaining / max(0.1, self._sweep_effective_speed_mm_s) + 7.0
+        self._set_phase(f"sweep_{direction}_start", max(7.0, timeout))
+        self.status_changed.emit(
+            f"Synchronisierte Fahrt {direction}: Ziel {target:g} mm mit "
+            f"{self._sweep_effective_speed_mm_s:.2f} mm/s …"
+        )
+
+    def _begin_sweep_timeline(self, status: ConveyorStatus, direction: str) -> None:
+        point = self._points[self._index]
+        half = self._sweep_duration_s / 2.0
+        if self._sweep_resuming_midpass:
+            elapsed_at_start = float(point.planned_offset_s or 0.0)
+        else:
+            elapsed_at_start = 0.0 if direction == "out" else half
+        started_wall = status.movement_started_at or time.time()
+        now_wall = time.time()
+        self._sweep_origin_wall = started_wall - elapsed_at_start
+        self._sweep_origin_monotonic = time.monotonic() - (
+            now_wall - self._sweep_origin_wall
+        )
+        self._sweep_resuming_midpass = False
+        self._wait_for_sweep_frame()
+
+    def _sweep_elapsed(self) -> float:
+        if self._sweep_origin_monotonic <= 0.0:
+            if self._phase == "sweep_back_start":
+                return self._sweep_duration_s / 2.0
+            return 0.0
+        return max(0.0, time.monotonic() - self._sweep_origin_monotonic)
+
+    def _wait_for_sweep_frame(self) -> None:
+        if not self._running or self._index >= len(self._points):
+            return
+        point = self._points[self._index]
+        if self._sweep_key(point) != self._sweep_pass_key:
+            return
+        if point.conveyor_direction == "back" and self._phase != "sweep_back_start":
+            if not self._sweep_out_completed:
+                self._set_phase("sweep_wait_out", 5.0)
+                return
+            if not self._sweep_return_completed and (
+                self._pending_conveyor_sequence is None
+                or self._phase not in {"sweep_back_start", "sweep_frame"}
+            ):
+                self._sweep_origin_monotonic = 0.0
+                self._sweep_origin_wall = 0.0
+                self._request_sweep_leg("back")
+                return
+        self._set_phase("sweep_frame", 2.0)
+        self.status_changed.emit(
+            f"Synchronisierte Aufnahme: UR {point.robot_raw_value} · "
+            f"Band {point.conveyor_direction} {point.conveyor_offset_mm:.1f} mm · "
+            f"Sample {point.conveyor_station_id + 1}"
+        )
+
+    def _finish_sweep_pass(self) -> None:
+        self._ramp_targets = (0, 0)
+        self._ramp_confirmation_marker = time.time()
+        self._ramp_sent = [False, False]
+        self._set_phase("ramp_finalize", RAMP_BLE_COMMAND_TIMEOUT_SECONDS)
+        self._ramp_tick()
 
     def _start_ramp_sync(self, point: CapturePoint) -> None:
         # A fresh pass begins at sample zero (0/0). A resumed pass is explicitly
@@ -1529,13 +1851,38 @@ class AcquisitionController(QObject):
         if not self._running:
             self._ramp_timer.stop()
             return
-        if self._phase in {"ramp_sync", "ramp_finalize"}:
+        if self._phase in {"ramp_sync", "ramp_finalize", "sweep_sync"}:
             for index, (adapter, target) in enumerate(
                 zip((self.light_1, self.light_2), self._ramp_targets, strict=True)
             ):
                 if not self._ramp_sent[index]:
                     self._ramp_sent[index] = adapter.try_set_ramp_brightness(target)
             self._maybe_ramp_transition_ready()
+            return
+        if self._sweep_pass_key is not None and self._phase in {
+            "sweep_frame",
+            "sweep_wait_out",
+            "sweep_back_start",
+            "sweep_wait_return",
+        }:
+            assert self._settings is not None
+            point = self._points[self._index] if self._index < len(self._points) else None
+            elapsed = self._sweep_elapsed()
+            if self._settings.capture_mode == "ramp":
+                scale = self._sweep_duration_s / self._settings.ramp_duration_s
+                targets = (
+                    triangle_brightness(
+                        elapsed, self._settings.ramp_light_1_period_s * scale
+                    ),
+                    triangle_brightness(
+                        elapsed, self._settings.ramp_light_2_period_s * scale
+                    ),
+                )
+            elif point is not None and self._sweep_key(point) == self._sweep_pass_key:
+                targets = (point.light_1_brightness, point.light_2_brightness)
+            else:
+                targets = self._ramp_targets
+            self._send_timed_light_targets(targets)
             return
         if self._ramp_pass_key is None or self._phase not in {"ramp_frame", "ramp_writing"}:
             return
@@ -1545,6 +1892,9 @@ class AcquisitionController(QObject):
             triangle_brightness(elapsed, self._settings.ramp_light_1_period_s),
             triangle_brightness(elapsed, self._settings.ramp_light_2_period_s),
         )
+        self._send_timed_light_targets(targets)
+
+    def _send_timed_light_targets(self, targets: tuple[int, int]) -> None:
         for panel_number, (adapter, status, target) in enumerate(
             zip((self.light_1, self.light_2), self._light_statuses, targets, strict=True),
             start=1,
@@ -1562,7 +1912,11 @@ class AcquisitionController(QObject):
                 adapter.try_set_ramp_brightness(target)
 
     def _maybe_ramp_transition_ready(self) -> None:
-        if not self._running or self._phase not in {"ramp_sync", "ramp_finalize"}:
+        if not self._running or self._phase not in {
+            "ramp_sync",
+            "ramp_finalize",
+            "sweep_sync",
+        }:
             return
         ready = all(
             sent
@@ -1579,9 +1933,15 @@ class AcquisitionController(QObject):
         if self._phase == "ramp_finalize":
             self._ramp_timer.stop()
             self._ramp_pass_key = None
+            self._sweep_pass_key = None
             self._applied_lights = (0, 0)
-            self.status_changed.emit("Licht-Rampe beendet; beide Panels bestätigt auf 0 %.")
+            self._pending_conveyor_sequence = None
+            self.status_changed.emit("Lichtvariation beendet; beide Panels bestätigt auf 0 %.")
             self._advance()
+            return
+        if self._phase == "sweep_sync":
+            point = self._points[self._index]
+            self._request_sweep_leg(point.conveyor_direction)
             return
         point = self._points[self._index]
         planned = float(point.planned_offset_s or 0.0)
@@ -1616,6 +1976,63 @@ class AcquisitionController(QObject):
         self._ramp_tick()
 
     def _on_frame(self, frame: object) -> None:
+        if self._running and self._phase == "sweep_frame" and isinstance(frame, CameraFrame):
+            point = self._points[self._index]
+            planned = float(point.planned_offset_s or 0.0)
+            actual = frame.timestamp - self._sweep_origin_wall
+            if actual < planned:
+                return
+            timing_error = actual - planned
+            if timing_error > 0.5:
+                self._fail(
+                    f"Kamerabild für Band-Sample {point.conveyor_station_id} kam "
+                    f"{timing_error * 1000:.0f} ms zu spät (maximal 500 ms)."
+                )
+                return
+            conveyor_status = (
+                self.conveyor.status if self.conveyor is not None else ConveyorStatus()
+            )
+            if conveyor_status.logical_offset_mm is None:
+                self._fail(
+                    "Die aktuelle Förderbandposition ist während der Fahrt nicht lesbar. "
+                    "Bitte das EL7047-PDO 'Actual position' mit "
+                    "MAIN.StepperInternalPosition verknüpfen."
+                )
+                return
+            self._ramp_actual_offset_s = actual
+            self._ramp_timing_error_s = timing_error
+            metadata = self._metadata(point, frame)
+            if not self.writer.can_accept():
+                self._fail(
+                    "Der PNG-Writer kann mit der synchronisierten Bildrate nicht Schritt "
+                    "halten (8 ausstehende Bilder)."
+                )
+                return
+            capture_index = self._index
+            try:
+                self.writer.submit(capture_index, point, frame, metadata)
+            except Exception as exc:
+                self._fail(f"Speichern konnte nicht gestartet werden: {exc}")
+                return
+            self._ramp_pending_writes.add(capture_index)
+            self._index += 1
+            next_same_pass = (
+                self._index < len(self._points)
+                and self._sweep_key(self._points[self._index]) == self._sweep_pass_key
+            )
+            if next_same_pass:
+                self._wait_for_sweep_frame()
+            else:
+                self._sweep_samples_finished = True
+                if self._sweep_return_completed:
+                    self._finish_sweep_pass()
+                else:
+                    remaining = self._sweep_duration_s / 2.0 + 7.0
+                    self._set_phase("sweep_wait_return", remaining)
+                    self.status_changed.emit(
+                        "Alle Sweep-Bilder aufgenommen; warte auf Bandrückkehr zu 0 mm …"
+                    )
+            return
         if self._running and self._phase == "ramp_frame" and isinstance(frame, CameraFrame):
             point = self._points[self._index]
             planned = float(point.planned_offset_s or 0.0)
@@ -1742,6 +2159,7 @@ class AcquisitionController(QObject):
                 ),
                 "station_id": point.conveyor_station_id,
                 "direction": point.conveyor_direction,
+                "motion_mode": point.conveyor_motion_mode,
                 "origin_internal_position": self._saved_conveyor_origin,
                 "internal_position": conveyor.internal_position,
                 "internal_start_position": (
@@ -1770,6 +2188,18 @@ class AcquisitionController(QObject):
                     if move is not None and move.sequence == 0
                     else conveyor.completed_at
                 ),
+                "movement_started_at": (
+                    None
+                    if conveyor.movement_started_at is None
+                    else datetime.fromtimestamp(conveyor.movement_started_at)
+                    .astimezone()
+                    .isoformat()
+                ),
+                "position_sampled_at": (
+                    None
+                    if conveyor.sampled_at is None
+                    else datetime.fromtimestamp(conveyor.sampled_at).astimezone().isoformat()
+                ),
                 "movement_acknowledged": (
                     move is not None
                     and (move.sequence == 0 or conveyor.completed_sequence == move.sequence)
@@ -1778,6 +2208,21 @@ class AcquisitionController(QObject):
                 "busy": conveyor.busy,
                 "error": conveyor.error,
             }
+            if point.conveyor_motion_mode == "synchronized":
+                metadata["conveyor"]["synchronized_capture"] = {
+                    "sample_id": point.conveyor_station_id,
+                    "planned_active_motion_offset_s": point.planned_offset_s,
+                    "actual_active_motion_offset_s": self._ramp_actual_offset_s,
+                    "timing_error_ms": (
+                        None
+                        if self._ramp_timing_error_s is None
+                        else self._ramp_timing_error_s * 1000.0
+                    ),
+                    "planned_position_mm": point.conveyor_offset_mm,
+                    "measured_position_mm": conveyor.logical_offset_mm,
+                    "effective_speed_mm_per_s": self._sweep_effective_speed_mm_s,
+                    "active_round_trip_duration_s": self._sweep_duration_s,
+                }
         if point.ramp_sample_id is not None:
             metadata["ramp"] = {
                 "sample_id": point.ramp_sample_id,
@@ -1858,7 +2303,7 @@ class AcquisitionController(QObject):
 
     def _check_timeout(self) -> None:
         if self._running and time.monotonic() > self._deadline:
-            if self._phase in {"ramp_sync", "ramp_finalize"}:
+            if self._phase in {"ramp_sync", "ramp_finalize", "sweep_sync"}:
                 self._fail(
                     f"Ein Panel hat den Lichtbefehl länger als "
                     f"{RAMP_BLE_COMMAND_TIMEOUT_SECONDS:g} Sekunden nicht bestätigt."
@@ -1867,13 +2312,23 @@ class AcquisitionController(QObject):
                 self._fail(
                     "Das Speichern des PNG/YAML-Paars ist zu langsam für die Rampen-Bildrate."
                 )
+            elif self._phase == "sweep_frame":
+                self._fail(
+                    "Kein frisches Kamerabild zum geplanten Band-Sample empfangen."
+                )
             elif self._phase == "ramp_frame":
                 self._fail("Kein frisches Kamerabild zum geplanten Rampenzeitpunkt empfangen.")
             elif self._phase == "ramp_draining":
                 self._fail(
                     "Ausstehende PNG/YAML-Dateien konnten nicht rechtzeitig gespeichert werden."
                 )
-            elif self._phase == "conveyor":
+            elif self._phase in {
+                "conveyor",
+                "sweep_out_start",
+                "sweep_back_start",
+                "sweep_wait_out",
+                "sweep_wait_return",
+            }:
                 if self.conveyor is not None:
                     self.conveyor.stop_motion()
                 self._fail("Zeitüberschreitung während der Förderbandfahrt; Stop wurde gesendet.")

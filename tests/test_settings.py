@@ -73,6 +73,7 @@ def test_acquisition_settings_round_trip(tmp_path) -> None:
         angle_end_deg=20.5,
         angle_step_deg=0.5,
         conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
         conveyor_max_offset_mm=50.0,
         conveyor_step_mm=10.0,
         conveyor_speed_mm_per_s=10.0,

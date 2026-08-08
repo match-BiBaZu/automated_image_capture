@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtTest import QSignalSpy
 
@@ -18,12 +19,14 @@ from automated_image_capture.acquisition import (
     build_capture_points,
     dump_yaml,
     ramp_command_timed_out,
+    synchronized_sweep_profile,
     triangle_brightness,
 )
 from automated_image_capture.models import (
     CameraFrame,
     CameraStatus,
     ConnectionState,
+    ConveyorMove,
     ConveyorStatus,
     LightStatus,
     RobotStatus,
@@ -136,6 +139,133 @@ def test_continuous_capture_filename_contains_angle_and_belt_station(tmp_path: P
 
     assert image.name == "img_000001_ura-0155_belt-003_pos-0300_out_p1-010_p2-020_auto.png"
     assert metadata.stem == image.stem
+
+
+def test_synchronized_ramp_spans_one_continuous_round_trip(tmp_path: Path) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=155,
+        pose_end=155,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        conveyor_max_offset_mm=50.0,
+        conveyor_speed_mm_per_s=10.0,
+        ramp_image_rate_fps=6,
+    )
+
+    duration, speed, samples = synchronized_sweep_profile(settings)
+    points = build_capture_points(settings)
+
+    assert (duration, speed, samples) == (10.0, 10.0, 60)
+    assert len(points) == 60
+    assert [point.conveyor_station_id for point in points] == list(range(60))
+    assert [point.conveyor_direction for point in points[:30]] == ["out"] * 30
+    assert [point.conveyor_direction for point in points[30:]] == ["back"] * 30
+    assert points[0].conveyor_offset_mm == pytest.approx(5 / 6)
+    assert points[29].conveyor_offset_mm == pytest.approx(49 + 1 / 6)
+    assert points[30].conveyor_offset_mm == pytest.approx(49 + 1 / 6)
+    assert points[-1].conveyor_offset_mm == pytest.approx(5 / 6)
+    assert all(point.conveyor_motion_mode == "synchronized" for point in points)
+
+
+def test_synchronized_grid_holds_each_light_pair_while_camera_keeps_sampling(
+    tmp_path: Path,
+) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        pose_start=155,
+        pose_end=155,
+        light_1_start=0,
+        light_1_end=10,
+        light_1_step=10,
+        light_2_start=0,
+        light_2_end=10,
+        light_2_step=10,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        conveyor_max_offset_mm=50.0,
+        conveyor_speed_mm_per_s=10.0,
+        ramp_image_rate_fps=6,
+    )
+
+    duration, speed, samples = synchronized_sweep_profile(settings)
+    points = build_capture_points(settings)
+    pairs = [(point.light_1_brightness, point.light_2_brightness) for point in points]
+
+    assert (duration, speed, samples) == (10.0, 10.0, 60)
+    assert len(points) == 60
+    assert set(pairs) == {(0, 0), (10, 0), (0, 10), (10, 10)}
+    assert pairs == sorted(pairs, key=lambda pair: ((pair[1] // 10) * 2 + pair[0] // 10))
+
+
+def test_synchronized_grid_slows_belt_for_more_light_targets_than_time_slots(
+    tmp_path: Path,
+) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        light_1_step=10,
+        light_2_step=10,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        conveyor_max_offset_mm=50.0,
+        conveyor_speed_mm_per_s=10.0,
+        ramp_image_rate_fps=6,
+    )
+
+    duration, speed, samples = synchronized_sweep_profile(settings)
+
+    assert duration == pytest.approx(121 / 6)
+    assert speed == pytest.approx(600 / 121)
+    assert samples == 121
+
+
+def test_synchronized_order_is_angle_then_exposure_then_complete_sweep(
+    tmp_path: Path,
+) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        robot_control_mode="angle",
+        angle_start_deg=15.5,
+        angle_end_deg=16.0,
+        angle_step_deg=0.5,
+        exposure_enabled=True,
+        exposure_start_us=1000,
+        exposure_end_us=2000,
+        exposure_step_us=1000,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        conveyor_max_offset_mm=2.0,
+        conveyor_speed_mm_per_s=2.0,
+        ramp_image_rate_fps=1,
+    )
+
+    points = build_capture_points(settings)
+
+    assert [
+        (point.angle_tenths, point.exposure_time_us, point.conveyor_direction)
+        for point in points
+    ] == [
+        (155, 1000, "out"),
+        (155, 1000, "back"),
+        (155, 2000, "out"),
+        (155, 2000, "back"),
+        (160, 1000, "out"),
+        (160, 1000, "back"),
+        (160, 2000, "out"),
+        (160, 2000, "back"),
+    ]
+
+
+def test_synchronized_conveyor_requires_a_nonzero_travel_range(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="größer als 0 mm"):
+        AcquisitionSettings(
+            output_directory=tmp_path,
+            conveyor_enabled=True,
+            conveyor_motion_mode="synchronized",
+            conveyor_max_offset_mm=0.0,
+        ).validated()
 
 
 def test_default_ramp_has_60_unique_samples_and_triangle_extremes(tmp_path: Path) -> None:
@@ -330,6 +460,85 @@ class FakeLight(QObject):
         return True
 
 
+class FakeConveyor(QObject):
+    status_changed = pyqtSignal(object)
+    move_failed = pyqtSignal(int, str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = ConnectionState.CONNECTED
+        self.config = SimpleNamespace(
+            conveyor_forward_direction="right",
+            plc_ip="test-plc",
+            plc_ams_net_id="1.2.3.4.5.6",
+        )
+        self.origin_position = 0
+        self.status = ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=1.0,
+            ready_to_execute=True,
+            internal_position=0,
+            logical_offset_mm=0.0,
+            origin_position=0,
+            sampled_at=time.time(),
+            position_feedback_verified=True,
+        )
+        self.requests: list[tuple[int, float, float]] = []
+        self._sequence = 100
+
+    def request_offset(self, offset: float, speed: float) -> int:
+        self._sequence += 1
+        sequence = self._sequence
+        self.requests.append((sequence, offset, speed))
+        self.status.requested_sequence = sequence
+        self.status.requested_offset_mm = offset
+        self.status.movement_started_at = None
+        self.status.last_move = ConveyorMove(
+            sequence,
+            offset,
+            offset,
+            round(offset),
+            round(offset - float(self.status.logical_offset_mm or 0.0)),
+            speed,
+            speed,
+            "right" if offset else "left",
+            self.status.internal_position,
+            time.time(),
+        )
+        self.status_changed.emit(self.status)
+        return sequence
+
+    def start_move(self) -> None:
+        self.status.movement_started_at = time.time()
+        self.status.busy = True
+        self.status.status_code = 2
+        self.status.sampled_at = time.time()
+        self.status_changed.emit(self.status)
+
+    def complete_move(self, offset: float) -> None:
+        sequence = self.status.requested_sequence
+        self.status.busy = False
+        self.status.status_code = 3
+        self.status.logical_offset_mm = offset
+        self.status.internal_position = round(offset * 64)
+        self.status.completed_sequence = sequence
+        self.status.completed_internal_position = self.status.internal_position
+        self.status.completed_at = time.time()
+        self.status.sampled_at = time.time()
+        self.status_changed.emit(self.status)
+
+    def position_matches(self, offset: float, tolerance_full_steps: int = 1) -> bool:
+        del tolerance_full_steps
+        return self.status.logical_offset_mm == pytest.approx(offset)
+
+    def release_control(self) -> None:
+        pass
+
+    def stop_motion(self) -> None:
+        pass
+
+
 def _ready_controller() -> tuple[
     AcquisitionController,
     FakeCamera,
@@ -428,6 +637,43 @@ def test_preflight_accepts_conveyor_standby_before_drive_enable(tmp_path: Path) 
 
     assert drive.ready
     assert "Positioniermodus" in drive.detail
+    controller.close()
+
+
+def test_synchronized_preflight_requires_position_feedback_test(tmp_path: Path) -> None:
+    controller, _camera, _robot, _light_1, _light_2 = _ready_controller()
+    controller.conveyor = SimpleNamespace(
+        state=ConnectionState.CONNECTED,
+        status=ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=0.32960026,
+            internal_position=1234,
+            position_feedback_verified=False,
+        ),
+        config=SimpleNamespace(conveyor_forward_direction="right"),
+        origin_position=1234,
+    )
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        pose_start=155,
+        pose_end=155,
+        light_1_start=0,
+        light_1_end=0,
+        light_2_start=0,
+        light_2_end=0,
+    )
+
+    feedback = next(
+        check
+        for check in controller.preflight_checks(settings)
+        if check.key == "conveyor_position_feedback"
+    )
+
+    assert not feedback.ready
+    assert "1-mm-Testfahrt" in feedback.detail
     controller.close()
 
 
@@ -542,6 +788,82 @@ def test_two_sample_ramp_captures_on_timeline_and_finishes_at_zero(qtbot, tmp_pa
     assert "planned_offset_s: 1.0" in yaml_text
     assert "timing_error_ms:" in yaml_text
     assert "last_confirmed_command_percent:" in yaml_text
+    controller.close()
+
+
+def test_synchronized_sweep_moves_out_and_back_while_capturing(qtbot, tmp_path: Path) -> None:
+    camera = FakeCamera()
+    robot = FakeRobot()
+    light_1 = FakeLight("PANEL-1")
+    light_2 = FakeLight("PANEL-2")
+    conveyor = FakeConveyor()
+    controller = AcquisitionController(
+        camera,
+        robot,
+        light_1,
+        light_2,
+        conveyor=conveyor,
+    )
+    camera.status_changed.emit(CameraStatus(model="TestCam", preview_fps=2.0))
+    robot.status_changed.emit(_robot_status(command_state_code=1))
+    light_1.status_changed.emit(light_1.status)
+    light_2.status_changed.emit(light_2.status)
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        capture_mode="ramp",
+        pose_start=180,
+        pose_end=180,
+        conveyor_enabled=True,
+        conveyor_motion_mode="synchronized",
+        conveyor_max_offset_mm=2.0,
+        conveyor_speed_mm_per_s=2.0,
+        ramp_image_rate_fps=1,
+        ramp_duration_s=2.0,
+        ramp_light_1_period_s=2.0,
+        ramp_light_2_period_s=2.0,
+        robot_settle_ms=0,
+    )
+
+    assert controller.start(settings)
+    qtbot.waitUntil(lambda: robot.requests == [180], timeout=2000)
+    robot.status_changed.emit(
+        _robot_status(command_state_code=3, sequence=9, acknowledged_pose=180)
+    )
+    qtbot.waitUntil(lambda: len(conveyor.requests) == 1, timeout=2000)
+    assert conveyor.requests[0][1:] == pytest.approx((2.0, 2.0))
+
+    conveyor.start_move()
+    qtbot.waitUntil(lambda: controller._phase == "sweep_frame", timeout=2000)
+    first_origin = controller._sweep_origin_wall
+    conveyor.status.logical_offset_mm = 1.0
+    conveyor.status.sampled_at = time.time()
+    camera.frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 80, np.uint8), "Mono8", first_origin + 0.51)
+    )
+    qtbot.waitUntil(lambda: controller._phase == "sweep_wait_out", timeout=2000)
+
+    conveyor.complete_move(2.0)
+    qtbot.waitUntil(lambda: len(conveyor.requests) == 2, timeout=2000)
+    assert conveyor.requests[1][1:] == pytest.approx((0.0, 2.0))
+    conveyor.start_move()
+    qtbot.waitUntil(lambda: controller._phase == "sweep_frame", timeout=2000)
+    return_origin = controller._sweep_origin_wall
+    conveyor.status.logical_offset_mm = 1.0
+    conveyor.status.sampled_at = time.time()
+    camera.frame_ready.emit(
+        CameraFrame(np.full((8, 10, 3), 120, np.uint8), "Mono8", return_origin + 1.51)
+    )
+    qtbot.waitUntil(lambda: controller._phase == "sweep_wait_return", timeout=2000)
+    conveyor.complete_move(0.0)
+    qtbot.waitUntil(lambda: not controller.running, timeout=5000)
+
+    session = controller.session_directory
+    assert session is not None
+    assert len(list(session.glob("*.png"))) == 2
+    yaml_text = next(session.glob("*.yaml")).read_text(encoding="utf-8")
+    assert 'motion_mode: "synchronized"' in yaml_text
+    assert "measured_position_mm: 1.0" in yaml_text
+    assert light_1.status.brightness == light_2.status.brightness == 0
     controller.close()
 
 

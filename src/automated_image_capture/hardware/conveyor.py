@@ -99,6 +99,7 @@ class ConveyorWorker(QObject):
         self._move_not_before = 0.0
         self._move_command_sent = False
         self._enable_deadline = 0.0
+        self._movement_started_at: float | None = None
 
     def enqueue_move(self, move: ConveyorMove) -> None:
         self._commands.put(("move", move))
@@ -136,6 +137,7 @@ class ConveyorWorker(QObject):
             self._write_values(plc, self._safe_values(), pyads)
             self._requested_move = None
             self._move_command_sent = False
+            self._movement_started_at = None
             self.event_message.emit("Förderband-Stop an die SPS gesendet.")
             return
         if command == "release":
@@ -143,6 +145,7 @@ class ConveyorWorker(QObject):
             self._requested_move = None
             self._saw_busy = False
             self._move_command_sent = False
+            self._movement_started_at = None
             self.event_message.emit("Förderbandsteuerung freigegeben und gestoppt.")
             return
         if command != "move" or not isinstance(payload, ConveyorMove):
@@ -160,6 +163,7 @@ class ConveyorWorker(QObject):
         self._requested_move = payload
         self._saw_busy = False
         self._move_command_sent = False
+        self._movement_started_at = None
         self._enable_deadline = time.monotonic() + DRIVE_ENABLE_TIMEOUT_SECONDS
         self.event_message.emit(
             f"Aktiviere Positioniermodus für Förderbandfahrt #{payload.sequence} …"
@@ -184,6 +188,7 @@ class ConveyorWorker(QObject):
             pyads,
         )
         self._move_command_sent = True
+        self._movement_started_at = time.time()
         self._move_not_before = time.monotonic() + 0.05
         self.event_message.emit(
             f"Fahrt #{move.sequence}: {move.requested_offset_mm:g} mm "
@@ -199,6 +204,7 @@ class ConveyorWorker(QObject):
         self._requested_move = None
         self._move_command_sent = False
         self._saw_busy = False
+        self._movement_started_at = None
         if move is not None:
             self.move_failed.emit(move.sequence, message)
 
@@ -292,6 +298,8 @@ class ConveyorWorker(QObject):
                         completed_sequence=self._completed_sequence,
                         completed_internal_position=self._completed_internal_position,
                         completed_at=self._completed_at,
+                        movement_started_at=self._movement_started_at,
+                        sampled_at=time.time(),
                         last_move=self._requested_move,
                     )
                     if status.busy or status.status_code in {1, 2}:
@@ -464,8 +472,15 @@ class ConveyorAdapter(DeviceAdapter):
     def _on_status(self, status: object) -> None:
         if not isinstance(status, ConveyorStatus):
             return
+        previous_position = self._status.internal_position
+        feedback_verified = self._status.position_feedback_verified or (
+            previous_position is not None
+            and status.internal_position is not None
+            and status.internal_position != previous_position
+        )
         previous_move = self._status.last_move
         self._status = replace(status)
+        self._status.position_feedback_verified = feedback_verified
         if self._status.last_move is None:
             self._status.last_move = previous_move
         if self._status.last_move is not None:

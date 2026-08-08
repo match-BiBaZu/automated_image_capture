@@ -74,9 +74,16 @@ Runtime, eine beidseitige AMS-Route und eine Netzwerkkonfiguration, welche die S
 
 Vor einer neuen Serie wird das Bauteil hinten platziert und in der Förderbandkarte
 **Aktuelle Position = 0 mm** gewählt. Nach zwei 1-mm-Testfahrten wird Links oder Rechts als
-Vorwärtsrichtung gespeichert. Die Aufnahmereihenfolge ist UR-Ziel → Förderbandstation →
-Belichtung → vollständige Lichtvariation. Standardmäßig fährt das Band
-`0, 10, 20, 30, 40, 50, 40, 30, 20, 10, 0 mm`; Hin- und Rückweg sind getrennte Stationen.
+Vorwärtsrichtung gespeichert. `Term 19 → POS Status → Actual position` muss in TwinCAT
+mit `MAIN.StepperInternalPosition` verknüpft sein. Die GUI gibt den synchronisierten Modus erst
+frei, nachdem eine Testfahrt eine echte Änderung dieses Werts gezeigt hat.
+
+Der Modus **Diskrete Stationen** verwendet weiterhin die Reihenfolge UR-Ziel →
+Förderbandstation → Belichtung → vollständige Lichtvariation. Standardmäßig fährt das
+Band `0, 10, 20, 30, 40, 50, 40, 30, 20, 10, 0 mm`; Hin- und Rückweg sind getrennte
+Stationen. Im Modus **Kontinuierliche synchronisierte Fahrt** fährt das Band pro UR-Ziel und
+Belichtung ohne Zwischenstopps `0 → Maximum → 0 mm`. Kamera und beide Panels laufen
+währenddessen weiter. Erst nach der bestätigten Rückkehr zu 0 mm wird der UR-Winkel geändert.
 
 Beim Stoppen sendet die Anwendung einen Förderband-Stop und gibt den SPS-Positioniermodus
 frei. Eine UR-Fahrt wird weiterhin nicht extern abgebrochen. Beim Fortsetzen wird die interne
@@ -107,7 +114,8 @@ deutlich länger als die folgenden Frames.
    **Exaktes Raster** verwendet feste Helligkeitsschritte; **Schnelle Rampe** nimmt während
    zeitbasierter Dreieckskurven beider Panels kontinuierlich Bilder auf.
 4. Für eine Bandserie Vorwärtsrichtung bestätigen, das Bauteil hinten platzieren und die
-   aktuelle Position ausdrücklich als logischen Nullpunkt übernehmen.
+   aktuelle Position ausdrücklich als logischen Nullpunkt übernehmen. Für den
+   synchronisierten Modus zuvor per 1-mm-Testfahrt die Positionsrückmeldung prüfen.
 5. Optional die Belichtungsvariation aktivieren, wenn die verbundene Kamera eine manuell
    beschreibbare `ExposureTime` meldet.
 6. **Aufnahme starten** wählen und die Freigabe des Arbeitsraums bestätigen.
@@ -119,6 +127,14 @@ speichert 60 Bilder in 10 Sekunden bei Panelperioden von 2,4 und 10 Sekunden. Pr
 höchstens ein BLE-Befehl gleichzeitig; veraltete Zwischenziele werden übersprungen. Die
 Dateinamen enthalten `ramp-NNN`, und die YAML-Dateien dokumentieren Sollzeit, tatsächliche
 Aufnahmeabweichung sowie den letzten bestätigten Panelbefehl.
+
+Bei der **kontinuierlichen synchronisierten Fahrt** lautet die Reihenfolge UR-Ziel →
+Belichtung → kompletter Bandlauf mit gleichzeitiger Lichtvariation. Die Rundfahrtdauer wird
+aus Weg und Geschwindigkeit bestimmt. Im Rampenmodus werden die Lichtperioden proportional
+auf diese Dauer skaliert. Im diskreten Modus werden die Lichtpaare über die Fahrt verteilt;
+bei zu vielen Kombinationen wird die Bandgeschwindigkeit automatisch reduziert. Veraltete
+BLE-Zwischenziele werden nicht aufgestaut. Jede YAML-Datei enthält geplante und gemessene
+Bandposition, Richtung, Sollhelligkeiten, zuletzt bestätigte Panelwerte sowie Zeitabweichung.
 Jede Sitzung erhält einen eigenen Ordner `capture_YYYYMMDD_HHMMSS`. Zu jeder verlustfreien
 PNG-Datei wird eine gleichnamige YAML-Datei mit Kamera-, Roboter-, Licht- und Sequenzdaten
 gespeichert. Eine optionale Belichtungsvariation wird beim Abschluss oder Stoppen auf den Wert

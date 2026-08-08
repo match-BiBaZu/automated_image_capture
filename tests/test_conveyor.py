@@ -191,3 +191,37 @@ def test_adapter_treats_plc_position_zero_as_a_real_position() -> None:
 
     assert worker.move is not None
     assert worker.move.delta_full_steps == 1
+
+
+def test_adapter_marks_position_feedback_verified_only_after_observed_change() -> None:
+    adapter = ConveyorAdapter(AppSettings(conveyor_forward_direction="right"))
+
+    adapter._on_status(
+        ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=1.0,
+            internal_position=100,
+        )
+    )
+    assert not adapter.status.position_feedback_verified
+
+    adapter._on_status(
+        ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=1.0,
+            internal_position=164,
+        )
+    )
+    assert adapter.status.position_feedback_verified
+
+    adapter._on_status(
+        ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=1.0,
+            internal_position=164,
+        )
+    )
+    assert adapter.status.position_feedback_verified

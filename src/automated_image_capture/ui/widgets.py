@@ -29,6 +29,7 @@ from automated_image_capture.acquisition import (
     AcquisitionSettings,
     PreflightCheck,
     build_capture_points,
+    synchronized_sweep_profile,
 )
 from automated_image_capture.hardware.robot import ALLOWED_POSES
 from automated_image_capture.models import (
@@ -310,12 +311,14 @@ class ConveyorControlCard(DeviceCard):
             if status.ready_to_execute
             else "Standby"
         )
+        feedback = "geprüft" if status.position_feedback_verified else "noch ungeprüft"
         self.details.setText(
             f"Kalibrierung: {calibration}\n"
             f"Antrieb: {drive_state} · beschäftigt/Warning/Fehler: "
             f"{'ja' if status.busy else 'nein'} / "
             f"{'ja' if status.warning else 'nein'} / {'ja' if status.error else 'nein'}\n"
-            f"SPS-Position: {internal} · logischer Offset: {offset} · Status {status.status_code}"
+            f"SPS-Position: {internal} · Rückmeldung: {feedback}\n"
+            f"Logischer Offset: {offset} · Status {status.status_code}"
         )
         self._update_controls()
 
@@ -558,27 +561,41 @@ class AcquisitionCard(QGroupBox):
             if settings.robot_control_mode == RobotCommandMode.ANGLE.value
             else f"UR-Pose {settings.pose_start} bis {settings.pose_end}"
         )
-        belt = (
-            f" · Förderband 0–{settings.conveyor_max_offset_mm:g}–0 mm / "
-            f"{settings.conveyor_step_mm:g} mm"
-            if settings.conveyor_enabled
-            else " · Förderband aus"
-        )
+        if settings.conveyor_enabled:
+            belt = (
+                f" · Förderband synchron 0–{settings.conveyor_max_offset_mm:g}–0 mm"
+                if settings.conveyor_motion_mode == "synchronized"
+                else f" · Förderband 0–{settings.conveyor_max_offset_mm:g}–0 mm / "
+                f"{settings.conveyor_step_mm:g} mm"
+            )
+        else:
+            belt = " · Förderband aus"
         exposure = (
             f" · Belichtung {settings.exposure_start_us}–{settings.exposure_end_us} µs"
             if settings.exposure_enabled
             else " · Belichtung unverändert"
         )
         if settings.capture_mode == "ramp":
-            samples = round(settings.ramp_duration_s * settings.ramp_image_rate_fps)
+            if settings.conveyor_enabled and settings.conveyor_motion_mode == "synchronized":
+                duration, speed, samples = synchronized_sweep_profile(settings)
+                timing = f"Bandlauf {duration:.1f} s bei {speed:.2f} mm/s"
+            else:
+                samples = round(settings.ramp_duration_s * settings.ramp_image_rate_fps)
+                timing = f"{settings.ramp_duration_s:g} s"
             mode = (
                 f"Schnelle Rampe · {samples} Bilder pro Pose/Belichtung · "
-                f"{settings.ramp_duration_s:g} s bei {settings.ramp_image_rate_fps} Bildern/s · "
+                f"{timing} bei {settings.ramp_image_rate_fps} Bildern/s · "
                 f"Perioden {settings.ramp_light_1_period_s:g}/{settings.ramp_light_2_period_s:g} s"
             )
         else:
+            label = (
+                "Diskrete Lichtfolge während Bandfahrt"
+                if settings.conveyor_enabled
+                and settings.conveyor_motion_mode == "synchronized"
+                else "Exaktes Raster"
+            )
             mode = (
-                f"Exaktes Raster · Panel 1 {settings.light_1_start}–{settings.light_1_end} % / "
+                f"{label} · Panel 1 {settings.light_1_start}–{settings.light_1_end} % / "
                 f"Panel 2 {settings.light_2_start}–{settings.light_2_end} %"
             )
         self.summary.setText(
@@ -761,6 +778,14 @@ class AcquisitionDialog(QDialog):
         conveyor_form = QFormLayout(self.conveyor_group)
         self.conveyor_enabled = QCheckBox("Bauteilposition über das Förderband variieren")
         self.conveyor_enabled.setChecked(config.conveyor_enabled)
+        self.conveyor_motion_mode = QComboBox()
+        self.conveyor_motion_mode.addItem("Diskrete Stationen", "stations")
+        self.conveyor_motion_mode.addItem(
+            "Kontinuierliche synchronisierte Fahrt", "synchronized"
+        )
+        self.conveyor_motion_mode.setCurrentIndex(
+            max(0, self.conveyor_motion_mode.findData(config.conveyor_motion_mode))
+        )
         self.conveyor_max_offset = self._double_spin(
             0.0, 5000.0, config.conveyor_max_offset_mm, " mm"
         )
@@ -770,21 +795,27 @@ class AcquisitionDialog(QDialog):
         )
         self.conveyor_settle = self._spin(0, 10_000, config.conveyor_settle_ms, " ms")
         conveyor_form.addRow(self.conveyor_enabled)
+        conveyor_form.addRow("Fahrmodus", self.conveyor_motion_mode)
         conveyor_form.addRow("Maximaler Offset", self.conveyor_max_offset)
         conveyor_form.addRow("Schrittweite", self.conveyor_step)
         conveyor_form.addRow("Geschwindigkeit", self.conveyor_speed)
         conveyor_form.addRow("Beruhigungszeit", self.conveyor_settle)
         conveyor_note = QLabel(
-            "Reihenfolge je UR-Ziel: 0 → Maximum → 0 mm. An Hin- und Rückwegpositionen "
-            "werden getrennte Bildserien aufgenommen."
+            "Stationen: Das Band hält an jeder Position. Synchronisiert: Pro UR-Winkel "
+            "und Belichtung fährt das Band einmal 0 → Maximum → 0; Kamera und Licht "
+            "laufen gleichzeitig. Die SPS-Istposition wird zu jedem Bild gespeichert."
         )
         conveyor_note.setWordWrap(True)
         conveyor_form.addRow(conveyor_note)
         layout.addWidget(self.conveyor_group)
 
-        self.ramp_group = QGroupBox("Schnelle zeitbasierte Licht-Rampe")
+        self.ramp_group = QGroupBox("Zeitsteuerung für schnelle Aufnahme")
         ramp_form = QFormLayout(self.ramp_group)
         self.ramp_duration = self._double_spin(2.0, 120.0, config.ramp_duration_s, " s")
+        self.ramp_duration.setToolTip(
+            "Bei synchronisierter Bandfahrt wird die Dauer automatisch aus Weg und "
+            "Bandgeschwindigkeit berechnet."
+        )
         self.ramp_rate = self._spin(1, 10, config.ramp_image_rate_fps, " Bilder/s")
         self.ramp_light_1_period = self._double_spin(0.8, 120.0, config.ramp_light_1_period_s, " s")
         self.ramp_light_2_period = self._double_spin(0.8, 120.0, config.ramp_light_2_period_s, " s")
@@ -794,7 +825,9 @@ class AcquisitionDialog(QDialog):
         ramp_form.addRow("Periode Panel 2", self.ramp_light_2_period)
         ramp_note = QLabel(
             "Beide Panels folgen 0–100–0-Dreieckskurven. Gespeichert werden nominelle "
-            "Sollwerte und der jeweils letzte bestätigte BLE-Befehl."
+            "Sollwerte und der jeweils letzte bestätigte BLE-Befehl. Bei synchronisierter "
+            "Fahrt bestimmt das Band die Dauer; im Rastermodus werden diskrete Sollwerte "
+            "ohne Befehlsstau über den Bandlauf verteilt."
         )
         ramp_note.setWordWrap(True)
         ramp_form.addRow(ramp_note)
@@ -820,6 +853,7 @@ class AcquisitionDialog(QDialog):
             self.angle_start,
             self.angle_end,
             self.angle_step,
+            self.conveyor_motion_mode,
             self.conveyor_max_offset,
             self.conveyor_step,
             self.conveyor_speed,
@@ -843,6 +877,9 @@ class AcquisitionDialog(QDialog):
         self.exposure_enabled.toggled.connect(self._update_estimate)
         self.conveyor_enabled.toggled.connect(self._update_conveyor_controls)
         self.conveyor_enabled.toggled.connect(self._update_estimate)
+        self.conveyor_enabled.toggled.connect(self._update_mode_controls)
+        self.conveyor_motion_mode.currentIndexChanged.connect(self._update_conveyor_controls)
+        self.conveyor_motion_mode.currentIndexChanged.connect(self._update_mode_controls)
         self.robot_control_mode.currentIndexChanged.connect(self._update_robot_controls)
         self.robot_control_mode.currentIndexChanged.connect(self._update_estimate)
         self.capture_mode.currentIndexChanged.connect(self._update_mode_controls)
@@ -929,13 +966,12 @@ class AcquisitionDialog(QDialog):
 
     def _update_conveyor_controls(self, *_: object) -> None:
         enabled = self.conveyor_enabled.isChecked()
-        for control in (
-            self.conveyor_max_offset,
-            self.conveyor_step,
-            self.conveyor_speed,
-            self.conveyor_settle,
-        ):
+        synchronized = self.conveyor_motion_mode.currentData() == "synchronized"
+        for control in (self.conveyor_max_offset, self.conveyor_speed):
             control.setEnabled(enabled)
+        self.conveyor_motion_mode.setEnabled(enabled)
+        self.conveyor_step.setEnabled(enabled and not synchronized)
+        self.conveyor_settle.setEnabled(enabled and not synchronized)
 
     def _update_robot_controls(self, *_: object) -> None:
         angle_mode = self.robot_control_mode.currentData() == RobotCommandMode.ANGLE.value
@@ -944,7 +980,15 @@ class AcquisitionDialog(QDialog):
 
     def _update_mode_controls(self, *_: object) -> None:
         ramp = self.capture_mode.currentData() == "ramp"
-        self.ramp_group.setVisible(ramp)
+        synchronized = (
+            self.conveyor_enabled.isChecked()
+            and self.conveyor_motion_mode.currentData() == "synchronized"
+        )
+        self.ramp_group.setVisible(ramp or synchronized)
+        self.ramp_duration.setEnabled(ramp and not synchronized)
+        self.ramp_rate.setEnabled(ramp or synchronized)
+        self.ramp_light_1_period.setEnabled(ramp)
+        self.ramp_light_2_period.setEnabled(ramp)
         self.ranges_form.setRowVisible(self.light_1_row, not ramp)
         self.ranges_form.setRowVisible(self.light_2_row, not ramp)
 
@@ -976,6 +1020,7 @@ class AcquisitionDialog(QDialog):
             angle_end_deg=self.angle_end.value(),
             angle_step_deg=self.angle_step.value(),
             conveyor_enabled=self.conveyor_enabled.isChecked(),
+            conveyor_motion_mode=str(self.conveyor_motion_mode.currentData()),
             conveyor_max_offset_mm=self.conveyor_max_offset.value(),
             conveyor_step_mm=self.conveyor_step.value(),
             conveyor_speed_mm_per_s=self.conveyor_speed.value(),
@@ -985,7 +1030,17 @@ class AcquisitionDialog(QDialog):
     def _update_estimate(self, *_: object) -> None:
         try:
             config = self._current_config()
-            count = len(build_capture_points(config))
+            points = build_capture_points(config)
+            count = len(points)
+            if config.conveyor_enabled and config.conveyor_motion_mode == "synchronized":
+                duration, speed, samples = synchronized_sweep_profile(config)
+                passes = len({(point.robot_key, point.exposure_time_us) for point in points})
+                self.estimate.setText(
+                    f"Geplante Aufnahmen: {count} · {samples} pro Bandlauf · "
+                    f"0–{config.conveyor_max_offset_mm:g}–0 mm in {duration:.1f} s "
+                    f"bei {speed:.2f} mm/s · reine Fahrzeit {passes * duration:.1f} s"
+                )
+                return
             if config.capture_mode == "ramp":
                 samples = round(config.ramp_duration_s * config.ramp_image_rate_fps)
                 passes = count // max(1, samples)

@@ -200,6 +200,11 @@ class SettingsStore:
             conveyor_enabled=self._settings.value(
                 "acquisition/conveyor_enabled", defaults.conveyor_enabled, type=bool
             ),
+            conveyor_motion_mode=str(
+                self._settings.value(
+                    "acquisition/conveyor_motion_mode", defaults.conveyor_motion_mode
+                )
+            ),
             conveyor_max_offset_mm=float(
                 self._settings.value(
                     "acquisition/conveyor_max_offset_mm", defaults.conveyor_max_offset_mm
@@ -251,6 +256,7 @@ class SettingsStore:
             "angle_end_deg",
             "angle_step_deg",
             "conveyor_enabled",
+            "conveyor_motion_mode",
             "conveyor_max_offset_mm",
             "conveyor_step_mm",
             "conveyor_speed_mm_per_s",

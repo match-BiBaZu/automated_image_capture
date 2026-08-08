@@ -227,6 +227,9 @@ def test_acquisition_dialog_configures_continuous_angles_and_conveyor(qtbot, tmp
 
     dialog.robot_control_mode.setCurrentIndex(dialog.robot_control_mode.findData("angle"))
     dialog.conveyor_enabled.setChecked(True)
+    dialog.conveyor_motion_mode.setCurrentIndex(
+        dialog.conveyor_motion_mode.findData("synchronized")
+    )
     dialog.conveyor_max_offset.setValue(50.0)
     dialog.conveyor_step.setValue(10.0)
     config = dialog._current_config().validated()
@@ -234,10 +237,14 @@ def test_acquisition_dialog_configures_continuous_angles_and_conveyor(qtbot, tmp
     assert config.robot_control_mode == "angle"
     assert config.angle_step_deg == 0.5
     assert config.conveyor_enabled
+    assert config.conveyor_motion_mode == "synchronized"
     assert config.conveyor_max_offset_mm == 50.0
     assert config.conveyor_step_mm == 10.0
     assert dialog.angle_row.isVisibleTo(dialog)
     assert not dialog.pose_row.isVisibleTo(dialog)
+    assert dialog.ramp_group.isVisibleTo(dialog)
+    assert not dialog.conveyor_step.isEnabled()
+    assert "pro Bandlauf" in dialog.estimate.text()
 
 
 def test_conveyor_card_shows_calibration_and_enables_manual_controls(qtbot, tmp_path) -> None:
