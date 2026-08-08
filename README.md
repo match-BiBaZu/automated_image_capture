@@ -1,5 +1,9 @@
 # Automated Image Capture
 
+Eine ausführliche fachliche und technische Projektübergabe einschließlich PC-Migration,
+Hardwarevoraussetzungen, Datenformaten und offenen Punkten steht in
+[`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md).
+
 PyQt6-Hardware-Dashboard als erster Baustein einer automatisierten Aufnahme von
 YOLO-Trainingsbildern. Die Anwendung verbindet:
 
