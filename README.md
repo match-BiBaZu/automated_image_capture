@@ -84,6 +84,9 @@ Band `0, 10, 20, 30, 40, 50, 40, 30, 20, 10, 0 mm`; Hin- und Rückweg sind getre
 Stationen. Im Modus **Kontinuierliche synchronisierte Fahrt** fährt das Band pro UR-Ziel und
 Belichtung ohne Zwischenstopps `0 → Maximum → 0 mm`. Kamera und beide Panels laufen
 währenddessen weiter. Erst nach der bestätigten Rückkehr zu 0 mm wird der UR-Winkel geändert.
+Eine SPS-Fertigmeldung wird dabei erst akzeptiert, wenn auch `StepperInternalPosition` den
+berechneten Endpunkt erreicht hat. Eine bis zu zwei Sekunden verzögerte Positionsrückmeldung
+wird mit 10 Hz nachgeführt, ohne die enge Endpunkttoleranz aufzuweichen.
 
 Beim Stoppen sendet die Anwendung einen Förderband-Stop und gibt den SPS-Positioniermodus
 frei. Eine UR-Fahrt wird weiterhin nicht extern abgebrochen. Beim Fortsetzen wird die interne

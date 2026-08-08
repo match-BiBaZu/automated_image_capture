@@ -460,13 +460,25 @@ def _convex_box_iou(left: np.ndarray, right: np.ndarray) -> float:
     return float(intersection / union) if union > 0 else 0.0
 
 
+@dataclass(slots=True, frozen=True)
+class _PositionModel:
+    coefficients: np.ndarray
+    center: float
+    scale: float
+
+    def predict(self, positions: np.ndarray) -> np.ndarray:
+        normalized = (positions - self.center) / self.scale
+        return np.polyval(self.coefficients, normalized)
+
+
 def _robust_position_model(
     positions: np.ndarray,
     values: np.ndarray,
     minimum_residual: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[_PositionModel, np.ndarray]:
     """Fit a deterministic quadratic trend and reject isolated segmentation errors."""
-    normalized = positions - float(np.median(positions))
+    center = float(np.median(positions))
+    normalized = positions - center
     scale = max(float(np.ptp(normalized)), 1.0)
     normalized /= scale
     degree = 2 if len(np.unique(positions)) >= 6 else 1
@@ -482,7 +494,7 @@ def _robust_position_model(
         if int(np.count_nonzero(updated)) < degree + 2 or np.array_equal(updated, inliers):
             break
         inliers = updated
-    return np.polyval(coefficients, normalized), inliers
+    return _PositionModel(coefficients, center, scale), inliers
 
 
 @dataclass(slots=True, frozen=True)
@@ -496,8 +508,40 @@ class ConveyorTrackSummary:
     median_center_residual_pixels: float | None = None
 
 
+def _measurement_row(
+    pose_id: int,
+    pair: MatchedPair,
+    measurement: SegmentationMeasurement,
+    consensus_iou: float,
+    quality: str,
+) -> dict[str, object]:
+    return {
+        "pose_id": pose_id,
+        "panel_1": pair.foreground.key.panel_1,
+        "panel_2": pair.foreground.key.panel_2,
+        "exposure": pair.foreground.key.exposure,
+        "ramp_sample_id": pair.foreground.key.ramp_sample_id,
+        "conveyor_measured_position_mm": pair.foreground.measured_conveyor_position_mm,
+        "conveyor_nominal_metadata_position_mm": pair.foreground.nominal_conveyor_position_mm,
+        "conveyor_position_sampled_at": pair.foreground.position_sampled_at,
+        "conveyor_track_used": False,
+        "track_center_residual_pixels": None,
+        "track_raw_box_iou": None,
+        "track_correction_applied": False,
+        "obb_center_x_pixels": None,
+        "obb_center_y_pixels": None,
+        "quality_reason": "",
+        "foreground_file": pair.foreground.path.name,
+        "background_file": pair.background.path.name,
+        "difference_threshold": round(measurement.threshold, 3),
+        "foreground_area_pixels": measurement.foreground_area,
+        "consensus_iou": round(float(consensus_iou), 6),
+        "quality": quality,
+    }
+
+
 def stabilize_boxes_by_conveyor_position(
-    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray]],
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray | None]],
 ) -> tuple[dict[Path, np.ndarray], ConveyorTrackSummary]:
     """Stabilize per-image OBBs along the measured conveyor trajectory.
 
@@ -505,25 +549,34 @@ def stabilize_boxes_by_conveyor_position(
     enough *measured* ADS positions span a useful distance do we fit a robust trajectory.
     This keeps old captures and stationary grids byte-for-byte compatible.
     """
-    result = {pair.foreground.path: raw_box for _, pair, raw_box in entries}
+    result = {
+        pair.foreground.path: raw_box
+        for _, pair, raw_box in entries
+        if raw_box is not None
+    }
     usable = [
         (row, pair, raw_box)
         for row, pair, raw_box in entries
-        if pair.foreground.measured_conveyor_position_mm is not None
+        if raw_box is not None
+        and pair.foreground.measured_conveyor_position_mm is not None
         and pair.foreground.key.conveyor_direction in {"out", "back"}
     ]
-    if len(usable) < 8:
+    if len(usable) < 6:
         return result, ConveyorTrackSummary(False)
     positions = np.asarray(
         [pair.foreground.measured_conveyor_position_mm for _, pair, _ in usable],
         dtype=np.float64,
     )
+
+
     if float(np.ptp(positions)) < 5.0:
         return result, ConveyorTrackSummary(False)
 
     features = np.asarray([_box_features(raw_box) for _, _, raw_box in usable])
-    predicted_x, inliers_x = _robust_position_model(positions, features[:, 0], 10.0)
-    predicted_y, inliers_y = _robust_position_model(positions, features[:, 1], 10.0)
+    model_x, inliers_x = _robust_position_model(positions, features[:, 0], 10.0)
+    model_y, inliers_y = _robust_position_model(positions, features[:, 1], 10.0)
+    predicted_x = model_x.predict(positions)
+    predicted_y = model_y.predict(positions)
     center_residuals = np.hypot(features[:, 0] - predicted_x, features[:, 1] - predicted_y)
     center_median = float(np.median(center_residuals))
     center_mad = float(np.median(np.abs(center_residuals - center_median)))
@@ -538,32 +591,68 @@ def stabilize_boxes_by_conveyor_position(
     sin_double = float(np.median(np.sin(2.0 * features[center_inliers, 4])))
     angle = math.atan2(sin_double, cos_double) / 2.0
 
+    all_usable = [
+        (row, pair, raw_box)
+        for row, pair, raw_box in entries
+        if pair.foreground.measured_conveyor_position_mm is not None
+        and pair.foreground.key.conveyor_direction in {"out", "back"}
+    ]
+    all_positions = np.asarray(
+        [pair.foreground.measured_conveyor_position_mm for _, pair, _ in all_usable],
+        dtype=np.float64,
+    )
+    all_predicted_x = model_x.predict(all_positions)
+    all_predicted_y = model_y.predict(all_positions)
+    residual_by_path = {
+        pair.foreground.path: (float(center_residuals[index]), bool(center_inliers[index]))
+        for index, (_, pair, _) in enumerate(usable)
+    }
+
     corrected = 0
     reviewed = 0
-    for index, (row, pair, raw_box) in enumerate(usable):
+    for index, (row, pair, raw_box) in enumerate(all_usable):
         predicted = _box_from_features(
-            float(predicted_x[index]),
-            float(predicted_y[index]),
+            float(all_predicted_x[index]),
+            float(all_predicted_y[index]),
             major,
             minor,
             angle,
         )
-        box_iou = _convex_box_iou(raw_box, predicted)
-        is_outlier = bool(center_residuals[index] > center_limit or box_iou < 0.35)
-        was_corrected = bool(center_residuals[index] > 2.0 or box_iou < 0.92)
+        residual_entry = residual_by_path.get(pair.foreground.path)
+        residual = None if residual_entry is None else residual_entry[0]
+        center_is_inlier = residual_entry is not None and residual_entry[1]
+        box_iou = None if raw_box is None else _convex_box_iou(raw_box, predicted)
+        missing_candidate = raw_box is None
+        is_outlier = bool(
+            missing_candidate
+            or not center_is_inlier
+            or (box_iou is not None and box_iou < 0.35)
+        )
+        was_corrected = bool(
+            missing_candidate
+            or residual is None
+            or residual > 2.0
+            or (box_iou is not None and box_iou < 0.92)
+        )
         result[pair.foreground.path] = predicted
         row["conveyor_track_used"] = True
-        row["track_center_residual_pixels"] = round(float(center_residuals[index]), 3)
-        row["track_raw_box_iou"] = round(box_iou, 6)
+        row["track_center_residual_pixels"] = (
+            None if residual is None else round(residual, 3)
+        )
+        row["track_raw_box_iou"] = None if box_iou is None else round(box_iou, 6)
         row["track_correction_applied"] = was_corrected
-        row["obb_center_x_pixels"] = round(float(predicted_x[index]), 3)
-        row["obb_center_y_pixels"] = round(float(predicted_y[index]), 3)
+        row["obb_center_x_pixels"] = round(float(all_predicted_x[index]), 3)
+        row["obb_center_y_pixels"] = round(float(all_predicted_y[index]), 3)
         if was_corrected:
             corrected += 1
         if is_outlier:
             row["quality"] = "REVIEW"
             previous = str(row.get("quality_reason", "")).strip()
-            reason = "OBB-Kandidat weicht von der gemessenen Förderbandbahn ab"
+            reason = (
+                "Keine zuverlässige Einzelsegmentierung; OBB aus Förderbandbahn interpoliert"
+                if missing_candidate
+                else "OBB-Kandidat weicht von der gemessenen Förderbandbahn ab"
+            )
             row["quality_reason"] = f"{previous}; {reason}".strip("; ")
             reviewed += 1
 
@@ -571,14 +660,107 @@ def stabilize_boxes_by_conveyor_position(
         result,
         ConveyorTrackSummary(
             True,
-            len(usable),
+            len(all_usable),
             corrected,
             reviewed,
-            float(np.min(positions)),
-            float(np.max(positions)),
+            float(np.min(all_positions)),
+            float(np.max(all_positions)),
             center_median,
         ),
     )
+
+
+def _uses_measured_conveyor_track(pairs: list[MatchedPair]) -> bool:
+    positions = [
+        pair.foreground.measured_conveyor_position_mm
+        for pair in pairs
+        if pair.foreground.measured_conveyor_position_mm is not None
+        and pair.foreground.key.conveyor_direction in {"out", "back"}
+    ]
+    return len(positions) >= 8 and max(positions) - min(positions) >= 5.0
+
+
+def build_conveyor_track(
+    pose_id: int,
+    pairs: list[MatchedPair],
+    config: LabelingConfig,
+    progress: ProgressCallback | None = None,
+    progress_offset: int = 0,
+    progress_total: int = 1,
+    cancelled: CancelCallback | None = None,
+) -> tuple[
+    dict[int, PoseConsensus],
+    list[dict[str, object]],
+    dict[Path, np.ndarray],
+    ConveyorTrackSummary,
+]:
+    """Build OBBs across one angle, including visually weak conveyor samples."""
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray | None]] = []
+    measurements: dict[Path, SegmentationMeasurement] = {}
+    for item_index, pair in enumerate(pairs):
+        if cancelled is not None and cancelled():
+            raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+        measurement = segment_pair(
+            _read_gray(pair.foreground.path),
+            _read_gray(pair.background.path),
+            config.minimum_difference,
+        )
+        raw_box = None
+        if measurement.foreground_area >= 500:
+            try:
+                raw_box = _box_from_mask(measurement.mask, config.box_margin_pixels)
+            except LabelingError:
+                pass
+        row = _measurement_row(
+            pose_id,
+            pair,
+            measurement,
+            1.0 if raw_box is not None else 0.0,
+            "PASS" if raw_box is not None else "REVIEW",
+        )
+        entries.append((row, pair, raw_box))
+        measurements[pair.foreground.path] = measurement
+        if progress is not None:
+            progress(
+                progress_offset + item_index + 1,
+                progress_total,
+                f"Segmentiere Förderbandbahn bei Winkel {pose_id / 10.0:.1f}°",
+            )
+
+    boxes, summary = stabilize_boxes_by_conveyor_position(entries)
+    if not summary.active or len(boxes) != len(pairs):
+        candidates = sum(raw_box is not None for _, _, raw_box in entries)
+        raise LabelingError(
+            f"Winkel {pose_id / 10.0:.1f}°: nur {candidates} von {len(pairs)} Bildern "
+            "liefern eine brauchbare Einzelsegmentierung; daraus konnte keine stabile "
+            "Förderbandbahn bestimmt werden."
+        )
+
+    station_entries: dict[int, list[tuple[dict[str, object], MatchedPair]]] = defaultdict(list)
+    for row, pair, _ in entries:
+        station_entries[pair.foreground.key.conveyor_station_id].append((row, pair))
+        track_iou = row.get("track_raw_box_iou")
+        row["consensus_iou"] = 0.0 if track_iou is None else track_iou
+
+    consensuses: dict[int, PoseConsensus] = {}
+    for station_id, items in station_entries.items():
+        _, first_pair = items[0]
+        measurement = measurements[first_pair.foreground.path]
+        box = boxes[first_pair.foreground.path]
+        track_mask = np.zeros_like(measurement.mask)
+        cv2.fillConvexPoly(track_mask, np.rint(box).astype(np.int32), 255)
+        ious = [float(row["consensus_iou"]) for row, _ in items]
+        flagged = sum(row["quality"] == "REVIEW" for row, _ in items)
+        consensuses[station_id] = PoseConsensus(
+            pose_id,
+            box,
+            track_mask,
+            len(items),
+            float(np.median(ious)),
+            float(np.min(ious)),
+            flagged,
+        )
+    return consensuses, [row for row, _, _ in entries], boxes, summary
 
 
 def build_pose_consensus(
@@ -632,31 +814,13 @@ def build_pose_consensus(
     rows: list[dict[str, object]] = []
     for (pair, measurement), iou in zip(measurements, ious, strict=True):
         rows.append(
-            {
-                "pose_id": pose_id,
-                "panel_1": pair.foreground.key.panel_1,
-                "panel_2": pair.foreground.key.panel_2,
-                "exposure": pair.foreground.key.exposure,
-                "ramp_sample_id": pair.foreground.key.ramp_sample_id,
-                "conveyor_measured_position_mm": pair.foreground.measured_conveyor_position_mm,
-                "conveyor_nominal_metadata_position_mm": (
-                    pair.foreground.nominal_conveyor_position_mm
-                ),
-                "conveyor_position_sampled_at": pair.foreground.position_sampled_at,
-                "conveyor_track_used": False,
-                "track_center_residual_pixels": None,
-                "track_raw_box_iou": None,
-                "track_correction_applied": False,
-                "obb_center_x_pixels": None,
-                "obb_center_y_pixels": None,
-                "quality_reason": "",
-                "foreground_file": pair.foreground.path.name,
-                "background_file": pair.background.path.name,
-                "difference_threshold": round(measurement.threshold, 3),
-                "foreground_area_pixels": measurement.foreground_area,
-                "consensus_iou": round(float(iou), 6),
-                "quality": "REVIEW" if iou < lower_limit else "PASS",
-            }
+            _measurement_row(
+                pose_id,
+                pair,
+                measurement,
+                float(iou),
+                "REVIEW" if iou < lower_limit else "PASS",
+            )
         )
     flagged = sum(row["quality"] == "REVIEW" for row in rows)
     return (
@@ -843,21 +1007,58 @@ def generate_obb_dataset(
     track_summaries: dict[tuple[int, int], ConveyorTrackSummary] = {}
     report_rows: list[dict[str, object]] = []
     write_records: list[tuple[dict[str, object], MatchedPair, int, LabelSource]] = []
-    for class_id, source, _, grouped in source_data:
-        for view_id in sorted(grouped):
-            pose_id, station_id = view_id
-            consensus, rows = build_pose_consensus(
-                pose_id,
-                grouped[view_id],
-                config,
-                progress,
-                completed,
-                total_steps,
-                cancelled,
-            )
-            completed += len(grouped[view_id])
-            all_consensuses[(class_id, pose_id, station_id)] = consensus
-            for row, pair in zip(rows, grouped[view_id], strict=True):
+    for class_id, source, pairs, grouped in source_data:
+        by_pose: dict[int, list[MatchedPair]] = defaultdict(list)
+        for pair in pairs:
+            by_pose[pair.foreground.key.pose_id].append(pair)
+
+        for pose_id in sorted(by_pose):
+            pose_pairs = by_pose[pose_id]
+            if _uses_measured_conveyor_track(pose_pairs):
+                consensuses, rows, boxes, summary = build_conveyor_track(
+                    pose_id,
+                    pose_pairs,
+                    config,
+                    progress,
+                    completed,
+                    total_steps,
+                    cancelled,
+                )
+                completed += len(pose_pairs)
+                track_summaries[(class_id, pose_id)] = summary
+                for station_id, consensus in consensuses.items():
+                    all_consensuses[(class_id, pose_id, station_id)] = consensus
+                for image_path, box in boxes.items():
+                    output_boxes[(class_id, image_path)] = box
+                row_pairs = zip(rows, pose_pairs, strict=True)
+            else:
+                track_summaries[(class_id, pose_id)] = ConveyorTrackSummary(False)
+                pose_rows: list[dict[str, object]] = []
+                ordered_pairs: list[MatchedPair] = []
+                for view_id in sorted(grouped):
+                    if view_id[0] != pose_id:
+                        continue
+                    station_id = view_id[1]
+                    view_pairs = grouped[view_id]
+                    consensus, rows = build_pose_consensus(
+                        pose_id,
+                        view_pairs,
+                        config,
+                        progress,
+                        completed,
+                        total_steps,
+                        cancelled,
+                    )
+                    completed += len(view_pairs)
+                    all_consensuses[(class_id, pose_id, station_id)] = consensus
+                    for pair in view_pairs:
+                        output_boxes[(class_id, pair.foreground.path)] = consensus.box
+                    pose_rows.extend(rows)
+                    ordered_pairs.extend(view_pairs)
+                row_pairs = zip(pose_rows, ordered_pairs, strict=True)
+
+            for row, pair in row_pairs:
+                station_id = pair.foreground.key.conveyor_station_id
                 row["class_id"] = class_id
                 row["class_name"] = source.name
                 row["source_directory"] = str(source.directory)
@@ -868,33 +1069,6 @@ def generate_obb_dataset(
                 row["conveyor_direction"] = pair.foreground.key.conveyor_direction
                 report_rows.append(row)
                 write_records.append((row, pair, class_id, source))
-
-    for class_id, source, pairs, _ in source_data:
-        del source
-        by_pose: dict[int, list[tuple[dict[str, object], MatchedPair, np.ndarray]]] = defaultdict(
-            list
-        )
-        rows_by_path = {
-            pair.foreground.path: row
-            for row, pair, record_class_id, _ in write_records
-            if record_class_id == class_id
-        }
-        for pair in pairs:
-            raw_box = all_consensuses[
-                (
-                    class_id,
-                    pair.foreground.key.pose_id,
-                    pair.foreground.key.conveyor_station_id,
-                )
-            ].box
-            by_pose[pair.foreground.key.pose_id].append(
-                (rows_by_path[pair.foreground.path], pair, raw_box)
-            )
-        for pose_id, entries in by_pose.items():
-            stabilized, summary = stabilize_boxes_by_conveyor_position(entries)
-            track_summaries[(class_id, pose_id)] = summary
-            for image_path, box in stabilized.items():
-                output_boxes[(class_id, image_path)] = box
 
     output = config.output_directory
     output.mkdir(parents=True, exist_ok=True)

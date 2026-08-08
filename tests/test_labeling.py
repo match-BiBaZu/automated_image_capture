@@ -154,6 +154,45 @@ def test_measured_conveyor_track_stabilizes_bad_single_box(tmp_path: Path) -> No
     assert entries[bad_index][0]["conveyor_track_used"] is True
 
 
+def test_measured_conveyor_track_interpolates_missing_segmentations(tmp_path: Path) -> None:
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray | None]] = []
+    missing = {0, 4, 9}
+    for index in range(10):
+        path = tmp_path / f"sample_{index}.png"
+        assert cv2.imwrite(str(path), np.zeros((240, 400), dtype=np.uint8))
+        key = CaptureKey(
+            pose_id=155,
+            panel_2=0,
+            panel_1=0,
+            exposure="auto",
+            robot_mode="angle",
+            conveyor_station_id=index,
+            conveyor_position_tenths_mm=index * 100,
+            conveyor_direction="out",
+        )
+        record = CaptureRecord(path, key, index, float(index * 10), float(index * 10))
+        pair = MatchedPair(record, record)
+        raw_box = None
+        if index not in missing:
+            raw_box = cv2.boxPoints(
+                ((70.0 + index * 12.0, 120.0), (70.0, 35.0), 12.0)
+            ).astype(np.float32)
+        entries.append(({"quality": "PASS", "quality_reason": ""}, pair, raw_box))
+
+    boxes, summary = stabilize_boxes_by_conveyor_position(entries)
+
+    assert summary.active
+    assert summary.tracked_images == 10
+    assert len(boxes) == 10
+    for index in missing:
+        row, pair, _ = entries[index]
+        assert boxes[pair.foreground.path].mean(axis=0)[0] == pytest.approx(
+            70.0 + index * 12.0, abs=5.0
+        )
+        assert row["quality"] == "REVIEW"
+        assert "interpoliert" in str(row["quality_reason"])
+
+
 def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) -> None:
     foreground = tmp_path / "parts_ramp"
     background = tmp_path / "empty_grid"

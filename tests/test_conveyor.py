@@ -8,7 +8,9 @@ from automated_image_capture.hardware.conveyor import (
     ConveyorAdapter,
     ConveyorWorker,
     effective_direction_sign,
+    expected_move_internal_position,
     full_steps_for_offset,
+    move_position_matches,
     signed_u32_delta,
     speed_in_full_steps,
 )
@@ -54,6 +56,41 @@ def test_direction_sign_respects_plc_reverse_setting() -> None:
     assert effective_direction_sign("left", False) == -1
     assert effective_direction_sign("right", True) == -1
     assert effective_direction_sign("left", True) == 1
+
+
+def test_move_completion_waits_for_actual_internal_endpoint() -> None:
+    move = ConveyorMove(
+        7,
+        150.0,
+        149.968,
+        455,
+        455,
+        15.0,
+        45.5,
+        "right",
+        start_internal_position=8002,
+    )
+    expected = 8002 + 455 * 64
+
+    assert expected_move_internal_position(move, False) == expected
+    assert not move_position_matches(move, expected - 19 * 64, False)
+    assert move_position_matches(move, expected - 2 * 64, False)
+
+
+def test_expected_move_endpoint_handles_reverse_and_u32_wrap() -> None:
+    move = ConveyorMove(
+        8,
+        10.0,
+        9.888,
+        30,
+        30,
+        10.0,
+        30.34,
+        "right",
+        start_internal_position=10,
+    )
+
+    assert expected_move_internal_position(move, True) == (10 - 30 * 64) % UINT32_MODULUS
 
 
 def test_conveyor_speed_is_clamped_to_plc_range() -> None:

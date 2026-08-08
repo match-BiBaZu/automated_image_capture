@@ -9,3 +9,19 @@ dist/
 *.egg-info/
 *.log
 *.pt
+
+# Locally generated captures, datasets, reviews, and training outputs
+/.diagnostics/
+/capture_*/
+/captures/
+/datasets/
+/images/
+/labels/
+/review/
+/runs/
+
+# Temporary working files
+/temp/
+/tmp/
+*.tmp
+*.temp

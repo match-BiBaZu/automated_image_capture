@@ -342,6 +342,7 @@ class ConveyorWorker(QObject):
                     )
                     if status.busy or status.status_code in {1, 2}:
                         self._saw_busy = True
+                        self._completion_feedback_wait_started = None
                     if self._requested_move is not None:
                         if status.error or status.status_code in {4, 5}:
                             failed = self._requested_move
