@@ -369,6 +369,28 @@ def _robot_status(
     )
 
 
+def test_preflight_explains_wrong_robot_program(tmp_path: Path) -> None:
+    controller, _camera, _robot, _light_1, _light_2 = _ready_controller()
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        robot_control_mode="angle",
+        angle_start_deg=15.5,
+        angle_end_deg=15.5,
+        light_1_start=0,
+        light_1_end=0,
+        light_2_start=0,
+        light_2_end=0,
+    )
+
+    checks = controller.preflight_checks(settings)
+    program = next(check for check in checks if check.key == "robot_program")
+
+    assert not program.ready
+    assert "BIBAZU_CONTINUOUS" in program.detail
+    assert "BiBaZu_GUI.urp" in program.detail
+    controller.close()
+
+
 def test_single_point_sequence_saves_png_and_yaml(qtbot, tmp_path: Path) -> None:
     camera = FakeCamera()
     robot = FakeRobot()

@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 from automated_image_capture.acquisition import (
     AcquisitionSettings,
+    PreflightCheck,
     build_capture_points,
 )
 from automated_image_capture.hardware.robot import ALLOWED_POSES
@@ -501,6 +502,14 @@ class AcquisitionCard(QGroupBox):
 
         self._running = False
         self._resume_available = False
+        self._preflight_ready = False
+        self._last_preflight: tuple[PreflightCheck, ...] | None = None
+        self.preflight = QLabel("Startfreigabe wird geprüft …")
+        self.preflight.setWordWrap(True)
+        self.preflight.setStyleSheet(
+            "background:#fef2f2; color:#991b1b; padding:7px; border-radius:4px;"
+        )
+        layout.addWidget(self.preflight)
         buttons = QGridLayout()
         self.configure_button = QPushButton("Aufnahme konfigurieren …")
         self.start_button = QPushButton("Aufnahme starten")
@@ -508,6 +517,7 @@ class AcquisitionCard(QGroupBox):
         self.stop_button = QPushButton("Aufnahme stoppen")
         self.align_button = QPushButton("Förderband auf Checkpoint ausrichten")
         self.align_button.setEnabled(False)
+        self.start_button.setEnabled(False)
         self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.configure_button.clicked.connect(self.configure_requested.emit)
@@ -569,13 +579,48 @@ class AcquisitionCard(QGroupBox):
     def set_running(self, running: bool) -> None:
         self._running = running
         self.configure_button.setEnabled(not running)
-        self.start_button.setEnabled(not running)
-        self.resume_button.setEnabled(not running and self._resume_available)
+        self.start_button.setEnabled(not running and self._preflight_ready)
+        self.resume_button.setEnabled(
+            not running and self._resume_available and self._preflight_ready
+        )
         self.stop_button.setEnabled(running)
 
     def set_resume_available(self, available: bool) -> None:
         self._resume_available = available
-        self.resume_button.setEnabled(available and not self._running)
+        self.resume_button.setEnabled(
+            available and not self._running and self._preflight_ready
+        )
+
+    def set_preflight(self, checks: tuple[PreflightCheck, ...]) -> None:
+        if checks == self._last_preflight:
+            return
+        self._last_preflight = checks
+        failed = [check for check in checks if not check.ready]
+        self._preflight_ready = bool(checks) and not failed
+        if self._preflight_ready:
+            self.preflight.setText(
+                f"✓ Startbereit – alle {len(checks)} Prüfungen sind erfüllt."
+            )
+            self.preflight.setStyleSheet(
+                "background:#ecfdf5; color:#166534; padding:7px; border-radius:4px;"
+            )
+            self.start_button.setToolTip("Alle Startbedingungen sind erfüllt.")
+        else:
+            problems = "\n".join(
+                f"• {check.label}: {check.detail}" for check in failed
+            )
+            self.preflight.setText(
+                f"✗ Start blockiert – {len(failed)} Punkt(e) fehlen:\n{problems}"
+            )
+            self.preflight.setStyleSheet(
+                "background:#fef2f2; color:#991b1b; padding:7px; border-radius:4px;"
+            )
+            first = failed[0].detail if failed else "Startprüfung noch nicht verfügbar."
+            self.start_button.setToolTip(first)
+        self.start_button.setEnabled(not self._running and self._preflight_ready)
+        self.resume_button.setEnabled(
+            not self._running and self._resume_available and self._preflight_ready
+        )
 
     def set_alignment_required(self, required: bool, expected: float, actual: float) -> None:
         self.align_button.setEnabled(required and not self._running)

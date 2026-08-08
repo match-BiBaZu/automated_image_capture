@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
             if self.acquisition.session_settings is not None:
                 self.acquisition_config = self.acquisition.session_settings
                 self.acquisition_card.set_settings(self.acquisition_config)
+        self._refresh_acquisition_preflight()
         self._append_event("Dashboard bereit. Es werden noch keine Geräte automatisch verbunden.")
 
     def _build_ui(self) -> None:
@@ -261,6 +262,7 @@ class MainWindow(QMainWindow):
             (self.light_2, self.light_2_card),
         ):
             adapter.state_changed.connect(card.set_state)
+            adapter.state_changed.connect(self._refresh_acquisition_preflight)
             adapter.event_message.connect(self._append_event)
             adapter.error.connect(
                 lambda message, name=adapter.display_name: self._show_error(name, message)
@@ -335,6 +337,7 @@ class MainWindow(QMainWindow):
     def _camera_status(self, status: CameraStatus) -> None:
         self._camera_status_data = status
         self.camera_card.set_status(status)
+        self._refresh_acquisition_preflight()
         fps = "–" if status.camera_fps is None else f"{status.camera_fps:.1f}"
         self.camera_card.details.setText(
             f"Modell: {status.model}\n"
@@ -543,6 +546,7 @@ class MainWindow(QMainWindow):
 
     def _robot_status(self, status: RobotStatus) -> None:
         self.robot_card.set_status(status)
+        self._refresh_acquisition_preflight()
         scaling = "–" if status.speed_scaling is None else f"{status.speed_scaling * 100:.0f} %"
         joints = (
             "–"
@@ -564,6 +568,7 @@ class MainWindow(QMainWindow):
 
     def _conveyor_status(self, status: ConveyorStatus) -> None:
         self.conveyor_card.set_status(status)
+        self._refresh_acquisition_preflight()
 
     def _jog_conveyor(self, direction: str) -> None:
         answer = QMessageBox.question(
@@ -583,6 +588,7 @@ class MainWindow(QMainWindow):
             self.conveyor.set_forward_direction(direction)
             self.config.conveyor_forward_direction = direction
         self.settings_store.save(self.config)
+        self._refresh_acquisition_preflight()
         if direction:
             self._append_event(
                 f"Förderband-Vorwärtsrichtung gespeichert: "
@@ -614,9 +620,11 @@ class MainWindow(QMainWindow):
 
     def _light_status(self, status: LightStatus) -> None:
         self._set_light_status(1, status)
+        self._refresh_acquisition_preflight()
 
     def _light_2_status(self, status: LightStatus) -> None:
         self._set_light_status(2, status)
+        self._refresh_acquisition_preflight()
 
     def _set_light_status(self, number: int, status: LightStatus) -> None:
         card = self.light_card if number == 1 else self.light_2_card
@@ -647,6 +655,7 @@ class MainWindow(QMainWindow):
         self.light_2.config = self.config
         self.statusBar().showMessage(f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}")
         self._append_event("Einstellungen gespeichert; sie gelten ab der nächsten Verbindung.")
+        self._refresh_acquisition_preflight()
 
     def open_labeling(self) -> None:
         dialog = LabelingDialog(self.settings_store, self)
@@ -680,9 +689,19 @@ class MainWindow(QMainWindow):
         self.acquisition_config = dialog.result_config
         self.settings_store.save_acquisition(self.acquisition_config)
         self.acquisition_card.set_settings(self.acquisition_config)
+        self._refresh_acquisition_preflight()
         self._append_event("Einstellungen für die automatische Aufnahme gespeichert.")
 
     def start_acquisition(self) -> None:
+        checks = self.acquisition.preflight_checks(self.acquisition_config)
+        self.acquisition_card.set_preflight(checks)
+        failed = [check for check in checks if not check.ready]
+        if failed:
+            self._acquisition_status(
+                "Start blockiert: "
+                + "; ".join(f"{check.label}: {check.detail}" for check in failed)
+            )
+            return
         count = len(build_capture_points(self.acquisition_config))
         moving_devices = "UR und Förderband" if self.acquisition_config.conveyor_enabled else "UR"
         interrupted = (
@@ -733,6 +752,14 @@ class MainWindow(QMainWindow):
             self.light_2_card,
         ):
             card.setEnabled(not running)
+        if not running:
+            self._refresh_acquisition_preflight()
+
+    def _refresh_acquisition_preflight(self, *_: object) -> None:
+        if self.acquisition.running:
+            return
+        checks = self.acquisition.preflight_checks(self.acquisition_config)
+        self.acquisition_card.set_preflight(checks)
 
     def _show_error(self, device: str, message: str) -> None:
         self.statusBar().showMessage(f"{device}: {message}", 10000)

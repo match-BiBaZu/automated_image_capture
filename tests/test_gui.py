@@ -6,7 +6,7 @@ import numpy as np
 from PyQt6.QtCore import QSettings
 from PyQt6.QtTest import QSignalSpy
 
-from automated_image_capture.acquisition import AcquisitionSettings
+from automated_image_capture.acquisition import AcquisitionSettings, PreflightCheck
 from automated_image_capture.inference import InferenceDetection, InferenceFrame
 from automated_image_capture.models import (
     CameraStatus,
@@ -163,6 +163,9 @@ def test_live_inference_result_updates_preview_and_status(qtbot, tmp_path) -> No
 
 def test_resume_button_is_only_enabled_for_interrupted_sequence(qtbot, tmp_path) -> None:
     window = make_window(qtbot, tmp_path)
+    window.acquisition_card.set_preflight(
+        (PreflightCheck("ready", "Test", True, "bereit"),)
+    )
 
     assert not window.acquisition_card.resume_button.isEnabled()
     window.acquisition_card.set_resume_available(True)
@@ -173,6 +176,27 @@ def test_resume_button_is_only_enabled_for_interrupted_sequence(qtbot, tmp_path)
     assert window.acquisition_card.resume_button.isEnabled()
     window.acquisition_card.set_resume_available(False)
     assert not window.acquisition_card.resume_button.isEnabled()
+
+
+def test_acquisition_card_lists_failed_preflight_checks(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+
+    window.acquisition_card.set_preflight(
+        (
+            PreflightCheck("camera", "Kamera", True, "verbunden"),
+            PreflightCheck(
+                "conveyor_origin",
+                "Förderband-Nullpunkt",
+                False,
+                "Aktuelle Position als 0 mm übernehmen",
+            ),
+        )
+    )
+
+    assert not window.acquisition_card.start_button.isEnabled()
+    assert "Start blockiert" in window.acquisition_card.preflight.text()
+    assert "Förderband-Nullpunkt" in window.acquisition_card.preflight.text()
+    assert "0 mm übernehmen" in window.acquisition_card.preflight.text()
 
 
 def test_acquisition_dialog_switches_to_persistable_ramp_settings(qtbot, tmp_path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -235,6 +236,14 @@ class CapturePoint:
     @property
     def conveyor_key(self) -> tuple[int, float, str]:
         return (self.conveyor_station_id, self.conveyor_offset_mm, self.conveyor_direction)
+
+
+@dataclass(slots=True, frozen=True)
+class PreflightCheck:
+    key: str
+    label: str
+    ready: bool
+    detail: str
 
 
 def triangle_brightness(elapsed_s: float, period_s: float) -> int:
@@ -961,76 +970,253 @@ class AcquisitionController(QObject):
             return False
 
     def _validate_hardware(self, settings: AcquisitionSettings) -> None:
-        if self.camera.state is not ConnectionState.CONNECTED:
-            raise RuntimeError("Die Kamera ist nicht verbunden.")
-        if self.light_1.state is not ConnectionState.CONNECTED:
-            raise RuntimeError("Licht 1 ist nicht verbunden.")
-        if self.light_2.state is not ConnectionState.CONNECTED:
-            raise RuntimeError("Licht 2 ist nicht verbunden.")
+        failed = [check for check in self.preflight_checks(settings) if not check.ready]
+        if failed:
+            details = "\n".join(f"• {check.label}: {check.detail}" for check in failed)
+            raise RuntimeError(f"Startfreigabe fehlt:\n{details}")
+
+    def preflight_checks(self, settings: AcquisitionSettings) -> tuple[PreflightCheck, ...]:
+        checks: list[PreflightCheck] = []
+        try:
+            settings = settings.validated()
+            image_count = len(build_capture_points(settings))
+            checks.append(
+                PreflightCheck(
+                    "configuration",
+                    "Aufnahmekonfiguration",
+                    image_count > 0,
+                    f"gültig, {image_count} Bilder geplant",
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                PreflightCheck(
+                    "configuration",
+                    "Aufnahmekonfiguration",
+                    False,
+                    str(exc) or type(exc).__name__,
+                )
+            )
+            return tuple(checks)
+
+        output = settings.output_directory.expanduser()
+        probe = output
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        output_ready = (not output.exists() or output.is_dir()) and probe.is_dir()
+        output_ready = output_ready and os.access(probe, os.W_OK)
+        checks.append(
+            PreflightCheck(
+                "output",
+                "Speicherort",
+                output_ready,
+                str(output) if output_ready else f"nicht beschreibbar: {output}",
+            )
+        )
+
+        camera_ready = self.camera.state is ConnectionState.CONNECTED
+        checks.append(
+            PreflightCheck(
+                "camera",
+                "Kamera",
+                camera_ready,
+                (
+                    f"verbunden ({self._camera_status.model or 'Modell unbekannt'})"
+                    if camera_ready
+                    else f"Status {self.camera.state.value}"
+                ),
+            )
+        )
+
         if settings.capture_mode == "ramp":
             configured_fps = float(
                 getattr(getattr(self.camera, "config", None), "preview_max_fps", 0)
             )
             observed_fps = float(self._camera_status.preview_fps or 0.0)
             target_fps = float(settings.ramp_image_rate_fps)
-            if configured_fps < target_fps:
-                raise RuntimeError(
-                    f"Die Kamera-Vorschau ist auf {configured_fps:g} FPS begrenzt; "
-                    f"für die Rampe werden {target_fps:g} FPS benötigt."
-                )
-            if observed_fps > 0 and observed_fps + 0.25 < target_fps:
-                raise RuntimeError(
-                    f"Die gemessene Kamera-Vorschau liefert nur {observed_fps:.1f} FPS; "
-                    f"für die Rampe werden {target_fps:g} FPS benötigt."
-                )
-        robot_ready = (
-            self._robot_status.rtde_connected
-            and self._robot_status.command_channel_connected
-            and self._robot_status.robot_mode.upper() == "RUNNING"
-            and self._robot_status.safety_mode.upper() in {"NORMAL", "REDUCED"}
-            and "PLAYING" in self._robot_status.program_state.upper()
-            and "BIBAZU" in self._robot_status.loaded_program.upper()
-            and self._robot_status.command_state_code in {1, 3, -1}
-        )
-        if not robot_ready:
-            raise RuntimeError("Der UR-Handshake ist nicht bereit oder BiBaZu_GUI läuft nicht.")
-        loaded_program = self._robot_status.loaded_program.upper()
-        if (
-            settings.robot_control_mode == RobotCommandMode.ANGLE.value
-            and "BIBAZU_CONTINUOUS" not in loaded_program
-        ):
-            raise RuntimeError(
-                "Für kontinuierliche Winkel muss BiBaZu_Continuous geladen und PLAYING sein."
+            fps_ready = configured_fps >= target_fps and (
+                observed_fps <= 0 or observed_fps + 0.25 >= target_fps
             )
-        if settings.conveyor_enabled:
-            if self.conveyor is None or self.conveyor.state is not ConnectionState.CONNECTED:
-                raise RuntimeError("Das Förderband ist nicht über TwinCAT ADS verbunden.")
-            conveyor = self.conveyor.status
-            if not conveyor.calibration_valid or conveyor.mm_per_full_step <= 0.0:
-                raise RuntimeError("Die Förderbandkalibrierung in der SPS ist ungültig.")
-            if conveyor.error or not conveyor.ready_to_execute:
-                raise RuntimeError("Der Förderbandantrieb ist nicht fahrbereit.")
-            if not self.conveyor.config.conveyor_forward_direction:
-                raise RuntimeError("Bitte zuerst die Vorwärtsrichtung des Förderbands bestätigen.")
-            if self.conveyor.origin_position is None and self._saved_conveyor_origin is None:
-                raise RuntimeError(
-                    "Bitte zuerst die aktuelle Förderbandposition als 0 mm übernehmen."
+            checks.append(
+                PreflightCheck(
+                    "camera_fps",
+                    "Kamera-Bildrate",
+                    fps_ready,
+                    (
+                        f"Soll {target_fps:g}, Vorschau {observed_fps:.1f}, "
+                        f"Limit {configured_fps:g} FPS"
+                    ),
                 )
+            )
+
         if settings.exposure_enabled:
-            if not self._camera_status.exposure_writable:
-                raise RuntimeError("Die Kamera erlaubt aktuell keine manuelle Belichtungszeit.")
             minimum = self._camera_status.exposure_min_us
             maximum = self._camera_status.exposure_max_us
             low = min(settings.exposure_start_us, settings.exposure_end_us)
             high = max(settings.exposure_start_us, settings.exposure_end_us)
-            if minimum is not None and low < minimum:
-                raise RuntimeError(
-                    f"Belichtungszeit liegt unter dem Kameraminimum {minimum:.0f} µs."
+            exposure_ready = self._camera_status.exposure_writable
+            exposure_ready = exposure_ready and (minimum is None or low >= minimum)
+            exposure_ready = exposure_ready and (maximum is None or high <= maximum)
+            limits = (
+                "unbekannt"
+                if minimum is None or maximum is None
+                else f"{minimum:.0f}–{maximum:.0f} µs"
+            )
+            checks.append(
+                PreflightCheck(
+                    "exposure",
+                    "Kamera-Belichtung",
+                    exposure_ready,
+                    f"gewählt {low}–{high} µs, Kamerabereich {limits}",
                 )
-            if maximum is not None and high > maximum:
-                raise RuntimeError(
-                    f"Belichtungszeit liegt über dem Kameramaximum {maximum:.0f} µs."
+            )
+
+        for key, label, adapter in (
+            ("light_1", "Licht 1", self.light_1),
+            ("light_2", "Licht 2", self.light_2),
+        ):
+            ready = adapter.state is ConnectionState.CONNECTED
+            checks.append(
+                PreflightCheck(
+                    key,
+                    label,
+                    ready,
+                    "verbunden" if ready else f"Status {adapter.state.value}",
                 )
+            )
+
+        robot = self._robot_status
+        rtde_ready = robot.rtde_connected and robot.command_channel_connected
+        checks.append(
+            PreflightCheck(
+                "robot_rtde",
+                "UR RTDE-Handshake",
+                rtde_ready,
+                (
+                    "Receive- und Registerkanal verbunden"
+                    if rtde_ready
+                    else "Receive- oder Registerkanal fehlt"
+                ),
+            )
+        )
+        mode_ready = robot.robot_mode.upper() == "RUNNING" and robot.safety_mode.upper() in {
+            "NORMAL",
+            "REDUCED",
+        }
+        checks.append(
+            PreflightCheck(
+                "robot_state",
+                "UR Betriebszustand",
+                mode_ready,
+                f"Robot {robot.robot_mode}, Safety {robot.safety_mode}",
+            )
+        )
+        loaded = robot.loaded_program.upper()
+        expected_program = (
+            "BIBAZU_CONTINUOUS"
+            if settings.robot_control_mode == RobotCommandMode.ANGLE.value
+            else "BIBAZU_GUI"
+        )
+        program_ready = (
+            "PLAYING" in robot.program_state.upper()
+            and expected_program in loaded
+            and robot.command_state_code in {1, 3, -1}
+        )
+        checks.append(
+            PreflightCheck(
+                "robot_program",
+                "UR-Programm",
+                program_ready,
+                (
+                    f"erwartet {expected_program}, geladen {robot.loaded_program}, "
+                    f"Status {robot.program_state}, Handshake {robot.command_state_code}"
+                ),
+            )
+        )
+
+        if settings.conveyor_enabled:
+            conveyor_connected = (
+                self.conveyor is not None
+                and self.conveyor.state is ConnectionState.CONNECTED
+            )
+            checks.append(
+                PreflightCheck(
+                    "conveyor_ads",
+                    "Förderband ADS",
+                    conveyor_connected,
+                    "verbunden" if conveyor_connected else "nicht verbunden",
+                )
+            )
+            conveyor = self.conveyor.status if self.conveyor is not None else ConveyorStatus()
+            calibration_ready = (
+                conveyor_connected
+                and conveyor.calibration_valid
+                and conveyor.mm_per_full_step > 0.0
+            )
+            checks.append(
+                PreflightCheck(
+                    "conveyor_calibration",
+                    "Förderbandkalibrierung",
+                    calibration_ready,
+                    (
+                        f"{conveyor.mm_per_full_step:.6f} mm/Vollschritt"
+                        if calibration_ready
+                        else "in der SPS ungültig oder nicht lesbar"
+                    ),
+                )
+            )
+            drive_ready = (
+                conveyor_connected
+                and conveyor.ready_to_execute
+                and not conveyor.busy
+                and not conveyor.error
+                and conveyor.status_code not in {4, 5}
+            )
+            checks.append(
+                PreflightCheck(
+                    "conveyor_drive",
+                    "Förderbandantrieb",
+                    drive_ready,
+                    (
+                        f"Ready {conveyor.ready_to_execute}, Busy {conveyor.busy}, "
+                        f"Fehler {conveyor.error}, SPS-Status {conveyor.status_code}"
+                    ),
+                )
+            )
+            direction = (
+                ""
+                if self.conveyor is None
+                else self.conveyor.config.conveyor_forward_direction
+            )
+            checks.append(
+                PreflightCheck(
+                    "conveyor_direction",
+                    "Förderbandrichtung",
+                    direction in {"left", "right"},
+                    (
+                        f"Vorwärts = {'Links' if direction == 'left' else 'Rechts'}"
+                        if direction in {"left", "right"}
+                        else "Links/Rechts als Vorwärtsrichtung bestätigen"
+                    ),
+                )
+            )
+            origin = None if self.conveyor is None else self.conveyor.origin_position
+            if origin is None:
+                origin = self._saved_conveyor_origin
+            checks.append(
+                PreflightCheck(
+                    "conveyor_origin",
+                    "Förderband-Nullpunkt",
+                    origin is not None,
+                    (
+                        f"SPS-Position {origin} als 0 mm gesetzt"
+                        if origin is not None
+                        else "Bauteil hinten platzieren und ‚Aktuelle Position = 0 mm‘ drücken"
+                    ),
+                )
+            )
+
+        return tuple(checks)
 
     def _with_conveyor_quantization(
         self,
