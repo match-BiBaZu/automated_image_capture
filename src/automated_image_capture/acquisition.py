@@ -29,6 +29,7 @@ from automated_image_capture.models import (
 )
 
 RAMP_BLE_COMMAND_TIMEOUT_SECONDS = LIGHT_COMMAND_TIMEOUT_SECONDS
+SYNCHRONIZED_FRAME_LATE_TOLERANCE_SECONDS = 1.5
 
 
 def ramp_command_timed_out(adapter: object) -> bool:
@@ -1587,14 +1588,7 @@ class AcquisitionController(QObject):
                 self._fail(f"Förderbandfehler (SPS-Status {status.status_code}).")
                 return
             sequence = self._pending_conveyor_sequence
-            started_sequence = status.requested_sequence
-            if (
-                started_sequence is None
-                and status.movement_started_at is not None
-                and status.last_move is not None
-            ):
-                started_sequence = status.last_move.sequence
-            if sequence is not None and started_sequence == sequence:
+            if sequence is not None and status.movement_started_sequence == sequence:
                 if self._phase == "sweep_out_start" and status.movement_started_at:
                     self._begin_sweep_timeline(status, "out")
                 elif self._phase == "sweep_back_start" and status.movement_started_at:
@@ -1983,10 +1977,12 @@ class AcquisitionController(QObject):
             if actual < planned:
                 return
             timing_error = actual - planned
-            if timing_error > 0.5:
+            if timing_error > SYNCHRONIZED_FRAME_LATE_TOLERANCE_SECONDS:
                 self._fail(
                     f"Kamerabild für Band-Sample {point.conveyor_station_id} kam "
-                    f"{timing_error * 1000:.0f} ms zu spät (maximal 500 ms)."
+                    f"{timing_error * 1000:.0f} ms zu spät "
+                    f"(maximal {SYNCHRONIZED_FRAME_LATE_TOLERANCE_SECONDS * 1000:.0f} ms; "
+                    f"Vorschau {self._camera_status.preview_fps:.1f} FPS)."
                 )
                 return
             conveyor_status = (
@@ -2195,6 +2191,7 @@ class AcquisitionController(QObject):
                     .astimezone()
                     .isoformat()
                 ),
+                "movement_started_sequence": conveyor.movement_started_sequence,
                 "position_sampled_at": (
                     None
                     if conveyor.sampled_at is None

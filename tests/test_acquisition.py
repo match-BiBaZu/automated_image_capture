@@ -494,6 +494,7 @@ class FakeConveyor(QObject):
         self.status.requested_sequence = sequence
         self.status.requested_offset_mm = offset
         self.status.movement_started_at = None
+        self.status.movement_started_sequence = None
         self.status.last_move = ConveyorMove(
             sequence,
             offset,
@@ -511,6 +512,7 @@ class FakeConveyor(QObject):
 
     def start_move(self) -> None:
         self.status.movement_started_at = time.time()
+        self.status.movement_started_sequence = self.status.requested_sequence
         self.status.busy = True
         self.status.status_code = 2
         self.status.sampled_at = time.time()
@@ -845,6 +847,13 @@ def test_synchronized_sweep_moves_out_and_back_while_capturing(qtbot, tmp_path: 
     conveyor.complete_move(2.0)
     qtbot.waitUntil(lambda: len(conveyor.requests) == 2, timeout=2000)
     assert conveyor.requests[1][1:] == pytest.approx((0.0, 2.0))
+    # A delayed idle status may still contain the outward start time. It must
+    # never be paired with the newly queued return move.
+    conveyor.status.movement_started_at = first_origin
+    conveyor.status.movement_started_sequence = conveyor.requests[0][0]
+    conveyor.status.requested_sequence = conveyor.requests[1][0]
+    conveyor.status_changed.emit(conveyor.status)
+    assert controller._phase == "sweep_back_start"
     conveyor.start_move()
     qtbot.waitUntil(lambda: controller._phase == "sweep_frame", timeout=2000)
     return_origin = controller._sweep_origin_wall

@@ -114,6 +114,7 @@ class ConveyorStatus:
     completed_internal_position: int | None = None
     completed_at: float | None = None
     movement_started_at: float | None = None
+    movement_started_sequence: int | None = None
     sampled_at: float | None = None
     position_feedback_verified: bool = False
     last_move: ConveyorMove | None = None
