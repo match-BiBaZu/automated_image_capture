@@ -303,11 +303,18 @@ class ConveyorControlCard(DeviceCard):
             else "ungültig"
         )
         internal = "–" if status.internal_position is None else str(status.internal_position)
+        drive_state = (
+            "Positioniermodus wird aktiviert"
+            if status.preparing_drive
+            else "bereit"
+            if status.ready_to_execute
+            else "Standby"
+        )
         self.details.setText(
             f"Kalibrierung: {calibration}\n"
-            f"Antrieb bereit/beschäftigt/Fehler: "
-            f"{'ja' if status.ready_to_execute else 'nein'} / "
-            f"{'ja' if status.busy else 'nein'} / {'ja' if status.error else 'nein'}\n"
+            f"Antrieb: {drive_state} · beschäftigt/Warning/Fehler: "
+            f"{'ja' if status.busy else 'nein'} / "
+            f"{'ja' if status.warning else 'nein'} / {'ja' if status.error else 'nein'}\n"
             f"SPS-Position: {internal} · logischer Offset: {offset} · Status {status.status_code}"
         )
         self._update_controls()
@@ -319,16 +326,19 @@ class ConveyorControlCard(DeviceCard):
     def _update_controls(self) -> None:
         if not hasattr(self, "left_button"):
             return
-        ready = (
+        controls_available = (
             self.state is ConnectionState.CONNECTED
             and self._status.calibration_valid
-            and self._status.ready_to_execute
             and not self._status.busy
+            and not self._status.preparing_drive
             and not self._status.error
+            and self._status.status_code not in {4, 5}
         )
-        self.left_button.setEnabled(ready)
-        self.right_button.setEnabled(ready)
-        self.origin_button.setEnabled(ready and self._status.internal_position is not None)
+        self.left_button.setEnabled(controls_available)
+        self.right_button.setEnabled(controls_available)
+        self.origin_button.setEnabled(
+            controls_available and self._status.internal_position is not None
+        )
         self.forward_direction.setEnabled(not self._status.busy)
         self.stop_button.setEnabled(self.state is ConnectionState.CONNECTED)
 

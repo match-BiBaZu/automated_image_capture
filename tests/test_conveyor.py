@@ -71,7 +71,7 @@ class FakePlc:
         return {name: "no error" for name in values}
 
 
-def test_worker_sends_one_calibrated_relative_move_batch() -> None:
+def test_worker_enables_drive_before_sending_relative_move() -> None:
     plc = FakePlc()
     worker = ConveyorWorker(AppSettings())
     move = ConveyorMove(7, 10.0, 9.888, 30, 30, 10.0, 30.34, "right")
@@ -82,11 +82,34 @@ def test_worker_sends_one_calibrated_relative_move_batch() -> None:
         {
             "MAIN.GuiConveyorEnabled": False,
             "MAIN.GuiConveyorCalibrationMode": True,
+        }
+    ]
+    assert not worker._move_command_sent
+
+    worker._issue_move_command(plc, object())
+
+    assert plc.writes[1] == {
             "MAIN.GuiCalibrationJogSteps": 30,
             "MAIN.GuiCalibrationJogSpeedFullStepsPerSec": 30.34,
             "MAIN.GuiCalibrationMoveRight": True,
-        }
-    ]
+    }
+    assert worker._move_command_sent
+
+
+def test_worker_stop_disables_positioning_mode() -> None:
+    plc = FakePlc()
+    worker = ConveyorWorker(AppSettings())
+    move = ConveyorMove(7, 10.0, 9.888, 30, 30, 10.0, 30.34, "right")
+    worker._handle_command(plc, "move", move, object())
+
+    worker._handle_command(plc, "stop", None, object())
+
+    assert plc.writes[-1] == {
+        "MAIN.GuiCalibrationStop": True,
+        "MAIN.GuiConveyorCalibrationMode": False,
+        "MAIN.GuiConveyorEnabled": False,
+    }
+    assert worker._requested_move is None
 
 
 def test_adapter_computes_each_target_from_origin_not_previous_rounding() -> None:

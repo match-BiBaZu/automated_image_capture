@@ -24,6 +24,7 @@ from automated_image_capture.models import (
     CameraFrame,
     CameraStatus,
     ConnectionState,
+    ConveyorStatus,
     LightStatus,
     RobotStatus,
 )
@@ -388,6 +389,45 @@ def test_preflight_explains_wrong_robot_program(tmp_path: Path) -> None:
     assert not program.ready
     assert "BIBAZU_CONTINUOUS" in program.detail
     assert "BiBaZu_GUI.urp" in program.detail
+    controller.close()
+
+
+def test_preflight_accepts_conveyor_standby_before_drive_enable(tmp_path: Path) -> None:
+    controller, _camera, _robot, _light_1, _light_2 = _ready_controller()
+    controller.conveyor = SimpleNamespace(
+        state=ConnectionState.CONNECTED,
+        status=ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=0.32960026,
+            ready_to_execute=False,
+            warning=True,
+            error=False,
+            busy=False,
+            status_code=0,
+            internal_position=1234,
+        ),
+        config=SimpleNamespace(conveyor_forward_direction="right"),
+        origin_position=1234,
+    )
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        conveyor_enabled=True,
+        pose_start=155,
+        pose_end=155,
+        light_1_start=0,
+        light_1_end=0,
+        light_2_start=0,
+        light_2_end=0,
+    )
+
+    drive = next(
+        check for check in controller.preflight_checks(settings)
+        if check.key == "conveyor_drive"
+    )
+
+    assert drive.ready
+    assert "Positioniermodus" in drive.detail
     controller.close()
 
 

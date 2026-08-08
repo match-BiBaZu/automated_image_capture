@@ -580,6 +580,7 @@ class AcquisitionController(QObject):
         robot.status_changed.connect(self._on_robot_status)
         if conveyor is not None:
             conveyor.status_changed.connect(self._on_conveyor_status)
+            conveyor.move_failed.connect(self._on_conveyor_move_failed)
         light_1.status_changed.connect(lambda status: self._on_light_status(0, status))
         light_2.status_changed.connect(lambda status: self._on_light_status(1, status))
         self.writer.saved.connect(self._on_saved)
@@ -1167,20 +1168,27 @@ class AcquisitionController(QObject):
             )
             drive_ready = (
                 conveyor_connected
-                and conveyor.ready_to_execute
                 and not conveyor.busy
                 and not conveyor.error
                 and conveyor.status_code not in {4, 5}
             )
+            if conveyor.ready_to_execute:
+                drive_detail = "bereit für Fahrauftrag"
+            elif drive_ready:
+                drive_detail = (
+                    "Standby – der Positioniermodus wird vor der ersten Fahrt aktiviert"
+                )
+            else:
+                drive_detail = (
+                    f"Ready {conveyor.ready_to_execute}, Busy {conveyor.busy}, "
+                    f"Fehler {conveyor.error}, SPS-Status {conveyor.status_code}"
+                )
             checks.append(
                 PreflightCheck(
                     "conveyor_drive",
                     "Förderbandantrieb",
                     drive_ready,
-                    (
-                        f"Ready {conveyor.ready_to_execute}, Busy {conveyor.busy}, "
-                        f"Fehler {conveyor.error}, SPS-Status {conveyor.status_code}"
-                    ),
+                    drive_detail,
                 )
             )
             direction = (
@@ -1445,6 +1453,16 @@ class AcquisitionController(QObject):
                 self._prepare_point,
                 "conveyor_settle",
             )
+
+    def _on_conveyor_move_failed(self, sequence: int, message: str) -> None:
+        if self._pending_conveyor_sequence != sequence:
+            return
+        self._pending_conveyor_sequence = None
+        if self._alignment_required:
+            self.error.emit(f"Korrekturfahrt fehlgeschlagen: {message}")
+            return
+        if self._running:
+            self._fail(message)
 
     def _on_light_status(self, index: int, status: object) -> None:
         if not isinstance(status, LightStatus):

@@ -95,10 +95,15 @@ class ConveyorStatus:
     mm_per_full_step: float = 0.0
     ready_to_execute: bool = False
     busy: bool = False
+    warning: bool = False
     error: bool = False
     status_code: int = 0
     internal_position: int | None = None
     conveyor_reverse: bool = False
+    control_enabled: bool = False
+    preparing_drive: bool = False
+    wc_state: bool = False
+    info_data_state: int = 0
     forward_direction: str = ""
     origin_position: int | None = None
     logical_offset_mm: float | None = None

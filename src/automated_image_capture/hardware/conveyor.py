@@ -16,6 +16,7 @@ from automated_image_capture.settings import AppSettings
 PLC_PORT_TC3 = 851
 ADS_TIMEOUT_MS = 500
 ADS_RECONNECT_SECONDS = 2.0
+DRIVE_ENABLE_TIMEOUT_SECONDS = 5.0
 IDLE_POLL_SECONDS = 0.5
 ACTIVE_POLL_SECONDS = 0.1
 INCREMENTS_PER_FULL_STEP = 64
@@ -26,7 +27,11 @@ STATUS_SYMBOLS = {
     "MAIN.CalibrationError": "error",
     "MAIN.CalibrationStatusCode": "status_code",
     "MAIN.StepperPosReadyToExecute": "ready_to_execute",
+    "MAIN.StepperPosWarning": "warning",
     "MAIN.StepperInternalPosition": "internal_position",
+    "MAIN.StepperControlEnable": "control_enabled",
+    "MAIN.StepperWcState": "wc_state",
+    "MAIN.StepperInfoDataState": "info_data_state",
     "MAIN.GuiConveyorMmPerFullStep": "mm_per_full_step",
     "MAIN.GuiConveyorCalibrationValid": "calibration_valid",
     "MAIN.GuiConveyorReverse": "conveyor_reverse",
@@ -78,6 +83,7 @@ class ConveyorWorker(QObject):
     status_changed = pyqtSignal(object)
     error = pyqtSignal(str)
     event_message = pyqtSignal(str)
+    move_failed = pyqtSignal(int, str)
     finished = pyqtSignal()
 
     def __init__(self, config: AppSettings) -> None:
@@ -91,6 +97,8 @@ class ConveyorWorker(QObject):
         self._completed_at: float | None = None
         self._saw_busy = False
         self._move_not_before = 0.0
+        self._move_command_sent = False
+        self._enable_deadline = 0.0
 
     def enqueue_move(self, move: ConveyorMove) -> None:
         self._commands.put(("move", move))
@@ -125,42 +133,74 @@ class ConveyorWorker(QObject):
 
     def _handle_command(self, plc: Any, command: str, payload: object | None, pyads: Any) -> None:
         if command == "stop":
-            self._write_values(plc, {"MAIN.GuiCalibrationStop": True}, pyads)
+            self._write_values(plc, self._safe_values(), pyads)
+            self._requested_move = None
+            self._move_command_sent = False
             self.event_message.emit("Förderband-Stop an die SPS gesendet.")
             return
         if command == "release":
             self._write_values(plc, self._safe_values(), pyads)
             self._requested_move = None
             self._saw_busy = False
+            self._move_command_sent = False
             self.event_message.emit("Förderbandsteuerung freigegeben und gestoppt.")
             return
         if command != "move" or not isinstance(payload, ConveyorMove):
             return
         if self._requested_move is not None:
             raise RuntimeError("Eine Förderbandfahrt ist bereits aktiv.")
-        direction_symbol = (
-            "MAIN.GuiCalibrationMoveLeft"
-            if payload.plc_direction == "left"
-            else "MAIN.GuiCalibrationMoveRight"
-        )
         self._write_values(
             plc,
             {
                 "MAIN.GuiConveyorEnabled": False,
                 "MAIN.GuiConveyorCalibrationMode": True,
-                "MAIN.GuiCalibrationJogSteps": abs(payload.delta_full_steps),
-                "MAIN.GuiCalibrationJogSpeedFullStepsPerSec": payload.speed_full_steps_per_s,
-                direction_symbol: True,
             },
             pyads,
         )
         self._requested_move = payload
         self._saw_busy = False
+        self._move_command_sent = False
+        self._enable_deadline = time.monotonic() + DRIVE_ENABLE_TIMEOUT_SECONDS
+        self.event_message.emit(
+            f"Aktiviere Positioniermodus für Förderbandfahrt #{payload.sequence} …"
+        )
+
+    def _issue_move_command(self, plc: Any, pyads: Any) -> None:
+        move = self._requested_move
+        if move is None:
+            return
+        direction_symbol = (
+            "MAIN.GuiCalibrationMoveLeft"
+            if move.plc_direction == "left"
+            else "MAIN.GuiCalibrationMoveRight"
+        )
+        self._write_values(
+            plc,
+            {
+                "MAIN.GuiCalibrationJogSteps": abs(move.delta_full_steps),
+                "MAIN.GuiCalibrationJogSpeedFullStepsPerSec": move.speed_full_steps_per_s,
+                direction_symbol: True,
+            },
+            pyads,
+        )
+        self._move_command_sent = True
         self._move_not_before = time.monotonic() + 0.05
         self.event_message.emit(
-            f"Fahrt #{payload.sequence}: {payload.requested_offset_mm:g} mm "
-            f"({abs(payload.delta_full_steps)} Vollschritte, {payload.plc_direction})."
+            f"Fahrt #{move.sequence}: {move.requested_offset_mm:g} mm "
+            f"({abs(move.delta_full_steps)} Vollschritte, {move.plc_direction})."
         )
+
+    def _fail_move(self, plc: Any, pyads: Any, message: str) -> None:
+        move = self._requested_move
+        try:
+            self._write_values(plc, self._safe_values(), pyads)
+        except Exception:
+            pass
+        self._requested_move = None
+        self._move_command_sent = False
+        self._saw_busy = False
+        if move is not None:
+            self.move_failed.emit(move.sequence, message)
 
     @pyqtSlot()
     def run(self) -> None:
@@ -224,11 +264,18 @@ class ConveyorWorker(QObject):
                         calibration_valid=bool(values["MAIN.GuiConveyorCalibrationValid"]),
                         mm_per_full_step=float(values["MAIN.GuiConveyorMmPerFullStep"]),
                         ready_to_execute=bool(values["MAIN.StepperPosReadyToExecute"]),
+                        warning=bool(values["MAIN.StepperPosWarning"]),
                         busy=bool(values["MAIN.CalibrationBusy"]),
                         error=bool(values["MAIN.CalibrationError"]),
                         status_code=int(values["MAIN.CalibrationStatusCode"]),
                         internal_position=int(values["MAIN.StepperInternalPosition"]),
                         conveyor_reverse=bool(values["MAIN.GuiConveyorReverse"]),
+                        control_enabled=bool(values["MAIN.StepperControlEnable"]),
+                        preparing_drive=(
+                            self._requested_move is not None and not self._move_command_sent
+                        ),
+                        wc_state=bool(values["MAIN.StepperWcState"]),
+                        info_data_state=int(values["MAIN.StepperInfoDataState"]),
                         requested_offset_mm=(
                             None
                             if self._requested_move is None
@@ -252,12 +299,32 @@ class ConveyorWorker(QObject):
                     if self._requested_move is not None:
                         if status.error or status.status_code in {4, 5}:
                             failed = self._requested_move
-                            self._requested_move = None
-                            self._saw_busy = False
-                            self.error.emit(
+                            self._fail_move(
+                                plc,
+                                pyads,
                                 f"Förderbandfahrt #{failed.sequence} von der SPS abgelehnt "
-                                f"(Status {status.status_code})."
+                                f"(Status {status.status_code}).",
                             )
+                            status.requested_sequence = None
+                            status.requested_offset_mm = None
+                            status.actual_target_offset_mm = None
+                            status.preparing_drive = False
+                        elif not self._move_command_sent:
+                            if status.ready_to_execute:
+                                self._issue_move_command(plc, pyads)
+                            elif time.monotonic() >= self._enable_deadline:
+                                self._fail_move(
+                                    plc,
+                                    pyads,
+                                    "Der Förderbandantrieb wurde nach Aktivierung des "
+                                    "Positioniermodus nicht innerhalb von 5 Sekunden bereit. "
+                                    f"Warning={status.warning}, Error={status.error}, "
+                                    f"InfoData-State={status.info_data_state}.",
+                                )
+                                status.requested_sequence = None
+                                status.requested_offset_mm = None
+                                status.actual_target_offset_mm = None
+                                status.preparing_drive = False
                         elif (
                             status.status_code == 3
                             and not status.busy
@@ -274,6 +341,7 @@ class ConveyorWorker(QObject):
                                 f"Förderbandfahrt #{self._completed_sequence} abgeschlossen."
                             )
                             self._requested_move = None
+                            self._move_command_sent = False
                             self._saw_busy = False
                     self.status_changed.emit(status)
                     self.state_changed.emit(ConnectionState.CONNECTED)
@@ -311,6 +379,8 @@ class ConveyorWorker(QObject):
 
 
 class ConveyorAdapter(DeviceAdapter):
+    move_failed = pyqtSignal(int, str)
+
     def __init__(self, config: AppSettings, parent: QObject | None = None) -> None:
         super().__init__("Förderband", parent)
         self.config = config
@@ -337,6 +407,7 @@ class ConveyorAdapter(DeviceAdapter):
         self._thread.started.connect(self._worker.run)
         self._worker.state_changed.connect(self._set_state)
         self._worker.status_changed.connect(self._on_status)
+        self._worker.move_failed.connect(self._on_move_failed)
         self._worker.error.connect(self._emit_error)
         self._worker.event_message.connect(self._emit_event)
         self._worker.finished.connect(self._thread.quit)
@@ -409,6 +480,14 @@ class ConveyorAdapter(DeviceAdapter):
             self._status.requested_sequence = None
         self._decorate_status()
         self.status_changed.emit(replace(self._status))
+
+    @pyqtSlot(int, str)
+    def _on_move_failed(self, sequence: int, message: str) -> None:
+        if self._status.requested_sequence == sequence:
+            self._status.requested_sequence = None
+        self._status.preparing_drive = False
+        self.move_failed.emit(sequence, message)
+        self._emit_error(message)
 
     def _ready_worker(self) -> ConveyorWorker | None:
         if (
@@ -487,6 +566,7 @@ class ConveyorAdapter(DeviceAdapter):
         self._status.requested_offset_mm = move.requested_offset_mm
         self._status.actual_target_offset_mm = move.actual_offset_mm
         self._status.last_move = move
+        self._status.preparing_drive = True
         self.status_changed.emit(replace(self._status))
         worker.enqueue_move(move)
         return move.sequence
@@ -526,6 +606,7 @@ class ConveyorAdapter(DeviceAdapter):
         )
         self._status.requested_sequence = move.sequence
         self._status.last_move = move
+        self._status.preparing_drive = True
         self.status_changed.emit(replace(self._status))
         worker.enqueue_move(move)
         return move.sequence
