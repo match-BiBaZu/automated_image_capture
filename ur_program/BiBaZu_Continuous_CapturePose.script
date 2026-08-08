@@ -1,0 +1,5 @@
+def BiBaZu_Continuous_CapturePose():
+  global rotation_position = get_actual_tcp_pose()
+end
+
+BiBaZu_Continuous_CapturePose()

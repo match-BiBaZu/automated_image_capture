@@ -30,7 +30,14 @@ from automated_image_capture.acquisition import (
     build_capture_points,
 )
 from automated_image_capture.hardware.robot import ALLOWED_POSES
-from automated_image_capture.models import CameraStatus, ConnectionState, LightStatus, RobotStatus
+from automated_image_capture.models import (
+    CameraStatus,
+    ConnectionState,
+    ConveyorStatus,
+    LightStatus,
+    RobotCommandMode,
+    RobotStatus,
+)
 from automated_image_capture.settings import AppSettings
 
 STATE_COLORS = {
@@ -206,7 +213,8 @@ class RobotPoseControlCard(DeviceCard):
         if not hasattr(self, "move_button"):
             return
         program_running = "PLAYING" in self._status.program_state.upper()
-        correct_program = "BIBAZU" in self._status.loaded_program.upper()
+        loaded_program = self._status.loaded_program.upper()
+        correct_program = "BIBAZU" in loaded_program and "CONTINUOUS" not in loaded_program
         handshake_ready = self._status.command_state_code in {1, 3, -1}
         safe_mode = self._status.safety_mode.upper() in {"NORMAL", "REDUCED"}
         can_request = (
@@ -229,6 +237,99 @@ class RobotPoseControlCard(DeviceCard):
         pose = int(self.pose_selector.currentData())
         self.motion_consent.setChecked(False)
         self.pose_requested.emit(pose)
+
+
+class ConveyorControlCard(DeviceCard):
+    jog_requested = pyqtSignal(str)
+    stop_requested = pyqtSignal()
+    origin_requested = pyqtSignal()
+    forward_direction_changed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        title: str,
+        forward_direction: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(title, parent)
+        self._status = ConveyorStatus(forward_direction=forward_direction)
+        warning = QLabel(
+            "Förderbandbewegungen sind reale Maschinenbewegungen. "
+            "Vor Testfahrten Arbeitsraum prüfen."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color:#b45309; font-weight:600;")
+        self.content_layout.addWidget(warning)
+
+        direction_row = QHBoxLayout()
+        self.left_button = QPushButton("← 1 mm")
+        self.stop_button = QPushButton("Stop")
+        self.right_button = QPushButton("1 mm →")
+        self.left_button.clicked.connect(lambda: self.jog_requested.emit("left"))
+        self.right_button.clicked.connect(lambda: self.jog_requested.emit("right"))
+        self.stop_button.clicked.connect(self.stop_requested.emit)
+        direction_row.addWidget(self.left_button)
+        direction_row.addWidget(self.stop_button)
+        direction_row.addWidget(self.right_button)
+        self.content_layout.addLayout(direction_row)
+
+        mapping_row = QHBoxLayout()
+        mapping_row.addWidget(QLabel("Vorwärtsrichtung"))
+        self.forward_direction = QComboBox()
+        self.forward_direction.addItem("Bitte testen …", "")
+        self.forward_direction.addItem("Links ist vorwärts", "left")
+        self.forward_direction.addItem("Rechts ist vorwärts", "right")
+        self.forward_direction.setCurrentIndex(
+            max(0, self.forward_direction.findData(forward_direction))
+        )
+        self.forward_direction.currentIndexChanged.connect(
+            lambda: self.forward_direction_changed.emit(str(self.forward_direction.currentData()))
+        )
+        mapping_row.addWidget(self.forward_direction, 1)
+        self.content_layout.addLayout(mapping_row)
+
+        self.origin_button = QPushButton("Aktuelle Position = 0 mm")
+        self.origin_button.clicked.connect(self.origin_requested.emit)
+        self.content_layout.addWidget(self.origin_button)
+        self._update_controls()
+
+    def set_status(self, status: ConveyorStatus) -> None:
+        self._status = status
+        offset = "–" if status.logical_offset_mm is None else f"{status.logical_offset_mm:.3f} mm"
+        calibration = (
+            f"gültig · {status.mm_per_full_step:.8f} mm/Vollschritt"
+            if status.calibration_valid
+            else "ungültig"
+        )
+        internal = "–" if status.internal_position is None else str(status.internal_position)
+        self.details.setText(
+            f"Kalibrierung: {calibration}\n"
+            f"Antrieb bereit/beschäftigt/Fehler: "
+            f"{'ja' if status.ready_to_execute else 'nein'} / "
+            f"{'ja' if status.busy else 'nein'} / {'ja' if status.error else 'nein'}\n"
+            f"SPS-Position: {internal} · logischer Offset: {offset} · Status {status.status_code}"
+        )
+        self._update_controls()
+
+    def set_state(self, state: ConnectionState) -> None:
+        super().set_state(state)
+        self._update_controls()
+
+    def _update_controls(self) -> None:
+        if not hasattr(self, "left_button"):
+            return
+        ready = (
+            self.state is ConnectionState.CONNECTED
+            and self._status.calibration_valid
+            and self._status.ready_to_execute
+            and not self._status.busy
+            and not self._status.error
+        )
+        self.left_button.setEnabled(ready)
+        self.right_button.setEnabled(ready)
+        self.origin_button.setEnabled(ready and self._status.internal_position is not None)
+        self.forward_direction.setEnabled(not self._status.busy)
+        self.stop_button.setEnabled(self.state is ConnectionState.CONNECTED)
 
 
 class LabeledSlider(QWidget):
@@ -389,6 +490,7 @@ class AcquisitionCard(QGroupBox):
     start_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     stop_requested = pyqtSignal()
+    align_conveyor_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Automatisierte Bildaufnahme", parent)
@@ -404,16 +506,20 @@ class AcquisitionCard(QGroupBox):
         self.start_button = QPushButton("Aufnahme starten")
         self.resume_button = QPushButton("Aufnahme fortsetzen")
         self.stop_button = QPushButton("Aufnahme stoppen")
+        self.align_button = QPushButton("Förderband auf Checkpoint ausrichten")
+        self.align_button.setEnabled(False)
         self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.configure_button.clicked.connect(self.configure_requested.emit)
         self.start_button.clicked.connect(self.start_requested.emit)
         self.resume_button.clicked.connect(self.resume_requested.emit)
         self.stop_button.clicked.connect(self.stop_requested.emit)
+        self.align_button.clicked.connect(self.align_conveyor_requested.emit)
         buttons.addWidget(self.configure_button, 0, 0)
         buttons.addWidget(self.start_button, 0, 1)
         buttons.addWidget(self.resume_button, 1, 0)
         buttons.addWidget(self.stop_button, 1, 1)
+        buttons.addWidget(self.align_button, 2, 0, 1, 2)
         layout.addLayout(buttons)
 
         self.progress = QProgressBar()
@@ -426,6 +532,18 @@ class AcquisitionCard(QGroupBox):
 
     def set_settings(self, settings: AcquisitionSettings) -> None:
         count = len(build_capture_points(settings))
+        robot = (
+            f"UR-Winkel {settings.angle_start_deg:g}–{settings.angle_end_deg:g}° "
+            f"in {settings.angle_step_deg:g}°-Schritten"
+            if settings.robot_control_mode == RobotCommandMode.ANGLE.value
+            else f"UR-Pose {settings.pose_start} bis {settings.pose_end}"
+        )
+        belt = (
+            f" · Förderband 0–{settings.conveyor_max_offset_mm:g}–0 mm / "
+            f"{settings.conveyor_step_mm:g} mm"
+            if settings.conveyor_enabled
+            else " · Förderband aus"
+        )
         exposure = (
             f" · Belichtung {settings.exposure_start_us}–{settings.exposure_end_us} µs"
             if settings.exposure_enabled
@@ -444,7 +562,7 @@ class AcquisitionCard(QGroupBox):
                 f"Panel 2 {settings.light_2_start}–{settings.light_2_end} %"
             )
         self.summary.setText(
-            f"{mode}\nUR-Pose {settings.pose_start} bis {settings.pose_end}{exposure}\n"
+            f"{mode}\n{robot}{belt}{exposure}\n"
             f"{count} Bilder · Ziel: {settings.output_directory}"
         )
 
@@ -458,6 +576,15 @@ class AcquisitionCard(QGroupBox):
     def set_resume_available(self, available: bool) -> None:
         self._resume_available = available
         self.resume_button.setEnabled(available and not self._running)
+
+    def set_alignment_required(self, required: bool, expected: float, actual: float) -> None:
+        self.align_button.setEnabled(required and not self._running)
+        if required:
+            self.align_button.setText(
+                f"Förderband ausrichten: Ist {actual:.3f} mm → Soll {expected:g} mm"
+            )
+        else:
+            self.align_button.setText("Förderband auf Checkpoint ausrichten")
 
     def set_progress(self, current: int, total: int) -> None:
         self.progress.setRange(0, max(1, total))
@@ -500,8 +627,22 @@ class AcquisitionDialog(QDialog):
         self.ranges_form = ranges_form
         self.pose_start = self._pose_combo(config.pose_start)
         self.pose_end = self._pose_combo(config.pose_end)
-        ranges_form.addRow("UR Startpose", self.pose_start)
-        ranges_form.addRow("UR Endpose", self.pose_end)
+        self.robot_control_mode = QComboBox()
+        self.robot_control_mode.addItem("Feste Pose-IDs", RobotCommandMode.POSE_ID.value)
+        self.robot_control_mode.addItem(
+            "Kontinuierlicher Winkel (BiBaZu_Continuous)", RobotCommandMode.ANGLE.value
+        )
+        self.robot_control_mode.setCurrentIndex(
+            max(0, self.robot_control_mode.findData(config.robot_control_mode))
+        )
+        ranges_form.addRow("UR-Steuerung", self.robot_control_mode)
+        self.pose_row = self._row_widget(self.pose_start, self.pose_end)
+        ranges_form.addRow("UR Startpose / Endpose", self.pose_row)
+        self.angle_start = self._double_spin(15.5, 21.0, config.angle_start_deg, "°")
+        self.angle_end = self._double_spin(15.5, 21.0, config.angle_end_deg, "°")
+        self.angle_step = self._double_spin(0.1, 5.5, config.angle_step_deg, "°")
+        self.angle_row = self._row_widget(self.angle_start, self.angle_end, self.angle_step)
+        ranges_form.addRow("UR-Winkel Start / Ende / Schritt", self.angle_row)
 
         self.light_1_start, self.light_1_end, self.light_1_step = self._range_row(
             0, 100, config.light_1_start, config.light_1_end, config.light_1_step, "%"
@@ -561,6 +702,31 @@ class AcquisitionDialog(QDialog):
         self.exposure_enabled.toggled.connect(self._update_exposure_controls)
         layout.addWidget(ranges)
 
+        self.conveyor_group = QGroupBox("Förderbandvariation")
+        conveyor_form = QFormLayout(self.conveyor_group)
+        self.conveyor_enabled = QCheckBox("Bauteilposition über das Förderband variieren")
+        self.conveyor_enabled.setChecked(config.conveyor_enabled)
+        self.conveyor_max_offset = self._double_spin(
+            0.0, 5000.0, config.conveyor_max_offset_mm, " mm"
+        )
+        self.conveyor_step = self._double_spin(0.1, 5000.0, config.conveyor_step_mm, " mm")
+        self.conveyor_speed = self._double_spin(
+            0.1, 5000.0, config.conveyor_speed_mm_per_s, " mm/s"
+        )
+        self.conveyor_settle = self._spin(0, 10_000, config.conveyor_settle_ms, " ms")
+        conveyor_form.addRow(self.conveyor_enabled)
+        conveyor_form.addRow("Maximaler Offset", self.conveyor_max_offset)
+        conveyor_form.addRow("Schrittweite", self.conveyor_step)
+        conveyor_form.addRow("Geschwindigkeit", self.conveyor_speed)
+        conveyor_form.addRow("Beruhigungszeit", self.conveyor_settle)
+        conveyor_note = QLabel(
+            "Reihenfolge je UR-Ziel: 0 → Maximum → 0 mm. An Hin- und Rückwegpositionen "
+            "werden getrennte Bildserien aufgenommen."
+        )
+        conveyor_note.setWordWrap(True)
+        conveyor_form.addRow(conveyor_note)
+        layout.addWidget(self.conveyor_group)
+
         self.ramp_group = QGroupBox("Schnelle zeitbasierte Licht-Rampe")
         ramp_form = QFormLayout(self.ramp_group)
         self.ramp_duration = self._double_spin(2.0, 120.0, config.ramp_duration_s, " s")
@@ -595,6 +761,14 @@ class AcquisitionDialog(QDialog):
         for control in (
             self.pose_start,
             self.pose_end,
+            self.robot_control_mode,
+            self.angle_start,
+            self.angle_end,
+            self.angle_step,
+            self.conveyor_max_offset,
+            self.conveyor_step,
+            self.conveyor_speed,
+            self.conveyor_settle,
             self.light_1_start,
             self.light_1_end,
             self.light_1_step,
@@ -612,9 +786,15 @@ class AcquisitionDialog(QDialog):
             signal = getattr(control, "valueChanged", None) or control.currentIndexChanged
             signal.connect(self._update_estimate)
         self.exposure_enabled.toggled.connect(self._update_estimate)
+        self.conveyor_enabled.toggled.connect(self._update_conveyor_controls)
+        self.conveyor_enabled.toggled.connect(self._update_estimate)
+        self.robot_control_mode.currentIndexChanged.connect(self._update_robot_controls)
+        self.robot_control_mode.currentIndexChanged.connect(self._update_estimate)
         self.capture_mode.currentIndexChanged.connect(self._update_mode_controls)
         self.capture_mode.currentIndexChanged.connect(self._update_estimate)
         self._update_exposure_controls()
+        self._update_conveyor_controls()
+        self._update_robot_controls()
         self._update_mode_controls()
         self._update_estimate()
 
@@ -692,6 +872,21 @@ class AcquisitionDialog(QDialog):
         for control in (self.exposure_start, self.exposure_end, self.exposure_step):
             control.setEnabled(enabled)
 
+    def _update_conveyor_controls(self, *_: object) -> None:
+        enabled = self.conveyor_enabled.isChecked()
+        for control in (
+            self.conveyor_max_offset,
+            self.conveyor_step,
+            self.conveyor_speed,
+            self.conveyor_settle,
+        ):
+            control.setEnabled(enabled)
+
+    def _update_robot_controls(self, *_: object) -> None:
+        angle_mode = self.robot_control_mode.currentData() == RobotCommandMode.ANGLE.value
+        self.ranges_form.setRowVisible(self.pose_row, not angle_mode)
+        self.ranges_form.setRowVisible(self.angle_row, angle_mode)
+
     def _update_mode_controls(self, *_: object) -> None:
         ramp = self.capture_mode.currentData() == "ramp"
         self.ramp_group.setVisible(ramp)
@@ -721,6 +916,15 @@ class AcquisitionDialog(QDialog):
             ramp_image_rate_fps=self.ramp_rate.value(),
             ramp_light_1_period_s=self.ramp_light_1_period.value(),
             ramp_light_2_period_s=self.ramp_light_2_period.value(),
+            robot_control_mode=str(self.robot_control_mode.currentData()),
+            angle_start_deg=self.angle_start.value(),
+            angle_end_deg=self.angle_end.value(),
+            angle_step_deg=self.angle_step.value(),
+            conveyor_enabled=self.conveyor_enabled.isChecked(),
+            conveyor_max_offset_mm=self.conveyor_max_offset.value(),
+            conveyor_step_mm=self.conveyor_step.value(),
+            conveyor_speed_mm_per_s=self.conveyor_speed.value(),
+            conveyor_settle_ms=self.conveyor_settle.value(),
         )
 
     def _update_estimate(self, *_: object) -> None:
@@ -772,6 +976,11 @@ class SettingsDialog(QDialog):
 
         self.camera_ip = QLineEdit(config.camera_ip)
         self.robot_ip = QLineEdit(config.robot_ip)
+        self.plc_ip = QLineEdit(config.plc_ip)
+        self.plc_ams_net_id = QLineEdit(config.plc_ams_net_id)
+        self.plc_port = QSpinBox()
+        self.plc_port.setRange(1, 65535)
+        self.plc_port.setValue(config.plc_port)
         self.cti_path = QLineEdit(config.camera_cti_path)
         self.light_1_address = QLineEdit(config.light_address)
         self.light_2_address = QLineEdit(config.light_2_address)
@@ -791,6 +1000,9 @@ class SettingsDialog(QDialog):
 
         form.addRow("Baumer-IP", self.camera_ip)
         form.addRow("UR16e-IP", self.robot_ip)
+        form.addRow("TwinCAT-SPS-IP", self.plc_ip)
+        form.addRow("SPS AMS-Net-ID", self.plc_ams_net_id)
+        form.addRow("TwinCAT-PLC-Port", self.plc_port)
         form.addRow("Baumer GenTL (.cti)", cti_row)
         form.addRow("Licht 1 BLE-Adresse", self.light_1_address)
         form.addRow("Licht 2 BLE-Adresse", self.light_2_address)
@@ -827,6 +1039,10 @@ class SettingsDialog(QDialog):
             config = AppSettings(
                 camera_ip=self.camera_ip.text(),
                 robot_ip=self.robot_ip.text(),
+                plc_ip=self.plc_ip.text(),
+                plc_ams_net_id=self.plc_ams_net_id.text(),
+                plc_port=self.plc_port.value(),
+                conveyor_forward_direction=self._source_config.conveyor_forward_direction,
                 camera_cti_path=self.cti_path.text(),
                 camera_serial=self._source_config.camera_serial,
                 light_address=self.light_1_address.text().strip(),

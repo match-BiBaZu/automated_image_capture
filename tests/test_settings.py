@@ -15,6 +15,10 @@ def test_settings_round_trip(tmp_path) -> None:
     expected = AppSettings(
         camera_ip="169.254.117.70",
         robot_ip="10.10.10.10",
+        plc_ip="192.168.10.23",
+        plc_ams_net_id="10.145.4.14.1.1",
+        plc_port=851,
+        conveyor_forward_direction="right",
         camera_cti_path=str(tmp_path / "producer.cti"),
         camera_serial="1234",
         light_address="AA:BB:CC:DD:EE:FF",
@@ -64,6 +68,15 @@ def test_acquisition_settings_round_trip(tmp_path) -> None:
         ramp_image_rate_fps=8,
         ramp_light_1_period_s=1.6,
         ramp_light_2_period_s=12.5,
+        robot_control_mode="angle",
+        angle_start_deg=15.5,
+        angle_end_deg=20.5,
+        angle_step_deg=0.5,
+        conveyor_enabled=True,
+        conveyor_max_offset_mm=50.0,
+        conveyor_step_mm=10.0,
+        conveyor_speed_mm_per_s=10.0,
+        conveyor_settle_ms=300,
     )
 
     store.save_acquisition(expected)

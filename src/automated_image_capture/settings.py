@@ -14,6 +14,10 @@ DEFAULT_CTI_PATH = r"C:\Program Files\Baumer Camera Explorer\bgapi2_gige.cti"
 class AppSettings:
     camera_ip: str = "169.254.117.70"
     robot_ip: str = "10.10.10.10"
+    plc_ip: str = "192.168.10.23"
+    plc_ams_net_id: str = "10.145.4.14.1.1"
+    plc_port: int = 851
+    conveyor_forward_direction: str = ""
     camera_cti_path: str = DEFAULT_CTI_PATH
     camera_serial: str = ""
     light_address: str = ""
@@ -26,6 +30,16 @@ class AppSettings:
     def validated(self) -> AppSettings:
         ip_address(self.camera_ip)
         ip_address(self.robot_ip)
+        ip_address(self.plc_ip)
+        net_id_parts = self.plc_ams_net_id.strip().split(".")
+        if len(net_id_parts) != 6 or any(
+            not part.isdigit() or not 0 <= int(part) <= 255 for part in net_id_parts
+        ):
+            raise ValueError("Die AMS-Net-ID muss aus sechs Zahlen zwischen 0 und 255 bestehen.")
+        if not 1 <= self.plc_port <= 65535:
+            raise ValueError("Der TwinCAT-PLC-Port muss zwischen 1 und 65535 liegen.")
+        if self.conveyor_forward_direction not in {"", "left", "right"}:
+            raise ValueError("Die Förderband-Vorwärtsrichtung ist ungültig.")
         if not self.camera_cti_path.strip():
             raise ValueError("Der Pfad zum GenTL-Producer darf nicht leer sein.")
         if not 1 <= self.preview_max_fps <= 60:
@@ -34,6 +48,8 @@ class AppSettings:
             self,
             camera_ip=self.camera_ip.strip(),
             robot_ip=self.robot_ip.strip(),
+            plc_ip=self.plc_ip.strip(),
+            plc_ams_net_id=self.plc_ams_net_id.strip(),
             camera_cti_path=str(Path(self.camera_cti_path.strip())),
         )
 
@@ -50,6 +66,16 @@ class SettingsStore:
         return AppSettings(
             camera_ip=str(self._settings.value("camera/ip", defaults.camera_ip)),
             robot_ip=str(self._settings.value("robot/ip", defaults.robot_ip)),
+            plc_ip=str(self._settings.value("plc/ip", defaults.plc_ip)),
+            plc_ams_net_id=str(
+                self._settings.value("plc/ams_net_id", defaults.plc_ams_net_id)
+            ),
+            plc_port=int(self._settings.value("plc/port", defaults.plc_port)),
+            conveyor_forward_direction=str(
+                self._settings.value(
+                    "plc/conveyor_forward_direction", defaults.conveyor_forward_direction
+                )
+            ),
             camera_cti_path=str(self._settings.value("camera/cti_path", defaults.camera_cti_path)),
             camera_serial=str(self._settings.value("camera/serial", "")),
             light_address=str(self._settings.value("light/address", "")),
@@ -68,6 +94,12 @@ class SettingsStore:
         config = config.validated()
         self._settings.setValue("camera/ip", config.camera_ip)
         self._settings.setValue("robot/ip", config.robot_ip)
+        self._settings.setValue("plc/ip", config.plc_ip)
+        self._settings.setValue("plc/ams_net_id", config.plc_ams_net_id)
+        self._settings.setValue("plc/port", config.plc_port)
+        self._settings.setValue(
+            "plc/conveyor_forward_direction", config.conveyor_forward_direction
+        )
         self._settings.setValue("camera/cti_path", config.camera_cti_path)
         self._settings.setValue("camera/serial", config.camera_serial)
         self._settings.setValue("light/address", config.light_address)
@@ -151,6 +183,43 @@ class SettingsStore:
                     "acquisition/ramp_light_2_period_s", defaults.ramp_light_2_period_s
                 )
             ),
+            robot_control_mode=str(
+                self._settings.value(
+                    "acquisition/robot_control_mode", defaults.robot_control_mode
+                )
+            ),
+            angle_start_deg=float(
+                self._settings.value("acquisition/angle_start_deg", defaults.angle_start_deg)
+            ),
+            angle_end_deg=float(
+                self._settings.value("acquisition/angle_end_deg", defaults.angle_end_deg)
+            ),
+            angle_step_deg=float(
+                self._settings.value("acquisition/angle_step_deg", defaults.angle_step_deg)
+            ),
+            conveyor_enabled=self._settings.value(
+                "acquisition/conveyor_enabled", defaults.conveyor_enabled, type=bool
+            ),
+            conveyor_max_offset_mm=float(
+                self._settings.value(
+                    "acquisition/conveyor_max_offset_mm", defaults.conveyor_max_offset_mm
+                )
+            ),
+            conveyor_step_mm=float(
+                self._settings.value(
+                    "acquisition/conveyor_step_mm", defaults.conveyor_step_mm
+                )
+            ),
+            conveyor_speed_mm_per_s=float(
+                self._settings.value(
+                    "acquisition/conveyor_speed_mm_per_s", defaults.conveyor_speed_mm_per_s
+                )
+            ),
+            conveyor_settle_ms=int(
+                self._settings.value(
+                    "acquisition/conveyor_settle_ms", defaults.conveyor_settle_ms
+                )
+            ),
         ).validated()
 
     def save_acquisition(self, config) -> None:
@@ -177,6 +246,15 @@ class SettingsStore:
             "ramp_image_rate_fps",
             "ramp_light_1_period_s",
             "ramp_light_2_period_s",
+            "robot_control_mode",
+            "angle_start_deg",
+            "angle_end_deg",
+            "angle_step_deg",
+            "conveyor_enabled",
+            "conveyor_max_offset_mm",
+            "conveyor_step_mm",
+            "conveyor_speed_mm_per_s",
+            "conveyor_settle_ms",
         ):
             value = getattr(config, field_name)
             if field_name == "output_directory":

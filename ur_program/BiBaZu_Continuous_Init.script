@@ -1,0 +1,12 @@
+def BiBaZu_Continuous_Init():
+  global angle = 0
+  global last_command = read_input_integer_register(43)
+  global active_command = last_command
+  global command_valid = False
+  global rotation_position = p[0, 0, 0, 0, 0, 0]
+  write_output_integer_register(42, last_command)
+  write_output_integer_register(43, 1)
+  write_output_integer_register(41, 0)
+end
+
+BiBaZu_Continuous_Init()

@@ -1,0 +1,10 @@
+def BiBaZu_Continuous_Move():
+  if command_valid:
+    local target_rpy = [d2r(-45.0), d2r(angle / 10.0), d2r(-90.0)]
+    local target_rotation = rpy2rotvec(target_rpy)
+    local target_pose = p[rotation_position[0], rotation_position[1], rotation_position[2], target_rotation[0], target_rotation[1], target_rotation[2]]
+    movel(target_pose, a=0.3, v=0.1)
+  end
+end
+
+BiBaZu_Continuous_Move()

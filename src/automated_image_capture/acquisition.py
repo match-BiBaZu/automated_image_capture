@@ -14,13 +14,16 @@ import numpy as np
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from automated_image_capture.hardware.camera import CameraAdapter
+from automated_image_capture.hardware.conveyor import ConveyorAdapter
 from automated_image_capture.hardware.light import LIGHT_COMMAND_TIMEOUT_SECONDS, LightAdapter
 from automated_image_capture.hardware.robot import ALLOWED_POSES, RobotAdapter
 from automated_image_capture.models import (
     CameraFrame,
     CameraStatus,
     ConnectionState,
+    ConveyorStatus,
     LightStatus,
+    RobotCommandMode,
     RobotStatus,
 )
 
@@ -93,6 +96,38 @@ def poses_between(start: int, end: int) -> tuple[int, ...]:
     return tuple(reversed(ALLOWED_POSES[end_index : start_index + 1]))
 
 
+def _tenths(value: float, label: str) -> int:
+    converted = round(float(value) * 10.0)
+    if abs(float(value) * 10.0 - converted) > 1e-6:
+        raise ValueError(f"{label} darf höchstens eine Nachkommastelle haben.")
+    return converted
+
+
+def angle_values(start_deg: float, end_deg: float, step_deg: float) -> tuple[int, ...]:
+    start = _tenths(start_deg, "Der UR-Startwinkel")
+    end = _tenths(end_deg, "Der UR-Endwinkel")
+    step = _tenths(step_deg, "Die UR-Winkelschrittweite")
+    if not 155 <= start <= 210 or not 155 <= end <= 210:
+        raise ValueError("UR-Winkel müssen zwischen 15,5 und 21,0 Grad liegen.")
+    return inclusive_values(start, end, step)
+
+
+def conveyor_positions(max_offset_mm: float, step_mm: float) -> tuple[tuple[int, float, str], ...]:
+    maximum = _tenths(max_offset_mm, "Der maximale Förderbandoffset")
+    step = _tenths(step_mm, "Die Förderbandschrittweite")
+    if maximum < 0 or maximum > 50000:
+        raise ValueError("Der Förderbandoffset muss zwischen 0 und 5000 mm liegen.")
+    if step <= 0:
+        raise ValueError("Die Förderbandschrittweite muss positiv sein.")
+    outward = list(range(0, maximum + 1, step))
+    if outward[-1] != maximum:
+        outward.append(maximum)
+    values = [(index, value / 10.0, "out") for index, value in enumerate(outward)]
+    for value in reversed(outward[:-1]):
+        values.append((len(values), value / 10.0, "back"))
+    return tuple(values)
+
+
 @dataclass(slots=True, frozen=True)
 class AcquisitionSettings:
     output_directory: Path
@@ -116,6 +151,15 @@ class AcquisitionSettings:
     ramp_image_rate_fps: int = 6
     ramp_light_1_period_s: float = 2.4
     ramp_light_2_period_s: float = 10.0
+    robot_control_mode: str = RobotCommandMode.POSE_ID.value
+    angle_start_deg: float = 15.5
+    angle_end_deg: float = 21.0
+    angle_step_deg: float = 0.5
+    conveyor_enabled: bool = False
+    conveyor_max_offset_mm: float = 50.0
+    conveyor_step_mm: float = 10.0
+    conveyor_speed_mm_per_s: float = 10.0
+    conveyor_settle_ms: int = 300
 
     def validated(self) -> AcquisitionSettings:
         if not str(self.output_directory):
@@ -133,6 +177,16 @@ class AcquisitionSettings:
         inclusive_values(self.light_1_start, self.light_1_end, self.light_1_step)
         inclusive_values(self.light_2_start, self.light_2_end, self.light_2_step)
         poses_between(self.pose_start, self.pose_end)
+        if self.robot_control_mode not in {mode.value for mode in RobotCommandMode}:
+            raise ValueError("Der UR-Steuerungsmodus ist ungültig.")
+        angle_values(self.angle_start_deg, self.angle_end_deg, self.angle_step_deg)
+        conveyor_positions(self.conveyor_max_offset_mm, self.conveyor_step_mm)
+        if not 0.1 <= self.conveyor_speed_mm_per_s <= 5000.0:
+            raise ValueError(
+                "Die Förderbandgeschwindigkeit muss zwischen 0,1 und 5000 mm/s liegen."
+            )
+        if not 0 <= self.conveyor_settle_ms <= 10000:
+            raise ValueError("Die Förderband-Beruhigungszeit muss zwischen 0 und 10000 ms liegen.")
         if self.exposure_enabled:
             if min(self.exposure_start_us, self.exposure_end_us, self.exposure_step_us) <= 0:
                 raise ValueError("Belichtungszeiten und Schrittweite müssen positiv sein.")
@@ -163,6 +217,24 @@ class CapturePoint:
     exposure_time_us: int | None
     ramp_sample_id: int | None = None
     planned_offset_s: float | None = None
+    robot_control_mode: str = RobotCommandMode.POSE_ID.value
+    angle_tenths: int | None = None
+    conveyor_station_id: int = 0
+    conveyor_offset_mm: float = 0.0
+    conveyor_actual_offset_mm: float | None = None
+    conveyor_direction: str = "fixed"
+
+    @property
+    def robot_raw_value(self) -> int:
+        return self.angle_tenths if self.angle_tenths is not None else self.pose
+
+    @property
+    def robot_key(self) -> tuple[str, int]:
+        return (self.robot_control_mode, self.robot_raw_value)
+
+    @property
+    def conveyor_key(self) -> tuple[int, float, str]:
+        return (self.conveyor_station_id, self.conveyor_offset_mm, self.conveyor_direction)
 
 
 def triangle_brightness(elapsed_s: float, period_s: float) -> int:
@@ -183,11 +255,26 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
         )
     else:
         exposures = (None,)
+    if settings.robot_control_mode == RobotCommandMode.ANGLE.value:
+        robot_targets = tuple(
+            (raw, raw) for raw in angle_values(
+                settings.angle_start_deg, settings.angle_end_deg, settings.angle_step_deg
+            )
+        )
+    else:
+        robot_targets = tuple(
+            (pose, None) for pose in poses_between(settings.pose_start, settings.pose_end)
+        )
+    belt_positions = (
+        conveyor_positions(settings.conveyor_max_offset_mm, settings.conveyor_step_mm)
+        if settings.conveyor_enabled
+        else ((0, 0.0, "fixed"),)
+    )
     if settings.capture_mode == "ramp":
         sample_count = round(settings.ramp_duration_s * settings.ramp_image_rate_fps)
         return tuple(
             CapturePoint(
-                pose=pose,
+                pose=raw,
                 light_1_brightness=triangle_brightness(
                     sample_id / settings.ramp_image_rate_fps,
                     settings.ramp_light_1_period_s,
@@ -199,14 +286,32 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
                 exposure_time_us=exposure,
                 ramp_sample_id=sample_id,
                 planned_offset_s=sample_id / settings.ramp_image_rate_fps,
+                robot_control_mode=settings.robot_control_mode,
+                angle_tenths=angle,
+                conveyor_station_id=station_id,
+                conveyor_offset_mm=offset_mm,
+                conveyor_direction=direction,
             )
-            for pose in poses_between(settings.pose_start, settings.pose_end)
+            for raw, angle in robot_targets
+            for station_id, offset_mm, direction in belt_positions
             for exposure in exposures
             for sample_id in range(sample_count)
         )
     return tuple(
-        CapturePoint(pose, light_1, light_2, exposure)
-        for pose in poses_between(settings.pose_start, settings.pose_end)
+        CapturePoint(
+            raw,
+            light_1,
+            light_2,
+            exposure,
+            robot_control_mode=settings.robot_control_mode,
+            angle_tenths=angle,
+            conveyor_station_id=station_id,
+            conveyor_offset_mm=offset_mm,
+            conveyor_direction=direction,
+        )
+        for raw, angle in robot_targets
+        for station_id, offset_mm, direction in belt_positions
+        for exposure in exposures
         for light_2 in inclusive_values(
             settings.light_2_start,
             settings.light_2_end,
@@ -217,7 +322,6 @@ def build_capture_points(settings: AcquisitionSettings) -> tuple[CapturePoint, .
             settings.light_1_end,
             settings.light_1_step,
         )
-        for exposure in exposures
     )
 
 
@@ -264,8 +368,20 @@ class DatasetWriter(QObject):
             raise RuntimeError("Keine Aufnahmesitzung gestartet.")
         exposure = "auto" if point.exposure_time_us is None else f"e{point.exposure_time_us}us"
         ramp = "" if point.ramp_sample_id is None else f"ramp-{point.ramp_sample_id:03d}_"
+        robot = (
+            f"ura-{point.robot_raw_value:04d}"
+            if point.robot_control_mode == RobotCommandMode.ANGLE.value
+            else f"ur{point.pose}"
+        )
+        belt = ""
+        if point.conveyor_direction != "fixed":
+            position_tenths = round(point.conveyor_offset_mm * 10.0)
+            belt = (
+                f"belt-{point.conveyor_station_id:03d}_pos-{position_tenths:04d}_"
+                f"{point.conveyor_direction}_"
+            )
         stem = (
-            f"img_{index + 1:06d}_ur{point.pose}_{ramp}"
+            f"img_{index + 1:06d}_{robot}_{belt}{ramp}"
             f"p1-{point.light_1_brightness:03d}_p2-{point.light_2_brightness:03d}_{exposure}"
         )
         return (
@@ -388,6 +504,7 @@ class AcquisitionController(QObject):
     status_changed = pyqtSignal(str)
     error = pyqtSignal(str)
     completed = pyqtSignal(str)
+    alignment_required_changed = pyqtSignal(bool, float, float)
 
     def __init__(
         self,
@@ -396,12 +513,14 @@ class AcquisitionController(QObject):
         light_1: LightAdapter,
         light_2: LightAdapter,
         parent: QObject | None = None,
+        conveyor: ConveyorAdapter | None = None,
     ) -> None:
         super().__init__(parent)
         self.camera = camera
         self.robot = robot
         self.light_1 = light_1
         self.light_2 = light_2
+        self.conveyor = conveyor
         self.writer = DatasetWriter(self)
         self._settings: AcquisitionSettings | None = None
         self._points: tuple[CapturePoint, ...] = ()
@@ -410,7 +529,11 @@ class AcquisitionController(QObject):
         self._running = False
         self._phase = "idle"
         self._deadline = 0.0
-        self._current_pose: int | None = None
+        self._current_robot_key: tuple[str, int] | None = None
+        self._current_conveyor_key: tuple[int, float, str] | None = None
+        self._pending_conveyor_sequence: int | None = None
+        self._saved_conveyor_origin: int | None = None
+        self._alignment_required = False
         self._applied_lights: tuple[int, int] | None = None
         self._applied_exposure: int | None = None
         self._frame_after = 0.0
@@ -421,7 +544,9 @@ class AcquisitionController(QObject):
         self._camera_status = CameraStatus()
         self._robot_status = RobotStatus()
         self._light_statuses = [LightStatus(), LightStatus()]
-        self._ramp_pass_key: tuple[int, int | None] | None = None
+        self._ramp_pass_key: (
+            tuple[tuple[str, int], tuple[int, float, str], int | None] | None
+        ) = None
         self._ramp_origin_monotonic = 0.0
         self._ramp_origin_wall = 0.0
         self._ramp_confirmation_marker = 0.0
@@ -444,6 +569,8 @@ class AcquisitionController(QObject):
         camera.frame_ready.connect(self._on_frame)
         camera.status_changed.connect(self._on_camera_status)
         robot.status_changed.connect(self._on_robot_status)
+        if conveyor is not None:
+            conveyor.status_changed.connect(self._on_conveyor_status)
         light_1.status_changed.connect(lambda status: self._on_light_status(0, status))
         light_2.status_changed.connect(lambda status: self._on_light_status(1, status))
         self.writer.saved.connect(self._on_saved)
@@ -476,6 +603,7 @@ class AcquisitionController(QObject):
             settings = settings.validated()
             points = build_capture_points(settings)
             self._validate_hardware(settings)
+            points = self._with_conveyor_quantization(points, settings)
             session = self.writer.start_session(settings.output_directory)
         except Exception as exc:
             self.error.emit(str(exc) or type(exc).__name__)
@@ -488,7 +616,13 @@ class AcquisitionController(QObject):
         self._index = 0
         self._checkpoint_index = 0
         self._running = True
-        self._current_pose = None
+        self._current_robot_key = None
+        self._current_conveyor_key = None
+        self._pending_conveyor_sequence = None
+        self._saved_conveyor_origin = (
+            self.conveyor.origin_position if settings.conveyor_enabled and self.conveyor else None
+        )
+        self._set_alignment_required(False)
         self._applied_lights = None
         self._applied_exposure = None
         self._reset_ramp_state()
@@ -509,8 +643,11 @@ class AcquisitionController(QObject):
     def stop(self) -> None:
         if not self._running:
             return
+        if self.conveyor is not None:
+            self.conveyor.stop_motion()
         self._finish(
-            "Aufnahme gestoppt. Eine bereits gestartete UR-Fahrt wird nicht abgebrochen.",
+            "Aufnahme gestoppt. Das Förderband wurde gestoppt; "
+            "eine UR-Fahrt wird nicht abgebrochen.",
             resumable=True,
         )
 
@@ -539,12 +676,18 @@ class AcquisitionController(QObject):
                 "Vorhandene Dateipaare vor dem Fortsetzen abgeglichen.",
             )
             self._validate_hardware(self._settings)
+            self._points = self._with_conveyor_quantization(self._points, self._settings)
+            if not self._validate_resume_conveyor_position():
+                return False
         except Exception as exc:
             self.error.emit(str(exc) or type(exc).__name__)
             return False
 
         self._running = True
-        self._current_pose = None
+        self._current_robot_key = None
+        self._current_conveyor_key = None
+        self._pending_conveyor_sequence = None
+        self._set_alignment_required(False)
         self._applied_lights = None
         self._applied_exposure = None
         self._reset_ramp_state()
@@ -592,6 +735,10 @@ class AcquisitionController(QObject):
                 self._checkpoint_index = index
                 self._session_directory = manifest.parent
                 self._writer_token = self.writer.session_token
+                conveyor_checkpoint = payload.get("conveyor")
+                if isinstance(conveyor_checkpoint, dict):
+                    origin = conveyor_checkpoint.get("origin_internal_position")
+                    self._saved_conveyor_origin = None if origin is None else int(origin)
                 self._reconcile_saved_points()
                 self._checkpoint_index = self._index
                 if self._index >= len(self._points):
@@ -622,6 +769,64 @@ class AcquisitionController(QObject):
         self.stop()
         self.writer.close()
 
+    @property
+    def alignment_required(self) -> bool:
+        return self._alignment_required
+
+    @property
+    def expected_resume_offset_mm(self) -> float | None:
+        if not self._points or self._index >= len(self._points):
+            return None
+        return self._points[self._index].conveyor_offset_mm
+
+    def _set_alignment_required(self, required: bool) -> None:
+        required = bool(required)
+        self._alignment_required = required
+        expected = float(self.expected_resume_offset_mm or 0.0)
+        current = (
+            0.0
+            if self.conveyor is None or self.conveyor.status.logical_offset_mm is None
+            else float(self.conveyor.status.logical_offset_mm)
+        )
+        self.alignment_required_changed.emit(required, expected, current)
+
+    def align_for_resume(self) -> bool:
+        if not self._alignment_required or self._settings is None or self.conveyor is None:
+            return False
+        expected = self.expected_resume_offset_mm
+        if expected is None:
+            return False
+        sequence = self.conveyor.request_offset(expected, self._settings.conveyor_speed_mm_per_s)
+        if sequence is None:
+            return False
+        if sequence == 0:
+            self._set_alignment_required(False)
+            self.status_changed.emit("Förderband steht wieder an der erwarteten Position.")
+        else:
+            self._pending_conveyor_sequence = sequence
+            self.status_changed.emit(
+                f"Korrigiere Förderbandposition auf {expected:g} mm (Fahrt #{sequence}) …"
+            )
+        return True
+
+    def _validate_resume_conveyor_position(self) -> bool:
+        if self._settings is None or not self._settings.conveyor_enabled:
+            return True
+        if self.conveyor is None or self._saved_conveyor_origin is None:
+            raise RuntimeError("Der Förderband-Nullpunkt fehlt im Sitzungs-Checkpoint.")
+        self.conveyor.restore_origin(self._saved_conveyor_origin)
+        expected = self.expected_resume_offset_mm
+        if expected is None or self.conveyor.position_matches(expected):
+            self._set_alignment_required(False)
+            return True
+        self._set_alignment_required(True)
+        actual = self.conveyor.status.logical_offset_mm
+        self.status_changed.emit(
+            f"Fortsetzen blockiert: Förderband Soll {expected:g} mm, "
+            f"Ist {'unbekannt' if actual is None else f'{actual:.3f} mm'}."
+        )
+        return False
+
     def _set_resume_available(self, available: bool) -> None:
         available = bool(available)
         if available == self._resume_available:
@@ -636,6 +841,11 @@ class AcquisitionController(QObject):
         defaults = AcquisitionSettings(output_directory=Path("."))
         names = set(AcquisitionSettings.__dataclass_fields__)
         values = {name: payload.get(name, getattr(defaults, name)) for name in names}
+        # Manifests written before milestone 3 always used fixed poses and no conveyor.
+        if "robot_control_mode" not in payload:
+            values["robot_control_mode"] = RobotCommandMode.POSE_ID.value
+        if "conveyor_enabled" not in payload:
+            values["conveyor_enabled"] = False
         values["output_directory"] = Path(str(values["output_directory"]))
         return AcquisitionSettings(**values).validated()
 
@@ -645,7 +855,7 @@ class AcquisitionController(QObject):
         settings = asdict(self._settings)
         settings["output_directory"] = str(self._settings.output_directory)
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": status,
             "next_index": self._checkpoint_index,
             "total": len(self._points),
@@ -653,6 +863,21 @@ class AcquisitionController(QObject):
             "message": message,
             "updated_at": datetime.now().astimezone().isoformat(),
         }
+        if self._settings.conveyor_enabled:
+            expected = (
+                None
+                if not self._points or self._checkpoint_index >= len(self._points)
+                else self._points[self._checkpoint_index].conveyor_offset_mm
+            )
+            payload["conveyor"] = {
+                "origin_internal_position": self._saved_conveyor_origin,
+                "expected_next_offset_mm": expected,
+                "last_confirmed_station_id": (
+                    None
+                    if self._current_conveyor_key is None
+                    else self._current_conveyor_key[0]
+                ),
+            }
         destination = self._session_directory / "capture_session.json"
         temporary = self._session_directory / "capture_session.json.part"
         try:
@@ -769,6 +994,28 @@ class AcquisitionController(QObject):
         )
         if not robot_ready:
             raise RuntimeError("Der UR-Handshake ist nicht bereit oder BiBaZu_GUI läuft nicht.")
+        loaded_program = self._robot_status.loaded_program.upper()
+        if (
+            settings.robot_control_mode == RobotCommandMode.ANGLE.value
+            and "BIBAZU_CONTINUOUS" not in loaded_program
+        ):
+            raise RuntimeError(
+                "Für kontinuierliche Winkel muss BiBaZu_Continuous geladen und PLAYING sein."
+            )
+        if settings.conveyor_enabled:
+            if self.conveyor is None or self.conveyor.state is not ConnectionState.CONNECTED:
+                raise RuntimeError("Das Förderband ist nicht über TwinCAT ADS verbunden.")
+            conveyor = self.conveyor.status
+            if not conveyor.calibration_valid or conveyor.mm_per_full_step <= 0.0:
+                raise RuntimeError("Die Förderbandkalibrierung in der SPS ist ungültig.")
+            if conveyor.error or not conveyor.ready_to_execute:
+                raise RuntimeError("Der Förderbandantrieb ist nicht fahrbereit.")
+            if not self.conveyor.config.conveyor_forward_direction:
+                raise RuntimeError("Bitte zuerst die Vorwärtsrichtung des Förderbands bestätigen.")
+            if self.conveyor.origin_position is None and self._saved_conveyor_origin is None:
+                raise RuntimeError(
+                    "Bitte zuerst die aktuelle Förderbandposition als 0 mm übernehmen."
+                )
         if settings.exposure_enabled:
             if not self._camera_status.exposure_writable:
                 raise RuntimeError("Die Kamera erlaubt aktuell keine manuelle Belichtungszeit.")
@@ -784,6 +1031,26 @@ class AcquisitionController(QObject):
                 raise RuntimeError(
                     f"Belichtungszeit liegt über dem Kameramaximum {maximum:.0f} µs."
                 )
+
+    def _with_conveyor_quantization(
+        self,
+        points: tuple[CapturePoint, ...],
+        settings: AcquisitionSettings,
+    ) -> tuple[CapturePoint, ...]:
+        if not settings.conveyor_enabled or self.conveyor is None:
+            return points
+        calibration = self.conveyor.status.mm_per_full_step
+        if calibration <= 0.0:
+            return points
+        return tuple(
+            replace(
+                point,
+                conveyor_actual_offset_mm=(
+                    int(point.conveyor_offset_mm / calibration + 0.5) * calibration
+                ),
+            )
+            for point in points
+        )
 
     def _set_phase(self, phase: str, timeout_seconds: float) -> None:
         self._phase = phase
@@ -813,13 +1080,53 @@ class AcquisitionController(QObject):
             self._finish(f"Aufnahme abgeschlossen: {directory}", completed=True)
             return
         point = self._points[self._index]
-        if self._current_pose != point.pose:
-            self.status_changed.emit(f"Fahre UR-Pose {point.pose} …")
+        if self._current_robot_key != point.robot_key:
+            if point.robot_control_mode == RobotCommandMode.ANGLE.value:
+                target_text = f"UR-Winkel {point.robot_raw_value / 10.0:.1f} Grad"
+            else:
+                target_text = f"UR-Pose {point.pose}"
+            self.status_changed.emit(f"Fahre {target_text} …")
             self._set_phase("robot", 45.0)
-            if not self.robot.request_pose(point.pose):
-                self._fail("UR-Pose konnte nicht angefordert werden.")
+            requested = (
+                self.robot.request_angle(point.robot_raw_value / 10.0)
+                if point.robot_control_mode == RobotCommandMode.ANGLE.value
+                else self.robot.request_pose(point.pose)
+            )
+            if not requested:
+                self._fail("UR-Ziel konnte nicht angefordert werden.")
             return
+        if self._settings is not None and self._settings.conveyor_enabled:
+            if self._current_conveyor_key != point.conveyor_key:
+                self._move_conveyor(point)
+                return
         self._prepare_point()
+
+    def _move_conveyor(self, point: CapturePoint) -> None:
+        if self.conveyor is None or self._settings is None:
+            self._fail("Förderbandadapter ist nicht verfügbar.")
+            return
+        self.status_changed.emit(
+            f"Fahre Förderband auf {point.conveyor_offset_mm:g} mm "
+            f"({point.conveyor_direction}) …"
+        )
+        current = self.conveyor.status.logical_offset_mm
+        distance = abs(point.conveyor_offset_mm - float(current or 0.0))
+        timeout = distance / self._settings.conveyor_speed_mm_per_s + 5.0
+        self._set_phase("conveyor", max(5.0, timeout))
+        sequence = self.conveyor.request_offset(
+            point.conveyor_offset_mm, self._settings.conveyor_speed_mm_per_s
+        )
+        if sequence is None:
+            self._fail("Förderbandfahrt konnte nicht angefordert werden.")
+        elif sequence == 0:
+            self._current_conveyor_key = point.conveyor_key
+            self._schedule(
+                self._settings.conveyor_settle_ms,
+                self._prepare_point,
+                "conveyor_settle",
+            )
+        else:
+            self._pending_conveyor_sequence = sequence
 
     def _prepare_point(self) -> None:
         point = self._points[self._index]
@@ -851,7 +1158,7 @@ class AcquisitionController(QObject):
     def _after_exposure_ready(self) -> None:
         point = self._points[self._index]
         if point.ramp_sample_id is not None:
-            key = (point.pose, point.exposure_time_us)
+            key = (point.robot_key, point.conveyor_key, point.exposure_time_us)
             if self._ramp_pass_key == key:
                 self._wait_for_ramp_frame()
             else:
@@ -892,19 +1199,65 @@ class AcquisitionController(QObject):
         if not self._running or self._phase != "robot":
             return
         point = self._points[self._index]
+        acknowledged_target = (
+            status.acknowledged_raw_value == point.robot_raw_value
+            if point.robot_control_mode == RobotCommandMode.ANGLE.value
+            else status.acknowledged_pose in {None, point.pose}
+        )
         if (
             status.command_state_code == 3
             and not status.command_pending
             and status.requested_sequence is not None
             and status.acknowledged_sequence == status.requested_sequence
-            and status.acknowledged_pose in {None, point.pose}
+            and acknowledged_target
         ):
-            self._current_pose = point.pose
+            self._current_robot_key = point.robot_key
             assert self._settings is not None
             self._schedule(
                 self._settings.robot_settle_ms,
-                self._prepare_point,
+                self._advance,
                 "robot_settle",
+            )
+
+    def _on_conveyor_status(self, status: object) -> None:
+        if not isinstance(status, ConveyorStatus):
+            return
+        if self._alignment_required and self._pending_conveyor_sequence is not None:
+            if status.error or status.status_code in {4, 5}:
+                self._pending_conveyor_sequence = None
+                self.error.emit("Korrekturfahrt des Förderbands ist fehlgeschlagen.")
+            elif status.completed_sequence == self._pending_conveyor_sequence:
+                self._pending_conveyor_sequence = None
+                expected = self.expected_resume_offset_mm
+                if expected is not None and self.conveyor is not None:
+                    if self.conveyor.position_matches(expected):
+                        self._set_alignment_required(False)
+                        self.status_changed.emit(
+                            "Förderbandposition korrigiert; die Aufnahme kann fortgesetzt werden."
+                        )
+            return
+        if not self._running or self._phase != "conveyor":
+            return
+        if status.error or status.status_code in {4, 5}:
+            self._fail(f"Förderbandfehler (SPS-Status {status.status_code}).")
+            return
+        if (
+            self._pending_conveyor_sequence is not None
+            and status.completed_sequence == self._pending_conveyor_sequence
+        ):
+            point = self._points[self._index]
+            if self.conveyor is None or not self.conveyor.position_matches(
+                point.conveyor_offset_mm
+            ):
+                self._fail("Förderbandfahrt quittiert, Zielposition stimmt jedoch nicht überein.")
+                return
+            self._pending_conveyor_sequence = None
+            self._current_conveyor_key = point.conveyor_key
+            assert self._settings is not None
+            self._schedule(
+                self._settings.conveyor_settle_ms,
+                self._prepare_point,
+                "conveyor_settle",
             )
 
     def _on_light_status(self, index: int, status: object) -> None:
@@ -1032,9 +1385,9 @@ class AcquisitionController(QObject):
         now_wall = time.time()
         self._ramp_origin_monotonic = now_monotonic - planned
         self._ramp_origin_wall = now_wall - planned
-        self._ramp_pass_key = (point.pose, point.exposure_time_us)
+        self._ramp_pass_key = (point.robot_key, point.conveyor_key, point.exposure_time_us)
         self.status_changed.emit(
-            f"Licht-Rampe gestartet: UR {point.pose}, "
+            f"Licht-Rampe gestartet: UR {point.robot_raw_value}, "
             f"{self._settings.ramp_duration_s:g} s bei "
             f"{self._settings.ramp_image_rate_fps} Bildern/s."
         )
@@ -1089,9 +1442,13 @@ class AcquisitionController(QObject):
                 return
             self._ramp_pending_writes.add(capture_index)
             self._index += 1
-            previous_key = (point.pose, point.exposure_time_us)
+            previous_key = (point.robot_key, point.conveyor_key, point.exposure_time_us)
             next_key = (
-                (self._points[self._index].pose, self._points[self._index].exposure_time_us)
+                (
+                    self._points[self._index].robot_key,
+                    self._points[self._index].conveyor_key,
+                    self._points[self._index].exposure_time_us,
+                )
                 if self._index < len(self._points)
                 else None
             )
@@ -1120,7 +1477,7 @@ class AcquisitionController(QObject):
         robot = self._robot_status
         lights = self._light_statuses
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "captured_at": datetime.fromtimestamp(frame.timestamp).astimezone().isoformat(),
             "image": {
                 "pixel_format": frame.pixel_format,
@@ -1137,8 +1494,20 @@ class AcquisitionController(QObject):
                 "measured_preview_fps": camera.preview_fps,
             },
             "robot": {
-                "requested_pose_id": point.pose,
+                "control_mode": point.robot_control_mode,
+                "requested_raw_value": point.robot_raw_value,
+                "requested_pose_id": (
+                    point.pose
+                    if point.robot_control_mode == RobotCommandMode.POSE_ID.value
+                    else None
+                ),
+                "requested_angle_deg": (
+                    point.robot_raw_value / 10.0
+                    if point.robot_control_mode == RobotCommandMode.ANGLE.value
+                    else None
+                ),
                 "acknowledged_pose_id": robot.acknowledged_pose,
+                "acknowledged_angle_deg": robot.acknowledged_angle_deg,
                 "command_sequence": robot.acknowledged_sequence,
                 "robot_mode": robot.robot_mode,
                 "safety_mode": robot.safety_mode,
@@ -1159,6 +1528,52 @@ class AcquisitionController(QObject):
                 "total": len(self._points),
             },
         }
+        if self._settings is not None and self._settings.conveyor_enabled:
+            conveyor = self.conveyor.status if self.conveyor is not None else ConveyorStatus()
+            move = conveyor.last_move
+            metadata["conveyor"] = {
+                "plc_ip": None if self.conveyor is None else self.conveyor.config.plc_ip,
+                "ams_net_id": (
+                    None if self.conveyor is None else self.conveyor.config.plc_ams_net_id
+                ),
+                "station_id": point.conveyor_station_id,
+                "direction": point.conveyor_direction,
+                "origin_internal_position": self._saved_conveyor_origin,
+                "internal_position": conveyor.internal_position,
+                "internal_start_position": (
+                    None if move is None else move.start_internal_position
+                ),
+                "internal_end_position": (
+                    conveyor.internal_position
+                    if move is not None and move.sequence == 0
+                    else conveyor.completed_internal_position
+                ),
+                "nominal_offset_mm": point.conveyor_offset_mm,
+                "quantized_target_offset_mm": (
+                    point.conveyor_actual_offset_mm
+                    if point.conveyor_actual_offset_mm is not None
+                    else conveyor.actual_target_offset_mm
+                ),
+                "measured_logical_offset_mm": conveyor.logical_offset_mm,
+                "calibration_mm_per_full_step": conveyor.mm_per_full_step,
+                "target_full_steps": None if move is None else move.target_full_steps,
+                "delta_full_steps": None if move is None else move.delta_full_steps,
+                "speed_mm_per_s": self._settings.conveyor_speed_mm_per_s,
+                "command_sequence": None if move is None else move.sequence,
+                "commanded_at": None if move is None else move.commanded_at,
+                "acknowledged_at": (
+                    move.commanded_at
+                    if move is not None and move.sequence == 0
+                    else conveyor.completed_at
+                ),
+                "movement_acknowledged": (
+                    move is not None
+                    and (move.sequence == 0 or conveyor.completed_sequence == move.sequence)
+                ),
+                "status_code": conveyor.status_code,
+                "busy": conveyor.busy,
+                "error": conveyor.error,
+            }
         if point.ramp_sample_id is not None:
             metadata["ramp"] = {
                 "sample_id": point.ramp_sample_id,
@@ -1254,6 +1669,10 @@ class AcquisitionController(QObject):
                 self._fail(
                     "Ausstehende PNG/YAML-Dateien konnten nicht rechtzeitig gespeichert werden."
                 )
+            elif self._phase == "conveyor":
+                if self.conveyor is not None:
+                    self.conveyor.stop_motion()
+                self._fail("Zeitüberschreitung während der Förderbandfahrt; Stop wurde gesendet.")
             else:
                 self._fail(f"Zeitüberschreitung in Phase '{self._phase}'.")
 
@@ -1275,6 +1694,9 @@ class AcquisitionController(QObject):
         self._phase_timer.stop()
         self._ramp_timer.stop()
         self._watchdog.stop()
+        if self.conveyor is not None and self._settings is not None:
+            if self._settings.conveyor_enabled:
+                self.conveyor.release_control()
         if restore_exposure:
             self.camera.restore_exposure()
         can_resume = resumable and self._checkpoint_index < len(self._points)

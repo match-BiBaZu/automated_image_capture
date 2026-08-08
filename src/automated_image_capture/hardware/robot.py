@@ -9,7 +9,7 @@ from typing import Any
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 from automated_image_capture.hardware.base import DeviceAdapter
-from automated_image_capture.models import ConnectionState, RobotStatus
+from automated_image_capture.models import ConnectionState, RobotCommandMode, RobotStatus
 from automated_image_capture.settings import AppSettings
 
 ROBOT_MODES = {
@@ -63,6 +63,8 @@ SEQUENCE_INPUT_REGISTER = 43
 ACK_SEQUENCE_OUTPUT_REGISTER = 42
 COMMAND_STATE_OUTPUT_REGISTER = 43
 CURRENT_POSE_OUTPUT_REGISTER = 41
+ANGLE_MIN_TENTHS = 155
+ANGLE_MAX_TENTHS = 210
 
 COMMAND_STATES = {
     0: "UR-Programm nicht bereit",
@@ -162,13 +164,17 @@ class RobotWorker(QObject):
         super().__init__()
         self._config = config
         self._stop = threading.Event()
-        self._commands: queue.Queue[tuple[int, int]] = queue.Queue()
-        self._requested_pose: int | None = None
+        self._commands: queue.Queue[tuple[RobotCommandMode, int, int]] = queue.Queue()
+        self._requested_mode = RobotCommandMode.POSE_ID
+        self._requested_value: int | None = None
         self._requested_sequence: int | None = None
 
     def enqueue_pose_command(self, pose: int, sequence: int) -> None:
         """Thread-safe mailbox; register writes happen exclusively in run()."""
-        self._commands.put((pose, sequence))
+        self._commands.put((RobotCommandMode.POSE_ID, pose, sequence))
+
+    def enqueue_angle_command(self, angle_tenths: int, sequence: int) -> None:
+        self._commands.put((RobotCommandMode.ANGLE, angle_tenths, sequence))
 
     def stop(self) -> None:
         self._stop.set()
@@ -296,12 +302,21 @@ class RobotWorker(QObject):
                             status.command_state_code,
                             f"Unbekannt ({status.command_state_code})",
                         )
-                        acknowledged_pose = int(
+                        acknowledged_value = int(
                             rtde.getOutputIntRegister(CURRENT_POSE_OUTPUT_REGISTER)
                         )
-                        status.acknowledged_pose = (
-                            acknowledged_pose if acknowledged_pose in ALLOWED_POSES else None
-                        )
+                        status.command_mode = self._requested_mode
+                        status.acknowledged_raw_value = acknowledged_value
+                        if self._requested_mode is RobotCommandMode.ANGLE:
+                            status.acknowledged_angle_deg = (
+                                acknowledged_value / 10.0
+                                if ANGLE_MIN_TENTHS <= acknowledged_value <= ANGLE_MAX_TENTHS
+                                else None
+                            )
+                        else:
+                            status.acknowledged_pose = (
+                                acknowledged_value if acknowledged_value in ALLOWED_POSES else None
+                            )
                     except Exception as exc:
                         rtde_error = f"RTDE: {exc}"
                         try:
@@ -315,18 +330,20 @@ class RobotWorker(QObject):
                     active_sequence: int | None = None
                     try:
                         while True:
-                            pose, sequence = self._commands.get_nowait()
+                            mode, value, sequence = self._commands.get_nowait()
                             active_sequence = sequence
-                            if not rtde_io.setInputIntRegister(POSE_INPUT_REGISTER, pose):
+                            if not rtde_io.setInputIntRegister(POSE_INPUT_REGISTER, value):
                                 raise ConnectionError("Pose-Register wurde nicht bestätigt.")
                             if not rtde_io.setInputIntRegister(
                                 SEQUENCE_INPUT_REGISTER, sequence
                             ):
                                 raise ConnectionError("Befehlsregister wurde nicht bestätigt.")
-                            self._requested_pose = pose
+                            self._requested_mode = mode
+                            self._requested_value = value
                             self._requested_sequence = sequence
                             self.event_message.emit(
-                                f"Pose {pose} als Auswahl #{sequence} an das UR-Programm übergeben."
+                                f"UR-Ziel {value} als Auswahl #{sequence} "
+                                "an das UR-Programm übergeben."
                             )
                     except queue.Empty:
                         pass
@@ -340,7 +357,14 @@ class RobotWorker(QObject):
                             pass
                         rtde_io = None
 
-                status.requested_pose = self._requested_pose
+                status.command_mode = self._requested_mode
+                status.requested_raw_value = self._requested_value
+                if self._requested_mode is RobotCommandMode.ANGLE:
+                    status.requested_angle_deg = (
+                        None if self._requested_value is None else self._requested_value / 10.0
+                    )
+                else:
+                    status.requested_pose = self._requested_value
                 status.requested_sequence = self._requested_sequence
                 status.command_pending = (
                     self._requested_sequence is not None
@@ -424,6 +448,36 @@ class RobotAdapter(DeviceAdapter):
         self._thread = None
 
     def request_pose(self, pose: int) -> bool:
+        return self._request_pose_legacy(pose)
+
+    def request_angle(self, angle_deg: float) -> bool:
+        angle_tenths = round(float(angle_deg) * 10.0)
+        if abs(float(angle_deg) * 10.0 - angle_tenths) > 1e-6:
+            self._emit_error("UR-Winkel sind nur in Schritten von 0,1 Grad zulässig.")
+            return False
+        if not ANGLE_MIN_TENTHS <= angle_tenths <= ANGLE_MAX_TENTHS:
+            self._emit_error("Der UR-Winkel muss zwischen 15,5 und 21,0 Grad liegen.")
+            return False
+        if self._worker is None or self._thread is None or not self._thread.isRunning():
+            self._emit_error(
+                "Ein UR-Winkel kann nur bei bestehender Verbindung angefordert werden."
+            )
+            return False
+        if self._pending_sequence is not None:
+            self._emit_error("Das vorherige UR-Ziel wurde noch nicht bestätigt.")
+            return False
+        self._next_sequence = (self._next_sequence + 1) & 0x7FFFFFFF
+        if self._next_sequence == 0:
+            self._next_sequence = 1
+        self._pending_sequence = self._next_sequence
+        self._worker.enqueue_angle_command(angle_tenths, self._next_sequence)
+        self._emit_event(
+            f"Winkel {angle_tenths / 10.0:.1f} Grad angefordert "
+            f"(Auswahl #{self._next_sequence})."
+        )
+        return True
+
+    def _request_pose_legacy(self, pose: int) -> bool:
         if pose not in ALLOWED_POSES:
             self._emit_error(f"Pose {pose} ist nicht freigegeben.")
             return False

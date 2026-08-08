@@ -74,6 +74,27 @@ def test_ramp_pairing_uses_sample_id_even_when_brightness_repeats(tmp_path: Path
     assert [pair.foreground.key.ramp_sample_id for pair in pairs] == [0, 1]
 
 
+def test_continuous_angle_and_belt_station_are_part_of_capture_key(tmp_path: Path) -> None:
+    foreground = tmp_path / "continuous"
+    foreground.mkdir()
+    image = np.zeros((20, 30), dtype=np.uint8)
+    names = (
+        "img_000001_ura-0155_belt-001_pos-0100_out_p1-000_p2-000_auto.png",
+        "img_000002_ura-0155_belt-009_pos-0100_back_p1-000_p2-000_auto.png",
+    )
+    for name in names:
+        cv2.imwrite(str(foreground / name), image)
+
+    records = scan_capture(foreground)
+    keys = sorted(records, key=lambda key: key.conveyor_station_id)
+
+    assert [key.robot_mode for key in keys] == ["angle", "angle"]
+    assert [key.pose_id for key in keys] == [155, 155]
+    assert [key.conveyor_station_id for key in keys] == [1, 9]
+    assert [key.conveyor_direction for key in keys] == ["out", "back"]
+    assert keys[0].view_id != keys[1].view_id
+
+
 def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) -> None:
     foreground = tmp_path / "parts_ramp"
     background = tmp_path / "empty_grid"

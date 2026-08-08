@@ -50,7 +50,7 @@ def test_variation_order_exhausts_lights_before_next_pose(tmp_path: Path) -> Non
     assert [point.pose for point in points[6:]] == [160] * 6
 
 
-def test_exposure_is_innermost_variation(tmp_path: Path) -> None:
+def test_each_exposure_runs_all_light_variations(tmp_path: Path) -> None:
     settings = AcquisitionSettings(
         output_directory=tmp_path,
         pose_start=180,
@@ -68,8 +68,73 @@ def test_exposure_is_innermost_variation(tmp_path: Path) -> None:
 
     points = build_capture_points(settings)
 
-    assert [point.exposure_time_us for point in points] == [1000, 2000, 1000, 2000]
-    assert [point.light_1_brightness for point in points] == [10, 10, 20, 20]
+    assert [point.exposure_time_us for point in points] == [1000, 1000, 2000, 2000]
+    assert [point.light_1_brightness for point in points] == [10, 20, 10, 20]
+
+
+def test_continuous_angle_conveyor_order_is_robot_belt_exposure_light(tmp_path: Path) -> None:
+    settings = AcquisitionSettings(
+        output_directory=tmp_path,
+        robot_control_mode="angle",
+        angle_start_deg=15.5,
+        angle_end_deg=16.0,
+        angle_step_deg=0.5,
+        conveyor_enabled=True,
+        conveyor_max_offset_mm=20.0,
+        conveyor_step_mm=10.0,
+        light_1_start=0,
+        light_1_end=10,
+        light_1_step=10,
+        light_2_start=0,
+        light_2_end=0,
+    )
+
+    points = build_capture_points(settings)
+    first_light_per_station = points[::2]
+
+    station_targets = [
+        (point.angle_tenths, point.conveyor_offset_mm, point.conveyor_direction)
+        for point in first_light_per_station
+    ]
+    assert station_targets == [
+        (155, 0.0, "out"),
+        (155, 10.0, "out"),
+        (155, 20.0, "out"),
+        (155, 10.0, "back"),
+        (155, 0.0, "back"),
+        (160, 0.0, "out"),
+        (160, 10.0, "out"),
+        (160, 20.0, "out"),
+        (160, 10.0, "back"),
+        (160, 0.0, "back"),
+    ]
+    assert all(
+        points[index].robot_key == points[index + 1].robot_key
+        and points[index].conveyor_key == points[index + 1].conveyor_key
+        for index in range(0, len(points), 2)
+    )
+
+
+def test_continuous_capture_filename_contains_angle_and_belt_station(tmp_path: Path) -> None:
+    writer = DatasetWriter()
+    writer.start_session(tmp_path)
+    point = CapturePoint(
+        155,
+        10,
+        20,
+        None,
+        robot_control_mode="angle",
+        angle_tenths=155,
+        conveyor_station_id=3,
+        conveyor_offset_mm=30.0,
+        conveyor_direction="out",
+    )
+
+    image, metadata = writer.expected_paths(0, point)
+    writer.close()
+
+    assert image.name == "img_000001_ura-0155_belt-003_pos-0300_out_p1-010_p2-020_auto.png"
+    assert metadata.stem == image.stem
 
 
 def test_default_ramp_has_60_unique_samples_and_triangle_extremes(tmp_path: Path) -> None:

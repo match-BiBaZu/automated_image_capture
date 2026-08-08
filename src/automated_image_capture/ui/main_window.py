@@ -27,7 +27,12 @@ from PyQt6.QtWidgets import (
 )
 
 from automated_image_capture.acquisition import AcquisitionController, build_capture_points
-from automated_image_capture.hardware import CameraAdapter, LightAdapter, RobotAdapter
+from automated_image_capture.hardware import (
+    CameraAdapter,
+    ConveyorAdapter,
+    LightAdapter,
+    RobotAdapter,
+)
 from automated_image_capture.inference import (
     InferenceFrame,
     LiveInferenceConfig,
@@ -37,6 +42,7 @@ from automated_image_capture.models import (
     CameraFrame,
     CameraStatus,
     ConnectionState,
+    ConveyorStatus,
     LightStatus,
     RobotStatus,
 )
@@ -47,6 +53,7 @@ from automated_image_capture.ui.widgets import (
     AcquisitionCard,
     AcquisitionDialog,
     CameraControlCard,
+    ConveyorControlCard,
     LightControlCard,
     RobotPoseControlCard,
     SettingsDialog,
@@ -76,6 +83,7 @@ class MainWindow(QMainWindow):
         self._training_dialog: TrainingDialog | None = None
         self.camera = CameraAdapter(self.config, self)
         self.robot = RobotAdapter(self.config, self)
+        self.conveyor = ConveyorAdapter(self.config, self)
         self.light = LightAdapter(
             self.config,
             self,
@@ -96,6 +104,7 @@ class MainWindow(QMainWindow):
             self.light,
             self.light_2,
             self,
+            conveyor=self.conveyor,
         )
 
         self._build_ui()
@@ -126,7 +135,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(labeling_button)
         toolbar.addWidget(training_button)
         toolbar.addStretch(1)
-        safety = QLabel("UR16e: nur freigegebene Posen über RTDE-Handshake")
+        safety = QLabel("UR16e: Bewegungsziele nur über den geprüften RTDE-Handshake")
         safety.setStyleSheet("color:#b45309; font-weight:600;")
         toolbar.addWidget(safety)
         toolbar.addWidget(settings_button)
@@ -137,16 +146,21 @@ class MainWindow(QMainWindow):
         cards_layout = QVBoxLayout(cards_container)
         self.camera_card = CameraControlCard("Baumer Industriekamera")
         self.robot_card = RobotPoseControlCard("Universal Robots UR16e")
+        self.conveyor_card = ConveyorControlCard(
+            "TwinCAT-Förderband", self.config.conveyor_forward_direction
+        )
         self.light_card = LightControlCard("Neewer RGB660 Pro II · Licht 1")
         self.light_2_card = LightControlCard("Neewer RGB660 Pro II · Licht 2")
         self.acquisition_card = AcquisitionCard()
         self.camera_card.action_requested.connect(lambda: self._toggle(self.camera))
         self.robot_card.action_requested.connect(lambda: self._toggle(self.robot))
+        self.conveyor_card.action_requested.connect(lambda: self._toggle(self.conveyor))
         self.light_card.action_requested.connect(lambda: self._toggle(self.light))
         self.light_2_card.action_requested.connect(lambda: self._toggle(self.light_2))
         cards_layout.addWidget(self.acquisition_card)
         cards_layout.addWidget(self.camera_card)
         cards_layout.addWidget(self.robot_card)
+        cards_layout.addWidget(self.conveyor_card)
         cards_layout.addWidget(self.light_card)
         cards_layout.addWidget(self.light_2_card)
         self.light_power = self.light_card.power_button
@@ -242,6 +256,7 @@ class MainWindow(QMainWindow):
         for adapter, card in (
             (self.camera, self.camera_card),
             (self.robot, self.robot_card),
+            (self.conveyor, self.conveyor_card),
             (self.light, self.light_card),
             (self.light_2, self.light_2_card),
         ):
@@ -255,6 +270,13 @@ class MainWindow(QMainWindow):
         self.camera_card.exposure_requested.connect(self.camera.set_exposure_time)
         self.robot.status_changed.connect(self._robot_status)
         self.robot_card.pose_requested.connect(self.robot.request_pose)
+        self.conveyor.status_changed.connect(self._conveyor_status)
+        self.conveyor_card.jog_requested.connect(self._jog_conveyor)
+        self.conveyor_card.stop_requested.connect(self.conveyor.stop_motion)
+        self.conveyor_card.origin_requested.connect(self.conveyor.set_current_as_origin)
+        self.conveyor_card.forward_direction_changed.connect(
+            self._set_conveyor_forward_direction
+        )
         self.light.status_changed.connect(self._light_status)
         self.light.state_changed.connect(self._light_state)
         self.light_2.status_changed.connect(self._light_2_status)
@@ -270,6 +292,9 @@ class MainWindow(QMainWindow):
         self.acquisition_card.start_requested.connect(self.start_acquisition)
         self.acquisition_card.resume_requested.connect(self.resume_acquisition)
         self.acquisition_card.stop_requested.connect(self.acquisition.stop)
+        self.acquisition_card.align_conveyor_requested.connect(
+            self._align_conveyor_for_resume
+        )
         self.acquisition.running_changed.connect(self.acquisition_card.set_running)
         self.acquisition.resume_available_changed.connect(
             self.acquisition_card.set_resume_available
@@ -280,8 +305,13 @@ class MainWindow(QMainWindow):
         self.acquisition.error.connect(
             lambda message: self._show_error("Automatische Aufnahme", message)
         )
+        self.acquisition.alignment_required_changed.connect(
+            self.acquisition_card.set_alignment_required
+        )
 
-    def _toggle(self, adapter: CameraAdapter | RobotAdapter | LightAdapter) -> None:
+    def _toggle(
+        self, adapter: CameraAdapter | ConveyorAdapter | RobotAdapter | LightAdapter
+    ) -> None:
         if adapter.state is ConnectionState.DISCONNECTED:
             adapter.connect()
         else:
@@ -290,6 +320,7 @@ class MainWindow(QMainWindow):
     def connect_all(self) -> None:
         self.camera.connect()
         self.robot.connect()
+        self.conveyor.connect()
         self.light.connect()
         self.light_2.connect()
 
@@ -297,6 +328,7 @@ class MainWindow(QMainWindow):
         self.acquisition.stop()
         self.camera.disconnect()
         self.robot.disconnect()
+        self.conveyor.disconnect()
         self.light.disconnect()
         self.light_2.disconnect()
 
@@ -530,6 +562,50 @@ class MainWindow(QMainWindow):
             f"PolyScope: {status.polyscope_version}"
         )
 
+    def _conveyor_status(self, status: ConveyorStatus) -> None:
+        self.conveyor_card.set_status(status)
+
+    def _jog_conveyor(self, direction: str) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Förderband-Testfahrt",
+            f"Das Förderband fährt 1 mm nach {direction}. Ist der Arbeitsraum frei?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.conveyor.jog(direction, 1.0, 10.0)
+
+    def _set_conveyor_forward_direction(self, direction: str) -> None:
+        if not direction:
+            self.config.conveyor_forward_direction = ""
+        else:
+            self.conveyor.set_forward_direction(direction)
+            self.config.conveyor_forward_direction = direction
+        self.settings_store.save(self.config)
+        if direction:
+            self._append_event(
+                f"Förderband-Vorwärtsrichtung gespeichert: "
+                f"{'links' if direction == 'left' else 'rechts'}."
+            )
+
+    def _align_conveyor_for_resume(self) -> None:
+        expected = self.acquisition.expected_resume_offset_mm
+        if expected is None:
+            return
+        current = self.conveyor.status.logical_offset_mm
+        answer = QMessageBox.question(
+            self,
+            "Förderband auf Checkpoint ausrichten",
+            f"Das Förderband fährt von "
+            f"{'unbekannt' if current is None else f'{current:.3f} mm'} auf "
+            f"{expected:g} mm. Ist der Arbeitsraum frei?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.acquisition.align_for_resume()
+
     def _light_state(self, state: ConnectionState) -> None:
         self.light_card.set_connection_state(state)
 
@@ -566,6 +642,7 @@ class MainWindow(QMainWindow):
         self.settings_store.save(self.config)
         self.camera.config = self.config
         self.robot.config = self.config
+        self.conveyor.config = self.config
         self.light.config = self.config
         self.light_2.config = self.config
         self.statusBar().showMessage(f"Kamera {self.config.camera_ip} · UR {self.config.robot_ip}")
@@ -607,6 +684,7 @@ class MainWindow(QMainWindow):
 
     def start_acquisition(self) -> None:
         count = len(build_capture_points(self.acquisition_config))
+        moving_devices = "UR und Förderband" if self.acquisition_config.conveyor_enabled else "UR"
         interrupted = (
             "\n\nEine unterbrochene Sitzung ist vorhanden. Beim Start einer neuen Sitzung "
             "wird deren Fortsetzung verworfen."
@@ -616,7 +694,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Automatische Roboterbewegung starten",
-            f"Die Sitzung umfasst {count} Aufnahmen und verfährt den UR automatisch.\n\n"
+            f"Die Sitzung umfasst {count} Aufnahmen und verfährt {moving_devices} automatisch.\n\n"
             f"Ist der Arbeitsraum frei und darf die Sequenz gestartet werden?{interrupted}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -633,7 +711,8 @@ class MainWindow(QMainWindow):
             self,
             "Automatische Aufnahme fortsetzen",
             f"Es fehlen noch {remaining} Aufnahmen in:\n{session}\n\n"
-            "Die Hardware wird erneut geprüft und der UR fährt die nächste benötigte Pose an. "
+            "Die Hardware wird erneut geprüft; UR und gegebenenfalls Förderband fahren auf "
+            "das nächste benötigte Ziel. "
             "Ist der Arbeitsraum frei und wurde die Fehlerursache behoben?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -649,6 +728,7 @@ class MainWindow(QMainWindow):
         for card in (
             self.camera_card,
             self.robot_card,
+            self.conveyor_card,
             self.light_card,
             self.light_2_card,
         ):
@@ -675,6 +755,7 @@ class MainWindow(QMainWindow):
             self._training_dialog.shutdown()
         self.camera.disconnect()
         self.robot.disconnect()
+        self.conveyor.disconnect()
         event.accept()
 
     async def shutdown_async(self) -> None:
@@ -684,5 +765,6 @@ class MainWindow(QMainWindow):
         self.acquisition.close()
         self.camera.disconnect()
         self.robot.disconnect()
+        self.conveyor.disconnect()
         await self.light.shutdown()
         await self.light_2.shutdown()

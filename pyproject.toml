@@ -17,6 +17,7 @@ dependencies = [
     "neewerlite==0.3.3",
     "numpy>=2.0,<3",
     "opencv-python>=4.10,<5",
+    "pyads==3.6.0",
     "qasync>=0.27,<1",
     "torch==2.7.1",
     "torchvision==0.22.1",

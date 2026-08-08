@@ -15,7 +15,9 @@ import cv2
 import numpy as np
 
 CAPTURE_NAME = re.compile(
-    r"^img_(?P<index>\d+)_ur(?P<pose>\d+)_(?:ramp-(?P<ramp>\d+)_)?"
+    r"^img_(?P<index>\d+)_(?:ur(?P<pose>\d+)|ura-(?P<angle>\d+))_"
+    r"(?:belt-(?P<belt>\d+)_pos-(?P<position>\d+)_(?P<direction>out|back)_)?"
+    r"(?:ramp-(?P<ramp>\d+)_)?"
     r"p1-(?P<p1>\d+)_p2-(?P<p2>\d+)_"
     r"(?P<exposure>auto|e\d+us)\.png$",
     re.IGNORECASE,
@@ -37,11 +39,20 @@ class CaptureKey:
     panel_1: int
     exposure: str
     ramp_sample_id: int | None = None
+    robot_mode: str = "pose_id"
+    conveyor_station_id: int = 0
+    conveyor_position_tenths_mm: int = 0
+    conveyor_direction: str = "fixed"
+
+    @property
+    def view_id(self) -> tuple[int, int]:
+        return (self.pose_id, self.conveyor_station_id)
 
 
-def _capture_sort_key(key: CaptureKey) -> tuple[int, str, int, int, int]:
+def _capture_sort_key(key: CaptureKey) -> tuple[int, int, str, int, int, int]:
     return (
         key.pose_id,
+        key.conveyor_station_id,
         key.exposure,
         -1 if key.ramp_sample_id is None else key.ramp_sample_id,
         key.panel_2,
@@ -180,11 +191,17 @@ def scan_capture(directory: Path) -> dict[CaptureKey, CaptureRecord]:
         if match is None:
             continue
         key = CaptureKey(
-            pose_id=int(match.group("pose")),
+            pose_id=int(match.group("pose") or match.group("angle")),
             panel_2=int(match.group("p2")),
             panel_1=int(match.group("p1")),
             exposure=match.group("exposure").lower(),
             ramp_sample_id=(None if match.group("ramp") is None else int(match.group("ramp"))),
+            robot_mode="angle" if match.group("angle") is not None else "pose_id",
+            conveyor_station_id=(0 if match.group("belt") is None else int(match.group("belt"))),
+            conveyor_position_tenths_mm=(
+                0 if match.group("position") is None else int(match.group("position"))
+            ),
+            conveyor_direction=match.group("direction") or "fixed",
         )
         if key in records:
             raise LabelingError(
@@ -499,13 +516,13 @@ def _make_review_sheet(
 
 
 def _make_pose_overview(
-    consensuses: dict[int, PoseConsensus],
-    grouped: dict[int, list[MatchedPair]],
+    consensuses: dict[int | tuple[int, int], PoseConsensus],
+    grouped: dict[int | tuple[int, int], list[MatchedPair]],
     destination: Path,
 ) -> None:
     tiles: list[np.ndarray] = []
-    for pose_id, consensus in consensuses.items():
-        pairs = grouped[pose_id]
+    for view_id, consensus in consensuses.items():
+        pairs = grouped[view_id]
         pair = pairs[len(pairs) // 2]
         image = cv2.imread(str(pair.foreground.path), cv2.IMREAD_COLOR)
         if image is None:
@@ -513,7 +530,11 @@ def _make_pose_overview(
         cv2.polylines(image, [np.rint(consensus.box).astype(np.int32)], True, (0, 255, 0), 6)
         cv2.putText(
             image,
-            f"Pose {pose_id}",
+            (
+                f"Pose {view_id[0]} / Band {view_id[1]}"
+                if isinstance(view_id, tuple)
+                else f"Pose {view_id}"
+            ),
             (30, 75),
             cv2.FONT_HERSHEY_SIMPLEX,
             2.0,
@@ -565,17 +586,17 @@ def generate_obb_dataset(
             int,
             LabelSource,
             list[MatchedPair],
-            dict[int, list[MatchedPair]],
+            dict[tuple[int, int], list[MatchedPair]],
         ]
     ] = []
     all_pose_ids: set[int] = set()
     for class_id, source in enumerate(config.pose_sources):
         foreground = scan_capture(source.directory)
         pairs = match_captures(foreground, background)
-        grouped: dict[int, list[MatchedPair]] = defaultdict(list)
+        grouped: dict[tuple[int, int], list[MatchedPair]] = defaultdict(list)
         for pair in pairs:
-            grouped[pair.foreground.key.pose_id].append(pair)
-        all_pose_ids.update(grouped)
+            grouped[pair.foreground.key.view_id].append(pair)
+            all_pose_ids.add(pair.foreground.key.pose_id)
         source_data.append((class_id, source, pairs, grouped))
 
     pose_ids = sorted(all_pose_ids)
@@ -584,26 +605,32 @@ def generate_obb_dataset(
     if config.include_background_negatives:
         total_steps += len(background)
     completed = 0
-    all_consensuses: dict[tuple[int, int], PoseConsensus] = {}
+    all_consensuses: dict[tuple[int, int, int], PoseConsensus] = {}
     report_rows: list[dict[str, object]] = []
     write_records: list[tuple[dict[str, object], MatchedPair, int, LabelSource]] = []
     for class_id, source, _, grouped in source_data:
-        for pose_id in sorted(grouped):
+        for view_id in sorted(grouped):
+            pose_id, station_id = view_id
             consensus, rows = build_pose_consensus(
                 pose_id,
-                grouped[pose_id],
+                grouped[view_id],
                 config,
                 progress,
                 completed,
                 total_steps,
                 cancelled,
             )
-            completed += len(grouped[pose_id])
-            all_consensuses[(class_id, pose_id)] = consensus
-            for row, pair in zip(rows, grouped[pose_id], strict=True):
+            completed += len(grouped[view_id])
+            all_consensuses[(class_id, pose_id, station_id)] = consensus
+            for row, pair in zip(rows, grouped[view_id], strict=True):
                 row["class_id"] = class_id
                 row["class_name"] = source.name
                 row["source_directory"] = str(source.directory)
+                row["conveyor_station_id"] = station_id
+                row["conveyor_position_mm"] = (
+                    pair.foreground.key.conveyor_position_tenths_mm / 10.0
+                )
+                row["conveyor_direction"] = pair.foreground.key.conveyor_direction
                 report_rows.append(row)
                 write_records.append((row, pair, class_id, source))
 
@@ -620,6 +647,7 @@ def generate_obb_dataset(
         if cancelled is not None and cancelled():
             raise LabelingCancelled("Label-Erzeugung abgebrochen.")
         pose_id = pair.foreground.key.pose_id
+        station_id = pair.foreground.key.conveyor_station_id
         split = "val" if pose_id in validation_poses else "train"
         image = _read_gray(pair.foreground.path)
         height, width = image.shape
@@ -631,7 +659,7 @@ def generate_obb_dataset(
         _link_or_copy(pair.foreground.path, positive_image, config.prefer_hardlinks)
         positive_label.write_text(
             _normalized_obb(
-                all_consensuses[(class_id, pose_id)].box,
+                all_consensuses[(class_id, pose_id, station_id)].box,
                 width,
                 height,
                 class_id,
@@ -667,19 +695,20 @@ def generate_obb_dataset(
                 progress(completed, total_steps, f"Übernehme Leerbild · UR-Pose {pose_id}")
 
     for class_id, source, _, grouped in source_data:
-        class_consensuses: dict[int, PoseConsensus] = {}
+        class_consensuses: dict[tuple[int, int], PoseConsensus] = {}
         prefix = f"class_{class_id:03d}_{_filename_slug(source.name)}"
-        for pose_id in sorted(grouped):
-            consensus = all_consensuses[(class_id, pose_id)]
-            class_consensuses[pose_id] = consensus
+        for view_id in sorted(grouped):
+            pose_id, station_id = view_id
+            consensus = all_consensuses[(class_id, pose_id, station_id)]
+            class_consensuses[view_id] = consensus
             cv2.imwrite(
-                str(review / f"{prefix}_ur_{pose_id}_consensus_mask.png"),
+                str(review / f"{prefix}_ur_{pose_id}_belt_{station_id}_consensus_mask.png"),
                 consensus.mask,
             )
             _make_review_sheet(
                 consensus,
-                grouped[pose_id],
-                review / f"{prefix}_ur_{pose_id}_obb.jpg",
+                grouped[view_id],
+                review / f"{prefix}_ur_{pose_id}_belt_{station_id}_obb.jpg",
             )
         _make_pose_overview(
             class_consensuses,
@@ -700,23 +729,25 @@ def generate_obb_dataset(
                 "name": source.name,
                 "source_directory": str(source.directory),
                 "poses": {
-                    str(pose_id): {
-                        "images": all_consensuses[(class_id, pose_id)].pair_count,
+                    f"{pose_id}/belt-{station_id}": {
+                        "images": all_consensuses[(class_id, pose_id, station_id)].pair_count,
                         "median_consensus_iou": round(
-                            all_consensuses[(class_id, pose_id)].median_iou,
+                            all_consensuses[(class_id, pose_id, station_id)].median_iou,
                             6,
                         ),
                         "minimum_consensus_iou": round(
-                            all_consensuses[(class_id, pose_id)].minimum_iou,
+                            all_consensuses[(class_id, pose_id, station_id)].minimum_iou,
                             6,
                         ),
-                        "flagged_images": all_consensuses[(class_id, pose_id)].flagged_count,
+                        "flagged_images": all_consensuses[
+                            (class_id, pose_id, station_id)
+                        ].flagged_count,
                         "obb_pixels": [
                             [round(float(x), 2), round(float(y), 2)]
-                            for x, y in all_consensuses[(class_id, pose_id)].box
+                            for x, y in all_consensuses[(class_id, pose_id, station_id)].box
                         ],
                     }
-                    for pose_id in sorted(grouped)
+                    for pose_id, station_id in sorted(grouped)
                 },
             }
             for class_id, source, _, grouped in source_data

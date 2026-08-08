@@ -11,6 +11,7 @@ from automated_image_capture.inference import InferenceDetection, InferenceFrame
 from automated_image_capture.models import (
     CameraStatus,
     ConnectionState,
+    ConveyorStatus,
     LightStatus,
     RobotStatus,
 )
@@ -196,6 +197,45 @@ def test_acquisition_dialog_switches_to_persistable_ramp_settings(qtbot, tmp_pat
     assert "100" in dialog.estimate.text()
 
 
+def test_acquisition_dialog_configures_continuous_angles_and_conveyor(qtbot, tmp_path) -> None:
+    dialog = AcquisitionDialog(AcquisitionSettings(output_directory=Path(tmp_path)))
+    qtbot.addWidget(dialog)
+
+    dialog.robot_control_mode.setCurrentIndex(dialog.robot_control_mode.findData("angle"))
+    dialog.conveyor_enabled.setChecked(True)
+    dialog.conveyor_max_offset.setValue(50.0)
+    dialog.conveyor_step.setValue(10.0)
+    config = dialog._current_config().validated()
+
+    assert config.robot_control_mode == "angle"
+    assert config.angle_step_deg == 0.5
+    assert config.conveyor_enabled
+    assert config.conveyor_max_offset_mm == 50.0
+    assert config.conveyor_step_mm == 10.0
+    assert dialog.angle_row.isVisibleTo(dialog)
+    assert not dialog.pose_row.isVisibleTo(dialog)
+
+
+def test_conveyor_card_shows_calibration_and_enables_manual_controls(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+    window.conveyor_card.set_state(ConnectionState.CONNECTED)
+    window._conveyor_status(
+        ConveyorStatus(
+            connected=True,
+            calibration_valid=True,
+            mm_per_full_step=0.32960026,
+            ready_to_execute=True,
+            internal_position=1234,
+            logical_offset_mm=0.0,
+        )
+    )
+
+    assert "gültig" in window.conveyor_card.details.text()
+    assert window.conveyor_card.left_button.isEnabled()
+    assert window.conveyor_card.right_button.isEnabled()
+    assert window.conveyor_card.origin_button.isEnabled()
+
+
 def test_robot_pose_requires_running_program_and_one_time_consent(qtbot, tmp_path) -> None:
     window = make_window(qtbot, tmp_path)
     spy = QSignalSpy(window.robot_card.pose_requested)
@@ -245,4 +285,23 @@ def test_robot_pose_is_disabled_while_command_is_pending(qtbot, tmp_path) -> Non
     )
 
     window.robot_card.motion_consent.setChecked(True)
+    assert not window.robot_card.move_button.isEnabled()
+
+
+def test_fixed_pose_button_is_disabled_for_continuous_ur_program(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+    window._robot_status(
+        RobotStatus(
+            rtde_connected=True,
+            dashboard_connected=True,
+            command_channel_connected=True,
+            robot_mode="RUNNING",
+            safety_mode="NORMAL",
+            program_state="PLAYING",
+            loaded_program="/programs/BiBaZu_Continuous.urp",
+            command_state_code=1,
+        )
+    )
+    window.robot_card.motion_consent.setChecked(True)
+
     assert not window.robot_card.move_button.isEnabled()

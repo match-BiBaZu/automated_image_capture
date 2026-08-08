@@ -1,0 +1,11 @@
+def BiBaZu_Continuous_Ack():
+  if command_valid:
+    write_output_integer_register(41, angle)
+    write_output_integer_register(43, 3)
+    write_output_integer_register(42, active_command)
+    global last_command = active_command
+    global command_valid = False
+  end
+end
+
+BiBaZu_Continuous_Ack()

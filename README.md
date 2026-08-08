@@ -61,6 +61,28 @@ Kamera- und Lichtauswahl wird über `QSettings` im Windows-Benutzerprofil gespei
    auswählen und die einmalige Bewegungsfreigabe bestätigen.
 7. Die Lichter erst nach erfolgreicher Verbindung über Ein/Aus, Helligkeit, CCT oder HSI ändern.
 
+## Kontinuierlicher UR-Winkel und Förderband
+
+Zusätzlich zu den festen Pose-IDs unterstützt die Aufnahme `BiBaZu_Continuous.urp`.
+Das am Handbediengerät eingelernte XYZ bleibt erhalten; variiert wird der Winkel von
+15,5 bis 21,0 Grad. Das fertige URP und seine Skriptdateien liegen unter `ur_program/`.
+
+Das Förderband wird über TwinCAT ADS angesprochen. Vorgaben sind SPS `192.168.10.23`,
+AMS-Net-ID `10.145.4.14.1.1` und PLC-Port 851. Windows benötigt dafür die TwinCAT-ADS-
+Runtime, eine beidseitige AMS-Route und eine Netzwerkkonfiguration, welche die SPS erreicht.
+`PressureControlGUI` darf während der Aufnahme nicht gleichzeitig das Band steuern.
+
+Vor einer neuen Serie wird das Bauteil hinten platziert und in der Förderbandkarte
+**Aktuelle Position = 0 mm** gewählt. Nach zwei 1-mm-Testfahrten wird Links oder Rechts als
+Vorwärtsrichtung gespeichert. Die Aufnahmereihenfolge ist UR-Ziel → Förderbandstation →
+Belichtung → vollständige Lichtvariation. Standardmäßig fährt das Band
+`0, 10, 20, 30, 40, 50, 40, 30, 20, 10, 0 mm`; Hin- und Rückweg sind getrennte Stationen.
+
+Beim Stoppen sendet die Anwendung einen Förderband-Stop und gibt den SPS-Positioniermodus
+frei. Eine UR-Fahrt wird weiterhin nicht extern abgebrochen. Beim Fortsetzen wird die interne
+SPS-Position gegen den gespeicherten Nullpunkt geprüft. Abweichungen erfordern eine separat
+bestätigte Korrekturfahrt.
+
 ## YOLO im Kamera-Livebild
 
 Oberhalb des Kamerabilds lässt sich **YOLO Live-Erkennung** zuschalten. Beim ersten Start
@@ -78,18 +100,21 @@ deutlich länger als die folgenden Frames.
 
 ## Automatische Aufnahme
 
-1. `BiBaZu_GUI.urp` am Teach Pendant laden und manuell starten.
-2. Kamera, UR und beide Panels in der GUI verbinden.
-3. Unter **Aufnahme konfigurieren** Speicherort, UR-Start-/Endpose und den Modus festlegen:
+1. Passend zum UR-Modus `BiBaZu_GUI.urp` oder `BiBaZu_Continuous.urp` am Teach Pendant
+   laden und manuell starten.
+2. Kamera, UR, beide Panels und bei aktivierter Positionsvariation das Förderband verbinden.
+3. Unter **Aufnahme konfigurieren** Speicherort, UR-Modus und den Lichtmodus festlegen:
    **Exaktes Raster** verwendet feste Helligkeitsschritte; **Schnelle Rampe** nimmt während
    zeitbasierter Dreieckskurven beider Panels kontinuierlich Bilder auf.
-4. Optional die Belichtungsvariation aktivieren, wenn die verbundene Kamera eine manuell
+4. Für eine Bandserie Vorwärtsrichtung bestätigen, das Bauteil hinten platzieren und die
+   aktuelle Position ausdrücklich als logischen Nullpunkt übernehmen.
+5. Optional die Belichtungsvariation aktivieren, wenn die verbundene Kamera eine manuell
    beschreibbare `ExposureTime` meldet.
-5. **Aufnahme starten** wählen und die Freigabe des Arbeitsraums bestätigen.
+6. **Aufnahme starten** wählen und die Freigabe des Arbeitsraums bestätigen.
 
-Die Reihenfolge ist Pose → Panel 2 → Panel 1 → Belichtung. Panel 1 läuft damit vollständig
-durch, bevor Panel 2 erhöht wird; erst nach sämtlichen Lichtkombinationen wird der UR verfahren.
-Im Rampenmodus ist die Reihenfolge Pose → Belichtung → Rampen-Sample. Das Standardprofil
+Die allgemeine Reihenfolge ist UR-Ziel → Bandstation → Belichtung → Lichtvariation. Im
+Rastermodus läuft Panel 1 je Panel-2-Wert vollständig durch. Im Rampenmodus wird pro
+Belichtung eine vollständige Rampe aufgenommen. Das Standardprofil
 speichert 60 Bilder in 10 Sekunden bei Panelperioden von 2,4 und 10 Sekunden. Pro Panel läuft
 höchstens ein BLE-Befehl gleichzeitig; veraltete Zwischenziele werden übersprungen. Die
 Dateinamen enthalten `ramp-NNN`, und die YAML-Dateien dokumentieren Sollzeit, tatsächliche

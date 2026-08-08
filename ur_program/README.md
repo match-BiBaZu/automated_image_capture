@@ -46,3 +46,18 @@ moving, preventing an old register value from causing an unexpected movement.
 The graphical movement nodes retain the original programmed acceleration and
 speed. Reduce the teach-pendant speed slider for initial commissioning. This
 does not replace the robot safety configuration or a collision review.
+
+## Kontinuierlicher Winkelmodus
+
+`Build_BiBaZu_Continuous.ps1` erzeugt `BiBaZu_Continuous.urp` samt den fünf
+zugehörigen `.script`-Dateien. Das Programm akzeptiert in Eingaberegister 42
+Werte von 155 bis 210 als Zehntelgrad. Register 43 bleibt die Befehlssequenz;
+Ausgaberegister 41/42/43 melden Winkel, quittierte Sequenz und Status.
+
+Nach dem Kopieren aller Dateien auf den Roboter wird der Wegpunkt
+`Rotation_Position` im `BeforeStart` am Handbediengerät neu eingelernt. Beim
+Programmstart wird dessen XYZ-Position aufgenommen. Weitere Befehle ändern nur
+die Basis-RPY-Orientierung Roll −45°, Pitch 15,5–21,0° und Yaw −90°.
+
+Die Desktopanwendung lädt oder startet das UR-Programm nicht. Es darf außerdem
+kein zweiter RTDE-Client gleichzeitig die Register 42/43 steuern.
