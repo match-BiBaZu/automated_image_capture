@@ -17,6 +17,7 @@ from automated_image_capture.acquisition import (
     DatasetWriter,
     build_capture_points,
     dump_yaml,
+    ramp_command_timed_out,
     triangle_brightness,
 )
 from automated_image_capture.models import (
@@ -92,6 +93,12 @@ def test_default_ramp_has_60_unique_samples_and_triangle_extremes(tmp_path: Path
     assert triangle_brightness(0.0, 2.4) == 0
     assert triangle_brightness(1.2, 2.4) == 100
     assert triangle_brightness(2.4, 2.4) == 0
+
+
+def test_ramp_ble_timeout_allows_normal_one_second_rgb660_latency() -> None:
+    assert not ramp_command_timed_out(SimpleNamespace(command_busy=True, command_age_seconds=1.4))
+    assert ramp_command_timed_out(SimpleNamespace(command_busy=True, command_age_seconds=3.1))
+    assert not ramp_command_timed_out(SimpleNamespace(command_busy=False, command_age_seconds=99.0))
 
 
 def test_ramp_order_is_pose_then_exposure_then_sample(tmp_path: Path) -> None:

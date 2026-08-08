@@ -18,6 +18,8 @@ from automated_image_capture.models import (
 )
 from automated_image_capture.settings import AppSettings
 
+LIGHT_COMMAND_TIMEOUT_SECONDS = 3.0
+
 
 def _attribute(value: Any, name: str, default: Any = None) -> Any:
     result = getattr(value, name, default)
@@ -242,6 +244,12 @@ class LightAdapter(DeviceAdapter):
     def command_busy(self) -> bool:
         return self._command_busy
 
+    @property
+    def command_age_seconds(self) -> float:
+        if not self._command_busy:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_command_started_at)
+
     def try_set_ramp_brightness(self, brightness: int) -> bool:
         """Send when BLE is free; the caller retries later with its newest target."""
         now = time.monotonic()
@@ -307,18 +315,30 @@ class LightAdapter(DeviceAdapter):
 
         async def execute() -> None:
             try:
-                await operation()
+                await asyncio.wait_for(operation(), timeout=LIGHT_COMMAND_TIMEOUT_SECONDS)
                 self._status.values_are_confirmed_commands = True
                 self._status.last_command_confirmed_at = time.time()
+                self._status.last_command_duration_ms = (
+                    time.monotonic() - self._last_command_started_at
+                ) * 1000.0
                 self.status_changed.emit(self._status)
                 if not quiet:
                     self._emit_event(f"Bestätigter Befehl: {description}.")
             except Exception as exc:
+                failed_light, self._light = self._light, None
+                if failed_light is not None:
+                    with contextlib.suppress(Exception):
+                        await failed_light.disconnect()
                 self._set_state(ConnectionState.ERROR)
-                self._emit_error(f"Lichtbefehl fehlgeschlagen: {exc}")
+                if isinstance(exc, TimeoutError):
+                    self._emit_error(
+                        f"Lichtbefehl nach {LIGHT_COMMAND_TIMEOUT_SECONDS:g} Sekunden "
+                        "abgebrochen; Bluetooth wird neu verbunden."
+                    )
+                else:
+                    self._emit_error(f"Lichtbefehl fehlgeschlagen: {exc}")
                 self._status.connected = False
                 self.status_changed.emit(self._status)
-                self._light = None
                 self._schedule_reconnect()
             finally:
                 self._command_busy = False

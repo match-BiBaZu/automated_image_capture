@@ -89,6 +89,7 @@ class LightStatus:
     capabilities: LightCapabilities = field(default_factory=LightCapabilities)
     values_are_confirmed_commands: bool = False
     last_command_confirmed_at: float | None = None
+    last_command_duration_ms: float | None = None
 
 
 @dataclass(slots=True, frozen=True)

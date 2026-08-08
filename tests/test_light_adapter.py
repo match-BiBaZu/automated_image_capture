@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import automated_image_capture.hardware.light as light_module
 from automated_image_capture.hardware.light import LightAdapter
 from automated_image_capture.models import ConnectionState, DiscoveredLight, LightStatus
 from automated_image_capture.settings import AppSettings
@@ -133,6 +134,35 @@ async def test_ramp_commands_are_serialized_and_stale_targets_are_skipped(
     assert [command[2] for command in light.commands] == [10, 30]
     assert SlowFakeLight.maximum_active == 1
     assert adapter._status.last_command_confirmed_at is not None
+    assert adapter._status.last_command_duration_ms is not None
+    assert adapter._status.last_command_duration_ms >= 40
+    await adapter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stalled_light_command_disconnects_cleanly(qtbot, monkeypatch) -> None:
+    class HangingFakeLight(FakeLight):
+        async def set_cct(self, kelvin: int, brightness: int, gm: int = 50) -> None:
+            await asyncio.sleep(1.0)
+
+    FakeLight.instances.clear()
+    monkeypatch.setattr(light_module, "LIGHT_COMMAND_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setitem(
+        sys.modules,
+        "neewerlite",
+        SimpleNamespace(NeewerScanner=FakeScanner, NeewerLight=HangingFakeLight),
+    )
+    adapter = LightAdapter(AppSettings(auto_reconnect=False))
+    adapter.connect()
+    await wait_for(lambda: adapter.state is ConnectionState.CONNECTED)
+    light = FakeLight.instances[-1]
+
+    adapter.set_brightness(25)
+    await wait_for(lambda: adapter.state is ConnectionState.ERROR)
+
+    assert not light.client.is_connected
+    assert not adapter._status.connected
+    assert not adapter.command_busy
     await adapter.shutdown()
 
 

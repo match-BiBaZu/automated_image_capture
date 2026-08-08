@@ -14,7 +14,7 @@ import numpy as np
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from automated_image_capture.hardware.camera import CameraAdapter
-from automated_image_capture.hardware.light import LightAdapter
+from automated_image_capture.hardware.light import LIGHT_COMMAND_TIMEOUT_SECONDS, LightAdapter
 from automated_image_capture.hardware.robot import ALLOWED_POSES, RobotAdapter
 from automated_image_capture.models import (
     CameraFrame,
@@ -23,6 +23,15 @@ from automated_image_capture.models import (
     LightStatus,
     RobotStatus,
 )
+
+RAMP_BLE_COMMAND_TIMEOUT_SECONDS = LIGHT_COMMAND_TIMEOUT_SECONDS
+
+
+def ramp_command_timed_out(adapter: object) -> bool:
+    return (
+        bool(getattr(adapter, "command_busy", False))
+        and float(getattr(adapter, "command_age_seconds", 0.0)) > RAMP_BLE_COMMAND_TIMEOUT_SECONDS
+    )
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -408,6 +417,7 @@ class AcquisitionController(QObject):
         self._session_directory: Path | None = None
         self._writer_token = 0
         self._resume_available = False
+        self._last_finish_message = ""
         self._camera_status = CameraStatus()
         self._robot_status = RobotStatus()
         self._light_statuses = [LightStatus(), LightStatus()]
@@ -950,7 +960,7 @@ class AcquisitionController(QObject):
         self._ramp_targets = (point.light_1_brightness, point.light_2_brightness)
         self._ramp_confirmation_marker = time.time()
         self._ramp_sent = [False, False]
-        self._set_phase("ramp_sync", 1.0)
+        self._set_phase("ramp_sync", RAMP_BLE_COMMAND_TIMEOUT_SECONDS)
         self.status_changed.emit(
             f"Synchronisiere Licht-Rampe bei Sample {point.ramp_sample_id}: "
             f"{self._ramp_targets[0]} % / {self._ramp_targets[1]} % …"
@@ -978,24 +988,21 @@ class AcquisitionController(QObject):
             triangle_brightness(elapsed, self._settings.ramp_light_1_period_s),
             triangle_brightness(elapsed, self._settings.ramp_light_2_period_s),
         )
-        now_wall = time.time()
-        for adapter, status, target in zip(
-            (self.light_1, self.light_2), self._light_statuses, targets, strict=True
+        for panel_number, (adapter, status, target) in enumerate(
+            zip((self.light_1, self.light_2), self._light_statuses, targets, strict=True),
+            start=1,
         ):
             if not status.connected:
                 self._fail("Ein Panel hat während der Licht-Rampe die Verbindung verloren.")
                 return
-            confirmed_at = status.last_command_confirmed_at or self._ramp_origin_wall
-            if getattr(adapter, "command_busy", False) and now_wall - confirmed_at > 1.0:
-                self._fail("Ein Panel hat einen Rampenbefehl länger als 1 Sekunde nicht bestätigt.")
+            if ramp_command_timed_out(adapter):
+                self._fail(
+                    f"Panel {panel_number} hat einen Rampenbefehl länger als "
+                    f"{RAMP_BLE_COMMAND_TIMEOUT_SECONDS:g} Sekunden nicht bestätigt."
+                )
                 return
             if status.brightness != target:
                 adapter.try_set_ramp_brightness(target)
-                if now_wall - confirmed_at > 1.0:
-                    self._fail(
-                        "Ein Panel hat einen Rampenbefehl länger als 1 Sekunde nicht bestätigt."
-                    )
-                    return
 
     def _maybe_ramp_transition_ready(self) -> None:
         if not self._running or self._phase not in {"ramp_sync", "ramp_finalize"}:
@@ -1048,7 +1055,7 @@ class AcquisitionController(QObject):
         self._ramp_targets = (0, 0)
         self._ramp_confirmation_marker = time.time()
         self._ramp_sent = [False, False]
-        self._set_phase("ramp_finalize", 1.0)
+        self._set_phase("ramp_finalize", RAMP_BLE_COMMAND_TIMEOUT_SECONDS)
         self._ramp_tick()
 
     def _on_frame(self, frame: object) -> None:
@@ -1176,6 +1183,7 @@ class AcquisitionController(QObject):
             "requested_brightness_percent": requested_brightness,
             "confirmed_brightness_percent": status.brightness,
             "last_confirmed_command_percent": status.brightness,
+            "last_command_duration_ms": status.last_command_duration_ms,
             "last_command_confirmed_at": None
             if confirmed_at is None
             else datetime.fromtimestamp(confirmed_at).astimezone().isoformat(),
@@ -1201,7 +1209,7 @@ class AcquisitionController(QObject):
                 self._checkpoint_index += 1
             self._write_manifest(
                 "running" if self._running else "interrupted",
-                f"Bild {index + 1} gespeichert.",
+                f"Bild {index + 1} gespeichert." if self._running else self._last_finish_message,
             )
             self.progress_changed.emit(self._checkpoint_index, len(self._points))
             if self._running and self._phase == "ramp_draining" and not self._ramp_pending_writes:
@@ -1232,7 +1240,10 @@ class AcquisitionController(QObject):
     def _check_timeout(self) -> None:
         if self._running and time.monotonic() > self._deadline:
             if self._phase in {"ramp_sync", "ramp_finalize"}:
-                self._fail("Ein Panel hat den Lichtbefehl länger als 1 Sekunde nicht bestätigt.")
+                self._fail(
+                    f"Ein Panel hat den Lichtbefehl länger als "
+                    f"{RAMP_BLE_COMMAND_TIMEOUT_SECONDS:g} Sekunden nicht bestätigt."
+                )
             elif self._phase == "ramp_writing":
                 self._fail(
                     "Das Speichern des PNG/YAML-Paars ist zu langsam für die Rampen-Bildrate."
@@ -1258,6 +1269,7 @@ class AcquisitionController(QObject):
         resumable: bool = False,
     ) -> None:
         restore_exposure = self._settings is not None and self._settings.exposure_enabled
+        self._last_finish_message = message
         self._running = False
         self._phase = "idle"
         self._phase_timer.stop()
