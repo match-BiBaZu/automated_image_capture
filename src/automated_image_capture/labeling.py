@@ -184,6 +184,7 @@ class LabelingResult:
     report_path: Path
     position_tracked_images: int = 0
     position_corrected_images: int = 0
+    position_interpolated_images: int = 0
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -517,6 +518,7 @@ def _measurement_row(
 ) -> dict[str, object]:
     return {
         "pose_id": pose_id,
+        "robot_mode": pair.foreground.key.robot_mode,
         "panel_1": pair.foreground.key.panel_1,
         "panel_2": pair.foreground.key.panel_2,
         "exposure": pair.foreground.key.exposure,
@@ -1227,6 +1229,9 @@ def generate_obb_dataset(
     flagged = sum(row["quality"] == "REVIEW" for row in report_rows)
     position_tracked = sum(item.tracked_images for item in track_summaries.values())
     position_corrected = sum(item.corrected_images for item in track_summaries.values())
+    position_interpolated = sum(
+        "interpoliert" in str(row.get("quality_reason", "")) for row in report_rows
+    )
     return LabelingResult(
         output,
         positive_count,
@@ -1238,4 +1243,5 @@ def generate_obb_dataset(
         output / "label_report.csv",
         position_tracked,
         position_corrected,
+        position_interpolated,
     )

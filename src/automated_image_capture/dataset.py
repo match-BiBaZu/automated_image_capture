@@ -76,6 +76,8 @@ class DatasetRecord:
     source_label: Path
     target_name: str
     split: Split
+    robot_mode: str = "pose_id"
+    quality_reason: str = ""
     conveyor_station_id: int | None = None
     conveyor_direction: str = "fixed"
     conveyor_nominal_position_mm: float | None = None
@@ -124,7 +126,7 @@ class ResizedDatasetResult:
 def default_build_config() -> DatasetBuildConfig:
     pictures = Path.home() / "Pictures"
     return DatasetBuildConfig(
-        source_dataset=pictures / "Kl1i" / "OBB",
+        source_dataset=pictures / "Ql1i" / "OBB",
         output_root=pictures / "YOLO_Training",
         curation_path=pictures / "YOLO_Training" / "curation.json",
     )
@@ -149,6 +151,33 @@ def _index_files(root: Path, directory: str, suffix: str) -> dict[str, Path]:
             raise DatasetError(f"Mehrdeutiger Dateiname in {root / directory}: {path.name}")
         result[path.name] = path
     return result
+
+
+def _explicit_source_split(root: Path, directory: str, path: Path) -> Split | None:
+    try:
+        relative = path.relative_to(root / directory)
+    except ValueError:
+        return None
+    if not relative.parts:
+        return None
+    return {"train": "train", "val": "val", "test": "test"}.get(relative.parts[0])  # type: ignore[return-value]
+
+
+def _source_split(root: Path, image: Path, label: Path, pose_id: int) -> Split:
+    image_split = _explicit_source_split(root, "images", image)
+    label_split = _explicit_source_split(root, "labels", label)
+    if image_split is not None and label_split is not None and image_split != label_split:
+        raise DatasetError(
+            f"Bild und Label liegen in unterschiedlichen Splits: {image.name}"
+        )
+    return image_split or label_split or split_for_pose(pose_id)
+
+
+def _robot_mode(row: dict[str, str], dataset_image: str) -> str:
+    configured = row.get("robot_mode", "").strip().casefold()
+    if configured in {"angle", "pose_id"}:
+        return configured
+    return "angle" if "_ura-" in dataset_image.casefold() else "pose_id"
 
 
 def _integer(row: dict[str, str], key: str) -> int:
@@ -233,7 +262,14 @@ def _collect_positive_records(root: Path, class_names: dict[int, str]) -> list[D
                     source_image=image_index[dataset_image],
                     source_label=label_index[label_file],
                     target_name=dataset_image,
-                    split=split_for_pose(pose_id),
+                    split=_source_split(
+                        root,
+                        image_index[dataset_image],
+                        label_index[label_file],
+                        pose_id,
+                    ),
+                    robot_mode=_robot_mode(row, dataset_image),
+                    quality_reason=row.get("quality_reason", "").strip(),
                     conveyor_station_id=_integer_or_none(row.get("conveyor_station_id")),
                     conveyor_direction=row.get("conveyor_direction", "fixed"),
                     conveyor_nominal_position_mm=_float_or_none(
@@ -284,7 +320,13 @@ def _collect_empty_records(root: Path) -> list[DatasetRecord]:
                     source_image=image_index[old_image_name],
                     source_label=label_index[old_label_name],
                     target_name=old_image_name,
-                    split=split_for_pose(pose_id),
+                    split=_source_split(
+                        root,
+                        image_index[old_image_name],
+                        label_index[old_label_name],
+                        pose_id,
+                    ),
+                    robot_mode=_robot_mode(row, old_image_name),
                     conveyor_station_id=_integer_or_none(row.get("conveyor_station_id")),
                     conveyor_direction=row.get("conveyor_direction", "fixed"),
                     conveyor_nominal_position_mm=_float_or_none(
@@ -333,6 +375,33 @@ def save_curation(
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _complete_evaluation_splits(records: list[DatasetRecord]) -> list[DatasetRecord]:
+    """Create missing val/test splits by holding out complete UR poses or angles."""
+    pose_splits = {
+        pose_id: next(record.split for record in records if record.pose_id == pose_id)
+        for pose_id in {record.pose_id for record in records}
+    }
+    assignments: dict[int, Split] = {}
+    for missing_split in ("val", "test"):
+        if missing_split in pose_splits.values():
+            continue
+        candidates = sorted(
+            pose_id for pose_id, split in pose_splits.items() if split == "train"
+        )
+        if len(candidates) <= 1:
+            continue
+        candidate_index = len(candidates) // 2 if missing_split == "val" else -1
+        selected_pose = candidates[candidate_index]
+        pose_splits[selected_pose] = missing_split
+        assignments[selected_pose] = missing_split
+    if not assignments:
+        return records
+    return [
+        replace(record, split=assignments.get(record.pose_id, record.split))
+        for record in records
+    ]
+
+
 def collect_dataset_records(config: DatasetBuildConfig) -> list[DatasetRecord]:
     config = config.validated()
     class_names = _load_class_names(config.source_dataset)
@@ -348,6 +417,23 @@ def collect_dataset_records(config: DatasetBuildConfig) -> list[DatasetRecord]:
         raise DatasetError(f"Doppelte Datensatz-IDs: {duplicate_ids[:3]}")
     if duplicate_targets:
         raise DatasetError(f"Doppelte Zieldateinamen: {duplicate_targets[:3]}")
+    pose_splits: dict[int, set[Split]] = {}
+    for record in records:
+        pose_splits.setdefault(record.pose_id, set()).add(record.split)
+    conflicting = {
+        pose_id: sorted(splits)
+        for pose_id, splits in pose_splits.items()
+        if len(splits) > 1
+    }
+    if conflicting:
+        raise DatasetError(
+            "UR-Winkel/-Posen liegen in mehreren Splits: "
+            + ", ".join(
+                f"{pose_id} ({'/'.join(splits)})"
+                for pose_id, splits in sorted(conflicting.items())
+            )
+        )
+    records = _complete_evaluation_splits(records)
     exclusions = load_curation(config.curation_path, config.source_dataset)
     known = set(identifiers)
     unknown = exclusions - known
@@ -383,8 +469,18 @@ def render_record_preview(record: DatasetRecord, max_width: int = 1100) -> np.nd
         height, width = image.shape[:2]
         points = normalized * np.asarray([width, height], dtype=np.float32)
         cv2.polylines(image, [np.rint(points).astype(np.int32)], True, (0, 255, 0), 5)
+    robot_value = (
+        f"{record.pose_id / 10.0:.1f} deg"
+        if record.robot_mode == "angle"
+        else str(record.pose_id)
+    )
+    belt = (
+        ""
+        if record.conveyor_measured_position_mm is None
+        else f" | Band {record.conveyor_measured_position_mm:.1f} mm"
+    )
     label = (
-        f"{record.class_name} | UR {record.pose_id} | "
+        f"{record.class_name} | UR {robot_value}{belt} | "
         f"P1 {record.panel_1}% | P2 {record.panel_2}% | {record.quality}"
     )
     cv2.putText(image, label, (16, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
@@ -447,6 +543,15 @@ def build_curated_dataset(
     included = [record for record in records if not record.excluded]
     if not included:
         raise DatasetError("Alle Bilder wurden ausgeschlossen; der Datensatz wäre leer.")
+    included_split_counts = Counter(record.split for record in included)
+    missing_splits = [
+        split for split in ("train", "val", "test") if not included_split_counts[split]
+    ]
+    if missing_splits:
+        raise DatasetError(
+            "Nach der Kuratierung fehlen Bilder in folgenden Splits: "
+            + ", ".join(missing_splits)
+        )
     output = _version_directory(config)
     output.mkdir(parents=True)
     for split in ("train", "val", "test"):
@@ -472,16 +577,21 @@ def build_curated_dataset(
         if progress is not None:
             progress(index, total, f"{record.class_name}: {record.target_name}")
 
-    split_counts = Counter(record.split for record in included)
+    split_counts = included_split_counts
     class_counts = Counter(record.class_name for record in included)
+    split_poses = {
+        split: sorted({record.pose_id for record in records if record.split == split})
+        for split in ("train", "val", "test")
+    }
     manifest = {
         "format_version": 1,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "classes": {str(class_id): name for class_id, name in class_names.items()},
         "splits": {
-            "train_poses": sorted(TRAIN_POSES),
-            "validation_poses": sorted(VALIDATION_POSES),
-            "test_poses": sorted(TEST_POSES),
+            "strategy": "source folders; missing val/test use complete-angle holdouts",
+            "train_poses": split_poses["train"],
+            "validation_poses": split_poses["val"],
+            "test_poses": split_poses["test"],
         },
         "sources": {
             "source_dataset": str(config.source_dataset),

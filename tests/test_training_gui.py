@@ -44,6 +44,18 @@ def _record(tmp_path: Path, record_id: str, quality: str) -> DatasetRecord:
         source_label=label,
         target_name=f"pose1_{record_id}.png",
         split="train",
+        robot_mode="angle",
+        quality_reason=(
+            "Keine zuverlässige Einzelsegmentierung; OBB aus Förderbandbahn interpoliert"
+            if quality == "REVIEW"
+            else ""
+        ),
+        conveyor_station_id=12,
+        conveyor_direction="out",
+        conveyor_nominal_position_mm=36.0,
+        conveyor_measured_position_mm=35.7,
+        conveyor_track_used=True,
+        track_correction_applied=quality == "REVIEW",
     )
 
 
@@ -65,9 +77,15 @@ def test_review_can_exclude_a_single_image(qtbot, monkeypatch, tmp_path: Path) -
 
     assert dialog.table.rowCount() == 2
     assert dialog.table.item(0, 1).text() == "REVIEW"
+    assert dialog.table.item(0, 4).text() == "15.5°"
+    assert dialog.table.item(0, 5).text() == "35.7 mm"
+    assert "interpoliert" in dialog.preview_details.text()
     dialog.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
     assert "review" in dialog._excluded_ids
     assert "1 ausgeschlossen" in dialog.review_summary.text()
+
+    dialog.filter.setCurrentText("Nur interpoliert")
+    assert dialog.table.rowCount() == 1
 
 
 def test_training_events_update_progress_and_result_link(qtbot, tmp_path: Path) -> None:

@@ -51,6 +51,16 @@ class TrainingConfig:
             raise TrainingError(
                 "Datensatzprüfung fehlgeschlagen: " + "; ".join(integrity.errors[:5])
             )
+        missing_splits = [
+            split
+            for split in ("train", "val", "test")
+            if not integrity.split_counts.get(split, 0)
+        ]
+        if missing_splits:
+            raise TrainingError(
+                "Für Training und Auswertung fehlen Bilder in folgenden Splits: "
+                + ", ".join(missing_splits)
+            )
         if self.epochs < 1 or self.patience < 0:
             raise TrainingError("Epochen müssen positiv und Patience darf nicht negativ sein.")
         if self.image_size < 128:

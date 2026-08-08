@@ -142,7 +142,15 @@ class TrainingDialog(QDialog):
         self.load_button = QPushButton("Bilder laden / aktualisieren")
         self.load_button.clicked.connect(self.load_records)
         self.filter = QComboBox()
-        self.filter.addItems(["Auffällige zuerst", "Nur REVIEW", "Alle", "Ausgeschlossen"])
+        self.filter.addItems(
+            [
+                "Auffällige zuerst",
+                "Nur REVIEW",
+                "Nur interpoliert",
+                "Alle",
+                "Ausgeschlossen",
+            ]
+        )
         self.filter.currentIndexChanged.connect(self._populate_table)
         self.review_summary = QLabel("Noch keine Bilder geladen")
         review_toolbar.addWidget(self.load_button)
@@ -152,13 +160,24 @@ class TrainingDialog(QDialog):
         root.addLayout(review_toolbar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["Verwenden", "Qualität", "Klasse", "UR-Pose", "Panel 1", "Panel 2", "Datei"]
+            [
+                "Verwenden",
+                "Qualität",
+                "Klasse",
+                "Split",
+                "UR-Winkel/Pose",
+                "Band Ist",
+                "Station/Fahrt",
+                "Panel 1",
+                "Panel 2",
+                "Datei",
+            ]
         )
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(self._show_selection)
         self.table.itemChanged.connect(self._include_changed)
         splitter.addWidget(self.table)
@@ -296,6 +315,10 @@ class TrainingDialog(QDialog):
         mode = self.filter.currentText()
         if mode == "Nur REVIEW":
             records = [record for record in records if record.quality == "REVIEW"]
+        elif mode == "Nur interpoliert":
+            records = [
+                record for record in records if "interpoliert" in record.quality_reason
+            ]
         elif mode == "Ausgeschlossen":
             records = [record for record in records if record.record_id in self._excluded_ids]
         if mode == "Auffällige zuerst":
@@ -305,6 +328,7 @@ class TrainingDialog(QDialog):
                     record.class_id is None,
                     record.class_id if record.class_id is not None else 9,
                     record.pose_id,
+                    record.conveyor_station_id or 0,
                     record.panel_2,
                     record.panel_1,
                 )
@@ -315,6 +339,7 @@ class TrainingDialog(QDialog):
                     record.class_id is None,
                     record.class_id if record.class_id is not None else 9,
                     record.pose_id,
+                    record.conveyor_station_id or 0,
                     record.panel_2,
                     record.panel_1,
                 )
@@ -336,10 +361,28 @@ class TrainingDialog(QDialog):
             )
             include.setData(Qt.ItemDataRole.UserRole, record.record_id)
             self.table.setItem(row, 0, include)
+            robot_value = (
+                f"{record.pose_id / 10.0:.1f}°"
+                if record.robot_mode == "angle"
+                else str(record.pose_id)
+            )
+            belt_value = (
+                "–"
+                if record.conveyor_measured_position_mm is None
+                else f"{record.conveyor_measured_position_mm:.1f} mm"
+            )
+            station_value = (
+                "–"
+                if record.conveyor_station_id is None
+                else f"#{record.conveyor_station_id} · {record.conveyor_direction}"
+            )
             values = (
                 record.quality,
                 record.class_name,
-                str(record.pose_id),
+                record.split,
+                robot_value,
+                belt_value,
+                station_value,
                 f"{record.panel_1} %",
                 f"{record.panel_2} %",
                 record.target_name,
@@ -385,9 +428,44 @@ class TrainingDialog(QDialog):
             )
         )
         iou = "–" if record.consensus_iou is None else f"{record.consensus_iou:.3f}"
+        robot_value = (
+            f"Winkel {record.pose_id / 10.0:.1f}°"
+            if record.robot_mode == "angle"
+            else f"Pose {record.pose_id}"
+        )
+        measured_position = (
+            "–"
+            if record.conveyor_measured_position_mm is None
+            else f"{record.conveyor_measured_position_mm:.3f} mm"
+        )
+        nominal_position = (
+            "–"
+            if record.conveyor_nominal_position_mm is None
+            else f"{record.conveyor_nominal_position_mm:.1f} mm"
+        )
+        track_state = (
+            "interpoliert"
+            if "interpoliert" in record.quality_reason
+            else "positionsstabilisiert"
+            if record.track_correction_applied
+            else "direkte OBB"
+        )
+        reason = (
+            ""
+            if not record.quality_reason
+            else f"\nPrüfgrund: {record.quality_reason}"
+        )
+        station = (
+            "–"
+            if record.conveyor_station_id is None
+            else str(record.conveyor_station_id)
+        )
         self.preview_details.setText(
-            f"{record.class_name} · Split {record.split} · UR {record.pose_id} · "
+            f"{record.class_name} · Split {record.split} · UR {robot_value} · "
             f"P1/P2 {record.panel_1}/{record.panel_2} · Konsens-IoU {iou}\n"
+            f"Förderband: Ist {measured_position}, Soll {nominal_position}, "
+            f"Station {station} "
+            f"({record.conveyor_direction}) · OBB: {track_state}{reason}\n"
             f"{record.source_image}"
         )
 
@@ -404,9 +482,19 @@ class TrainingDialog(QDialog):
 
     def _update_review_summary(self) -> None:
         flagged = sum(record.quality == "REVIEW" for record in self._records)
+        interpolated = sum(
+            "interpoliert" in record.quality_reason for record in self._records
+        )
+        positioned = sum(record.conveyor_track_used for record in self._records)
+        split_counts = {
+            split: sum(record.split == split for record in self._records)
+            for split in ("train", "val", "test")
+        }
         self.review_summary.setText(
             f"{len(self._records)} Bilder · {flagged} automatisch auffällig · "
-            f"{len(self._excluded_ids)} ausgeschlossen"
+            f"{interpolated} interpoliert · {positioned} positionsgeführt · "
+            f"Train/Val/Test {split_counts['train']}/{split_counts['val']}/"
+            f"{split_counts['test']} · {len(self._excluded_ids)} ausgeschlossen"
         )
 
     def build_dataset(self) -> None:

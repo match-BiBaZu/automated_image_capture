@@ -199,6 +199,47 @@ def test_unknown_pose_is_rejected(tmp_path: Path, source_dataset: Path) -> None:
         collect_dataset_records(_config(tmp_path, source_dataset))
 
 
+def test_explicit_source_split_accepts_new_continuous_angles(
+    tmp_path: Path, source_dataset: Path
+) -> None:
+    (source_dataset / "images" / "old").rename(source_dataset / "images" / "train")
+    (source_dataset / "labels" / "old").rename(source_dataset / "labels" / "train")
+    report = source_dataset / "label_report.csv"
+    text = report.read_text(encoding="utf-8").replace("155,", "999,", 1)
+    report.write_text(text, encoding="utf-8")
+
+    records = collect_dataset_records(_config(tmp_path, source_dataset))
+    new_angle = next(record for record in records if record.pose_id == 999)
+
+    assert new_angle.split == "train"
+
+
+def test_missing_test_split_holds_out_a_complete_pose(
+    tmp_path: Path, source_dataset: Path
+) -> None:
+    image_train = source_dataset / "images" / "train"
+    label_train = source_dataset / "labels" / "train"
+    (source_dataset / "images" / "old").rename(image_train)
+    (source_dataset / "labels" / "old").rename(label_train)
+    image_val = source_dataset / "images" / "val"
+    label_val = source_dataset / "labels" / "val"
+    image_val.mkdir()
+    label_val.mkdir()
+    for image in image_train.glob("*ur170_*.png"):
+        image.rename(image_val / image.name)
+    for label in label_train.glob("*ur170_*.txt"):
+        label.rename(label_val / label.name)
+
+    records = collect_dataset_records(_config(tmp_path, source_dataset))
+    pose_splits: dict[int, set[str]] = {}
+    for record in records:
+        pose_splits.setdefault(record.pose_id, set()).add(record.split)
+
+    assert pose_splits[170] == {"val"}
+    assert pose_splits[2200] == {"test"}
+    assert all(len(splits) == 1 for splits in pose_splits.values())
+
+
 def test_training_config_requires_verified_dataset(tmp_path: Path) -> None:
     with pytest.raises(TrainingError, match="data.yaml"):
         TrainingConfig(tmp_path / "missing", tmp_path / "runs").validated()

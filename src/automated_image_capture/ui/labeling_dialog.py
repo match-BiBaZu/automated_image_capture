@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from automated_image_capture.dataset import default_build_config
 from automated_image_capture.labeling import (
     LabelingCancelled,
     LabelingConfig,
@@ -135,10 +136,11 @@ class LabelingDialog(QDialog):
         layout = QVBoxLayout(self)
         explanation = QLabel(
             "Jede Pose in der Liste wird eine eigene YOLO-Klasse. Das Tool paart ihre "
-            "Aufnahmen mit dem Leerbild derselben UR-Ansicht und Beleuchtung. Aus allen "
-            "Beleuchtungen entsteht je Klasse und UR-Ansicht eine gemeinsame OBB. Bei "
-            "Förderbandaufnahmen wird automatisch die gemessene ADS-Position aus den "
-            "YAML-Dateien verwendet, um die OBB-Bahn zu stabilisieren und Ausreißer zu markieren."
+            "Aufnahmen mit dem Leerbild derselben UR-Ansicht und Beleuchtung. Bei klassischen "
+            "Rasterserien entsteht aus wiederholten Bildern derselben Ansicht eine gemeinsame "
+            "OBB. Synchronisierte Förderbandserien werden dagegen winkelweise als vollständige "
+            "Bahn ausgewertet: Die gemessene ADS-Position stabilisiert die OBB und ergänzt "
+            "visuell zu dunkle Samples. Solche Ergänzungen erscheinen ausdrücklich als REVIEW."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -364,12 +366,22 @@ class LabelingDialog(QDialog):
             self._failed("Unbekanntes Ergebnis der Label-Erzeugung.")
             return
         self._result = result
+        training_defaults = default_build_config()
+        training_paths = self.settings_store.load_training_paths(training_defaults)
+        output_root = training_paths["output_root"] or training_defaults.output_root
+        self.settings_store.save_training_paths(
+            result.output_directory,
+            Path(output_root),
+            None,
+        )
         self.status.setText(
             f"Fertig: {result.positive_images} positive und {result.negative_images} negative "
             f"Bilder, {result.classes} Klassen und {result.poses} UR-Ansichten, "
             f"{result.flagged_images} Bilder zur Nachprüfung. "
             f"Positionsbahn: {result.position_tracked_images} Bilder, "
-            f"davon {result.position_corrected_images} stabilisiert.\n"
+            f"davon {result.position_corrected_images} stabilisiert und "
+            f"{result.position_interpolated_images} ohne sichere Einzelsegmentierung "
+            "interpoliert. Der Datensatz ist als Quelle im YOLO-Training vorgemerkt.\n"
             f"Bericht: {result.report_path}"
         )
         self.open_button.setEnabled(True)
