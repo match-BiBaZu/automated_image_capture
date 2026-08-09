@@ -1,8 +1,11 @@
 # Projektübergabe: Automated Image Capture
 
-Stand: 8. August 2026  
-Repository: `https://github.com/match-BiBaZu/automated_image_capture`  
-Referenzstand bei Erstellung dieses Dokuments: Branch `main`, Commit `48ce931`
+Stand: 9. August 2026
+
+Repository: `https://github.com/match-BiBaZu/automated_image_capture`
+
+Referenzstand bei Aktualisierung: Branch `main`, Commit `2d29191`, zuzüglich der in diesem
+Dokument beschriebenen lokalen, noch nicht vollständig eingecheckten Änderungen und Artefakte.
 
 ## 1. Zielbild des Projekts
 
@@ -62,7 +65,8 @@ Die Anwendung verändert weder IP-Konfigurationen noch AMS-Routen selbst.
 - `pyads==3.6.0` für das Förderband
 - OpenCV und NumPy für Bildverarbeitung
 - Ultralytics, PyTorch 2.7.1 und Torchvision 0.22.1
-- PyTorch-CUDA-11.8-Wheels für die vorhandene RTX 3060
+- NVIDIA RTX 2000 Ada Generation Embedded GPU mit 8 GB VRAM
+- PyTorch `2.7.1+cu118`, Torchvision 0.22.1, CUDA 11.8 und Ultralytics 8.4.102
 
 `pyproject.toml` und `uv.lock` sind versioniert. Installation und Start:
 
@@ -101,6 +105,8 @@ Der Python-Code liegt unter `src/automated_image_capture`.
 | `ui/widgets.py` | Gerätekarten und Aufnahmekonfiguration |
 | `ui/labeling_dialog.py` | automatische OBB-Erzeugung |
 | `ui/training_dialog.py` | Review, Kuratierung, Training und Resultate |
+| `scripts/benchmark_camera.py` | isolierter Kamera-Rohabruf- und Durchsatzbenchmark |
+| `scripts/generate_obb_cli.py` | reproduzierbare OBB-Erzeugung ohne GUI |
 | `ur_program/` | kontinuierliches UR-Programm und Bau-/Installationshinweise |
 | `tests/` | Unit-, GUI- und optionale Hardwaretests |
 
@@ -180,11 +186,17 @@ Bilddaten werden nicht protokolliert.
 - Auswahl nach gespeicherter Seriennummer beziehungsweise IP.
 - Stream in einem separaten Thread.
 - Ein GenTL-Buffer wird vor der Freigabe vollständig in ein NumPy-Bild kopiert.
-- Die GUI erhält nur das neueste Bild und standardmäßig maximal 15 FPS.
+- Der Worker leert den GenTL-Stream mit der tatsächlich erreichbaren Rohbildrate.
+- Rohabruf, Aufnahme und GUI-Vorschau besitzen getrennte Pfade. Die Vorschau erhält nur das
+  neueste Bild und ist separat begrenzt; dieses Limit bremst die Hintergrundaufnahme nicht.
+- Das kameraseitige `AcquisitionFrameRate`-Limit kann in den Einstellungen deaktiviert werden
+  und ist standardmäßig deaktiviert.
+- Mono-Aufnahmen bleiben auf dem Aufnahme- und Schreibpfad einkanalig und werden nicht
+  unnötig zu RGB verdreifacht.
 - Unterstützt werden Mono-, hochbitige Mono-, Bayer-, RGB- und BGR-Formate.
 - Hochbitige Bilder werden nur für die Vorschau skaliert; gespeicherte Daten bleiben
   verlustfrei.
-- Status: Modell, Seriennummer, IP, Auflösung, Pixelformat, Kamera-FPS, Vorschau-FPS und
+- Status: Modell, Seriennummer, IP, Auflösung, Pixelformat, Kamera-/Rohabruf-/Vorschau-FPS und
   Belichtungszeit.
 - Exposure kann in der Kamerakarte manuell gesetzt werden. Dazu darf `ExposureAuto` für die
   aktuelle Verbindung deaktiviert werden. Beim Trennen werden die beim Verbinden gelesenen
@@ -192,6 +204,18 @@ Bilddaten werden nicht protokolliert.
 
 Der Baumer Camera Explorer muss geschlossen sein. Andernfalls ist die Kamera meist exklusiv
 belegt.
+
+Die Belichtung setzt eine harte physikalische Obergrenze: 250000 µs entsprechen höchstens
+ungefähr 4 FPS, 5000 µs belichtungsseitig höchstens 200 FPS. Netzwerk, Kamera und Host können
+die praktische Rate weiter begrenzen. Für eine Messung ohne GUI:
+
+```powershell
+uv run python scripts/benchmark_camera.py --frames 300
+```
+
+Die schnelle Rampenaufnahme lässt sich bis 240 Bilder/s konfigurieren, startet aber nur, wenn
+der Preflight den erforderlichen Rohabruf tatsächlich misst. PNGs werden verlustfrei und bei
+Hochgeschwindigkeitsserien unkomprimiert durch mehrere Hintergrund-Writer gespeichert.
 
 ### Robustheit
 
@@ -304,7 +328,8 @@ uv run python scripts/probe_ble.py --connect <BLE-ADRESSE>
 - keine gleichzeitige Steuerung durch `PressureControlGUI` oder `CSVSaver`.
 
 Die ursprüngliche Förderbandlogik wurde aus
-`C:\Users\nunning\BiBaZu_Big_Boi\CSVSaver` beziehungsweise dessen PressureControlGUI
+`C:\Users\Administrator\Documents\Dashas_ws\BiBaZu_Big_Boi\CSVSaver` beziehungsweise dessen
+PressureControlGUI
 abgeleitet. Dieser externe Ordner und das vollständige SPS-Projekt sind nicht Teil dieses
 Repositories.
 
@@ -537,6 +562,11 @@ UR-Winkels ausgewertet:
 9. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
    `quality=REVIEW` und einem verständlichen `quality_reason` protokolliert.
 
+Ein Bild wird jetzt zur automatischen Nichtübernahme empfohlen, wenn es zugleich extrem dunkel,
+kontrastarm und lokal schwach ist (`q99 < 30`, Dynamikumfang `< 18`, lokale Stärke `< 10`). Sind
+für einen Aufnahmeschlüssel alle positiven Klassen ausgeschlossen, wird auch das dazugehörige
+Leerbild nicht in den Datensatz übernommen. Damit lernt YOLO nicht versehentlich „dunkel = leer“.
+
 Synchronisierte Bandserien schreiben im finalen `review/` nur noch ein Sechserblatt pro
 Klasse/Winkel und eine Klassenübersicht. Die früheren Vollmasken und Einzelblätter pro
 Bandstation waren redundant und konnten bei hochauflösenden Datensätzen mehrere Gigabyte RAM
@@ -578,6 +608,11 @@ class_id x1 y1 x2 y2 x3 y3 x4 y4
 Koordinaten sind auf `[0,1]` normiert. Leerbilder besitzen leere `.txt`-Labels. Quelldaten
 werden niemals verändert. Auf demselben Laufwerk werden nach Möglichkeit Hardlinks verwendet.
 
+Für wiederholbare Läufe außerhalb der GUI steht `scripts/generate_obb_cli.py` bereit. Es nimmt
+beliebig viele Klassenquellen, Leerbildquelle, Ausgabeordner, Konsensparameter,
+Mindestdifferenz, Review-Snapshot-Verzeichnis und optional `--exclude-recommended` entgegen.
+Anchor-, Sichtbarkeits- und Review-Entscheidungen werden dabei mit den Ergebnissen erhalten.
+
 ## 15. Review, Kuratierung und Split-Logik
 
 Im YOLO-Trainingsdialog werden angezeigt:
@@ -604,6 +639,10 @@ und keine Mehrheitsabstimmung, durch die eine falsche OBB von fünf richtigen �
 würde. Die Entscheidung wird in `curation.json` gespeichert; Quellbilder und Quelllabels
 bleiben unverändert.
 
+Beim Dataset-Aufbau werden außerdem die im OBB-Audit mit `excluded_from_dataset=True`
+markierten Bilder ausgelassen. Ein fehlendes Leerbild ist nur dann zulässig, wenn sämtliche
+damit verknüpften Positivbilder ebenfalls ausgeschlossen wurden.
+
 Der OBB-Ausgang liefert zunächst Train/Val nach vollständigen UR-Winkeln. Beim Kuratieren
 werden diese Quell-Splits übernommen. Falls ein unabhängiger Testsatz fehlt, hält die Software
 deterministisch einen vollständigen Trainingswinkel als `test` zurück. Niemals werden
@@ -620,90 +659,174 @@ Der kuratierte, versionierte Datensatz enthält:
 Das Manifest bewahrt Klasse, Quelle, Split, Reviewentscheidung, UR-Ziel, Lichtwerte,
 Rampen-Sample sowie nominelle und gemessene Förderbandposition.
 
-## 16. Aktueller Ql1i-Datensatz
+## 16. Ql1i: Quelldaten, OBBs und Kuratierung
 
-Die derzeitigen Quelldaten liegen außerhalb des Repositories:
+Die drei Rohserien liegen außerhalb des Repositories auf Laufwerk `D:`:
 
 ```text
-Pose 1: C:\Users\nunning\Pictures\Ql1i\capture_20260808_165705
-Pose 2: C:\Users\nunning\Pictures\Ql1i\capture_20260808_170121
-Leer:   C:\Users\nunning\Pictures\Ql1i\capture_20260808_170321
-OBB:    C:\Users\nunning\Pictures\Ql1i\OBB
+Pose 1: D:\pictures\Ql1i\capture_20260808_165705
+Pose 2: D:\pictures\Ql1i\capture_20260808_170121
+Leer:   D:\pictures\Ql1i\capture_20260808_170321
 ```
 
-Geprüfter Stand:
+Jede Serie enthält 400 Mono8-Bilder mit 1920 × 1464 Pixeln und 5000 µs Belichtung. Verwendet
+wurden die vier UR-Winkel `155`, `180`, `205` und `210`. Der ursprüngliche, teilweise
+unvollständige Ordner `D:\pictures\Ql1i\OBB` wurde bewusst nicht überschrieben.
 
-- 400 Bilder Pose 1,
-- 400 Bilder Pose 2,
-- 400 Leerbilder,
-- 1.200 Bilder und 1.200 passende Labeldateien,
-- UR-Winkel `155`, `180`, `205`, `210`, also 15,5°, 18,0°, 20,5°, 21,0°,
-- 800 positive Bilder positionsgeführt,
-- 333 OBBs ohne sichere Einzelsegmentierung aus der Bandbahn interpoliert,
-- 413 positive Bilder vorsichtshalber als `REVIEW` markiert,
-- keine unlesbaren Bilder und keine ungültigen OBB-Koordinaten.
+Erhaltene Vergleichsläufe:
 
-Der YOLO-Dialog erzeugt daraus aktuell folgende winkelreine Aufteilung:
+```text
+D:\pictures\Ql1i\OBB_codex_20260809_v1
+D:\pictures\Ql1i\OBB_codex_20260809_v1_review_snapshots
+D:\pictures\Ql1i\OBB_codex_20260809_v2_mindiff20
+D:\pictures\Ql1i\OBB_codex_20260809_v2_mindiff20_review_snapshots
+```
 
-| Split | Winkel | Bilder |
-| --- | --- | ---: |
-| Train | 15,5° und 18,0° | 600 |
-| Validation | 20,5° | 300 |
-| Test | 21,0° | 300 |
+V1 mit Mindestdifferenz 80 war stabiler als V2 mit Mindestdifferenz 20. V1 erzeugte pro
+Klasse/Winkel 20/12/17/10 beziehungsweise 23/19/15/11 sichere Anker, 674 Review-Hinweise und
+333 positionsinterpolierte OBBs. Die empfindlichere V2-Konfiguration verschlechterte das
+Ergebnis auf 702 Review-Hinweise und weniger stabile Pose-1-Anker. Deshalb verwendet der
+finale Lauf wieder Mindestdifferenz 80:
 
-Jeder Winkel enthält beide Klassen und die passenden Leerbilder. Vor einem produktiven
-Training sollten vor allem die 333 interpolierten Overlays stichprobenartig geprüft werden.
+```text
+Finale OBBs:       D:\pictures\Ql1i\OBB_final_20260809
+Review-Snapshots:  D:\pictures\Ql1i\OBB_final_20260809_review_snapshots
+```
 
-## 17. YOLO-Training
+Finaler OBB-Stand:
+
+- 766 positive Bilder und 387 passende Leerbilder exportiert,
+- 34 unbrauchbar dunkle positive Bilder automatisch ausgeschlossen,
+- 13 damit verknüpfte Leerbilder ebenfalls nicht als Negativbeispiele übernommen,
+- 800 Positivbilder positionsgeführt, davon 333 aus der Bahn interpoliert,
+- 799 Positionskorrekturen und 674 Review-Hinweise vor den Ausschlüssen,
+- zwei Klassen und vier Winkel,
+- keine Quelldateien verändert.
+
+Die Ursache der problematischen Bilder ist nicht nur eine schwache Segmentierung: Trotz
+gleicher nomineller Lichtbefehle unterscheiden sich Objekt- und Leeraufnahme optisch stark.
+Beispielsweise liegt der Vordergrundmittelwert einer Pose-1-Aufnahme bei 40/40 ungefähr bei
+39, der des passenden Leerbildes ungefähr bei 163. Zusätzlich wirft das Bauteil einen langen
+Schlagschatten, der rohe OBBs nach links ziehen kann. Die BLE-Bestätigung bestätigt nur das
+Kommando, nicht die tatsächlich erreichte optische Beleuchtung.
+
+Der finale kuratierte Datensatz liegt hier:
+
+```text
+D:\pictures\Ql1i\YOLO_final_20260809\dataset_20260809_200522
+```
+
+Er enthält 1.153 Bilder: 380 Pose 1, 386 Pose 2 und 387 Leerbilder. Die winkelreine Aufteilung
+ist:
+
+| Split | Winkel | Pose 1 | Pose 2 | Leer | Gesamt |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Train | 15,5° + 18,0° | 189 | 191 | 191 | 571 |
+| Validation | 20,5° | 96 | 95 | 96 | 287 |
+| Test | 21,0° | 95 | 100 | 100 | 295 |
+
+Verlustfreie Resize-Caches wurden für 640 und 960 Pixel erhalten:
+
+```text
+D:\pictures\Ql1i\YOLO_final_20260809\dataset_20260809_200522_imgsz640
+D:\pictures\Ql1i\YOLO_final_20260809\dataset_20260809_200522_imgsz960
+```
+
+## 17. Df1a: erhaltener Referenzlauf
+
+Die ursprünglichen OBBs liegen unter:
+
+```text
+C:\Users\Administrator\Pictures\Df1a\OBB
+```
+
+Sie enthalten 2.420 Bilder: vier Klassen mit je 484 positiven Bildern sowie 484 Leerbilder.
+Der kuratierte Datensatz wurde als
+`C:\Users\Administrator\Pictures\Df1a\YOLO\dataset_20260809_184640` erhalten und besitzt
+1.210 Train-, 605 Validation- und 605 Testbilder. Der 640-Pixel-Cache liegt daneben als
+`dataset_20260809_184640_imgsz640`.
+
+Der finale Trainingslauf liegt unter:
+
+```text
+C:\Users\Administrator\Pictures\Df1a\YOLO\runs\Df1a_yolo26n_obb_20260809
+```
+
+Er war auf 50 Epochen mit Patience 12 angesetzt, stoppte nach Epoche 16 und wählte Epoche 4.
+Das stabile, gegen den Run-Checkpoint per SHA geprüfte Modell ist:
+
+```text
+C:\Users\Administrator\Pictures\Df1a\YOLO\Df1a_best.pt
+```
+
+Unabhängiger Test: Precision 0,93386, Recall 0,94725, mAP50 0,98628 und mAP50–95 0,89037.
+Auf allen 121 Leerbildern trat kein Fehlalarm auf. Eine zusätzliche praktische Stichprobe mit
+je einem Bild pro Klasse plus Leerbild wurde vollständig richtig klassifiziert.
+
+## 18. YOLO-Training und Performance
 
 Das Training läuft als separater Prozess, damit Hardwareanzeige und GUI responsiv bleiben.
 Beim Stoppen wird zuerst ein geordneter Abbruch versucht; Checkpoints und Logs bleiben erhalten.
 
-Aktuelle Implementierung:
+Aktuelle Implementierung und Defaults:
 
-- Modell: `yolo26n-obb.pt`
-- maximal 200 Epochen
-- Early Stopping/Patience 40
-- Bildgröße in der GUI derzeit 640 Pixel
-- Batch derzeit 4
-- Gerät standardmäßig GPU `0`
-- AMP aktiv
-- Seed 42, deterministisch
-- keine horizontalen/vertikalen Spiegelungen
-- kein Mosaic, MixUp oder Copy-Paste
-- keine große Rotation
-- nur geringe Translation, Skalierung und Helligkeitsvariation
+- Modell `yolo26n-obb.pt`, maximal 200 Epochen, Patience 40,
+- Bildgröße 640 Pixel,
+- Batch 16 und acht DataLoader-Worker,
+- Batch und Worker sind im Trainingsdialog einstellbar und werden an den Prozess übergeben,
+- Gerät standardmäßig GPU `0`, AMP aktiv,
+- Seed 42 und deterministische Ausführung,
+- keine Spiegelungen, kein Mosaic, MixUp oder Copy-Paste und keine große Rotation,
+- geringe Translation, Skalierung und Helligkeitsvariation,
+- einmaliger verlustfreier Resize-Cache, um wiederholtes Dekodieren und Skalieren zu vermeiden.
 
-Die ursprünglich formulierte Zielkonfiguration sah `imgsz=1024` und automatische Batchgröße
-vor. Der aktuelle Code verwendet aus praktischen Gründen 640 und Batch 4. Diese bewusste
-Abweichung sollte vor einem finalen Trainingslauf erneut bewertet werden.
+Batch 16/Workers 8 wurde auf der RTX 2000 Ada mit 8 GB getestet. Bei Df1a sank die gemessene
+Epochendauer gegenüber Batch 4/Workers 0 auf ungefähr 17–20 Sekunden; die GPU belegte dabei
+nur etwa 2,5–2,9 GB VRAM. Mehr CPU-Auslastung allein ist daher kein sinnvolles Ziel: Training,
+Datenladen, GPU-Kernel und Synchronisation begrenzen verschiedene Phasen.
 
-Nach dem Training werden gespeichert:
+### Ql1i-Modell
 
-- `best.pt`,
-- Kurven und Ultralytics-Plots,
-- Validation- und Testmetriken,
-- OBB mAP-Werte,
-- klassenweise Ergebnisse,
-- Confusion-Matrizen,
-- Leerbild-Fehlalarmrate,
-- vollständige Trainingszusammenfassung.
+Alle finalen Ql1i-Ergebnisse liegen unter:
 
-Kommandos:
-
-```powershell
-uv run python -m automated_image_capture.training prepare `
-  --source C:\Users\nunning\Pictures\Ql1i\OBB
-
-uv run python -m automated_image_capture.training train `
-  --dataset <KURATIERTER-DATENSATZ>
-
-uv run python -m automated_image_capture.training diagnose
+```text
+D:\pictures\Ql1i\YOLO_final_20260809
 ```
 
-`.pt`-Dateien sind absichtlich in `.gitignore` und müssen separat übertragen werden.
+Empfohlenes Modell und unveränderliche Sicherung:
 
-## 18. YOLO-Live-Inferenz
+```text
+D:\pictures\Ql1i\YOLO_final_20260809\Ql1i_best.pt
+D:\pictures\Ql1i\YOLO_final_20260809\Ql1i_best_baseline_20260809.pt
+```
+
+Der zugehörige Run `runs\Ql1i_yolo26n_obb_20260809` verwendete 640 Pixel, Batch 16 und acht
+Worker. Er war auf 75 Epochen mit Patience 15 angesetzt, stoppte ungefähr nach Epoche 20 und
+wählte Epoche 5. Validation: Precision 0,7003, Recall 0,8592, mAP50 0,86646 und mAP50–95
+0,54012. Unabhängiger Test: Precision 0,6861, Recall 0,86395, mAP50 0,86166 und mAP50–95
+0,60046. Klassenweise erreichte Pose 1 mAP50/mAP50–95 von 0,761/0,472, Pose 2 von
+0,962/0,729; die 100 Leerbilder erzeugten keinen Fehlalarm.
+
+Der Konfidenz-Sweep auf allen 295 Testbildern ergab:
+
+| Konfidenz | Pose 1 korrekt | Pose 2 korrekt | Leer korrekt | Klassenverwechslungen |
+| ---: | ---: | ---: | ---: | ---: |
+| 0,10 | 95/95 | 96/100 | 100/100 | 0 |
+| 0,15 | 89/95 | 96/100 | 100/100 | 0 |
+| 0,20 | 70/95 | 96/100 | 100/100 | 0 |
+| 0,25 | 47/95 | 94/100 | 100/100 | 0 |
+
+Für den aktuellen Ql1i-Liveversuch ist deshalb Konfidenz 0,10 sinnvoll. Der erhaltene
+960-Pixel-Vergleich `runs\Ql1i_yolo26n_obb_960_20260809` erzielte zwar auf Validation
+mAP50–95 0,77186, fiel auf dem unabhängigen Testwinkel aber auf mAP50 0,6920 und mAP50–95
+0,5189 zurück. Insbesondere Pose 1 erreichte dort nur 0,436/0,359. Dieser Lauf hat den
+Validation-Winkel überangepasst und wird nicht empfohlen.
+
+Nach jedem Training bleiben `best.pt`, Ultralytics-Plots, Validation-/Testmetriken,
+klassenweise Ergebnisse, Confusion-Matrizen, Leerbild-Fehlalarmrate und Zusammenfassung
+erhalten. `.pt`-Dateien sind absichtlich in `.gitignore` und müssen separat gesichert werden.
+
+## 19. YOLO-Live-Inferenz
 
 Das Hauptfenster kann ein trainiertes OBB-Modell auf dem jeweils neuesten Kameraframe
 ausführen. Die Inferenz läuft in einem eigenen Thread; alte Frames werden verworfen statt
@@ -718,10 +841,10 @@ Automatische Modellsuche verwendet historisch den Ordner:
 %USERPROFILE%\Pictures\Kk1_pose12_yolo26_obb\runs
 ```
 
-Für Ql1i sollte der gewünschte `best.pt` im Hauptfenster explizit gewählt werden, solange der
-Suchpfad nicht auf den neuen Datasetnamen umgestellt wurde.
+Für Ql1i sollte `D:\pictures\Ql1i\YOLO_final_20260809\Ql1i_best.pt` mit Konfidenz 0,10 im
+Hauptfenster explizit gewählt werden, solange der historische Suchpfad nicht umgestellt wurde.
 
-## 19. Was Git bewusst nicht enthält
+## 20. Was Git bewusst nicht enthält
 
 Die `.gitignore` schließt lokale, große oder reproduzierbare Artefakte aus:
 
@@ -734,19 +857,20 @@ Die `.gitignore` schließt lokale, große oder reproduzierbare Artefakte aus:
 
 Für den PC-Wechsel müssen daher separat gesichert werden:
 
-1. `C:\Users\nunning\Pictures\Ql1i` mit Rohbildern und OBB-Datensatz, falls weiter benötigt.
-2. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
-3. Optional QSettings/Registry-Export.
-4. Baumer Camera Explorer/GenTL-Producer-Installer.
-5. BT540-/Bluetooth-Treiber.
-6. TwinCAT ADS Runtime und die AMS-Routen.
-7. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
+1. `D:\pictures\Ql1i` mit Rohbildern, OBBs, Datensätzen, Caches und Trainingsläufen.
+2. `C:\Users\Administrator\Pictures\Df1a` mit OBBs, Datensatz und Referenzmodell.
+3. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
+4. Optional QSettings/Registry-Export.
+5. Baumer Camera Explorer/GenTL-Producer-Installer.
+6. BT540-/Bluetooth-Treiber.
+7. TwinCAT ADS Runtime und die AMS-Routen.
+8. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
    bearbeitet werden soll.
-8. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
+9. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
 
 Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioniert.
 
-## 20. Checkliste für einen neuen PC
+## 21. Checkliste für einen neuen PC
 
 ### Software
 
@@ -789,14 +913,14 @@ Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioni
 
 ### Daten und Training
 
-- [ ] Ql1i-Bilder/Modelle separat auf den neuen PC kopieren.
+- [ ] Ql1i- und Df1a-Bilder, OBBs, Runordner und Modelle separat auf den neuen PC kopieren.
 - [ ] Pfade in OBB- und YOLO-Dialog neu auswählen.
 - [ ] „Bilder laden / aktualisieren“ ausführen.
 - [ ] Interpolierte/REVIEW-Overlays prüfen.
 - [ ] Kuratierten Datensatz erzeugen und Splitzahlen kontrollieren.
 - [ ] Erst dann Training starten.
 
-## 21. Tests und Abnahme
+## 22. Tests und Abnahme
 
 Standardprüfung:
 
@@ -808,7 +932,7 @@ uv run ruff check .
 Stand bei Erstellung dieses Dokuments:
 
 ```text
-118 Tests bestanden, 6 Hardwaretests standardmäßig übersprungen
+130 Tests bestanden, 6 Hardwaretests standardmäßig übersprungen
 ```
 
 Hardwaretests:
@@ -829,13 +953,17 @@ Vor einer echten Hardware-Abnahme sollten gleichzeitig geprüft werden:
 - erfolgreiche OBB-Erzeugung aus Objekt- und Leerbildserie,
 - gültiger Train-/Val-/Test-Datensatz.
 
-## 22. Bekannte Grenzen und nächste sinnvolle Arbeiten
+## 23. Bekannte Grenzen und nächste sinnvolle Arbeiten
 
 1. Die automatische OBB-Erzeugung ist bewusst konservativ. Interpolierte Bilder müssen im
    Review beurteilt werden; das System ist kein vollautomatischer Ground-Truth-Ersatz.
-2. Der aktuelle Ql1i-Datensatz besitzt viele dunkle Bilder. Die Positionsbahn macht sie
-   labelbar, aber ihre Eignung für das Training sollte empirisch bewertet werden.
-3. Die Trainingsdefaults 640/Batch 4 weichen vom ursprünglichen Ziel 1024/Auto-Batch ab.
+2. Ql1i besitzt nur vier Winkel und zeigt starke optische Abweichungen trotz nominell gleicher
+   Lichtbefehle. Für neue Serien mindestens ein Panel mit etwa 40 % betreiben, diffuses
+   frontales Fülllicht verwenden, 700–1000 ms Licht-Settle-Time vorsehen und Winkelabstände von
+   höchstens 1° aufnehmen. Positive und leere Serien müssen dieselbe physische Lichtsequenz
+   verwenden; 0/0 und 20/0 sollten vermieden werden.
+3. Das Ql1i-Modell ist bei Pose 1 und höheren Konfidenzschwellen noch empfindlich. Konfidenz
+   0,10 ist für den aktuellen Versuch empirisch besser als der frühere Default 0,25.
 4. Der automatische Live-Modellsuchpfad enthält noch den historischen Namen `Kk1`.
 5. QSettings, Netzwerk, ADS-Routen und BLE-Auswahl sind rechnerlokal und brauchen eine
    bewusstere Export-/Importfunktion, falls häufig zwischen PCs gewechselt wird.
@@ -846,7 +974,7 @@ Vor einer echten Hardware-Abnahme sollten gleichzeitig geprüft werden:
 8. Automatische semantische Annotation jenseits der aktuellen OBB-Differenz-/Bahnlogik ist ein
    möglicher späterer Meilenstein.
 
-## 23. Leitprinzipien für die Weiterentwicklung
+## 24. Leitprinzipien für die Weiterentwicklung
 
 - Keine Quelldaten überschreiben oder automatisch massenhaft löschen.
 - Jede Aufnahme muss reproduzierbare Metadaten besitzen.

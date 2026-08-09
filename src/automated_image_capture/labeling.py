@@ -1300,6 +1300,7 @@ def assess_obb_visibility(image: np.ndarray, box: np.ndarray) -> _VisibilityAsse
         or dynamic_range <= 6.0
         or dark_fraction >= 0.995
         or bright_fraction >= 0.995
+        or (q99 < 30.0 and dynamic_range < 18.0 and local_strength < 10.0)
     )
     reasons: list[str] = []
     if q99 < 30.0:
@@ -1664,10 +1665,30 @@ def generate_obb_dataset(
             )
 
     negative_count = 0
+    excluded_key_classes: dict[CaptureKey, set[int]] = defaultdict(set)
+    for _, pair, class_id, _ in write_records:
+        if pair.foreground.path in excluded_paths:
+            excluded_key_classes[pair.foreground.key].add(class_id)
+    excluded_negative_keys = {
+        key
+        for key, class_ids in excluded_key_classes.items()
+        if len(class_ids) == len(config.pose_sources)
+    }
+    excluded_negative_count = 0
     if config.include_background_negatives:
         for background_record in background.values():
             if cancelled is not None and cancelled():
                 raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+            if background_record.key in excluded_negative_keys:
+                excluded_negative_count += 1
+                completed += 1
+                if progress is not None:
+                    progress(
+                        completed,
+                        total_steps,
+                        "Überspringe unbrauchbare Lichtlage des Leerbilds",
+                    )
+                continue
             pose_id = background_record.key.pose_id
             split = "val" if pose_id in validation_poses else "train"
             negative_name = f"empty_{background_record.path.name}"
@@ -1763,6 +1784,7 @@ def generate_obb_dataset(
         "positive_images": exported_positive_count,
         "excluded_images": len(excluded_paths),
         "negative_images": negative_count,
+        "excluded_negative_images": excluded_negative_count,
         "validation_poses": sorted(validation_poses),
         "train_poses": sorted(set(pose_ids) - validation_poses),
         "flagged_images": sum(row["quality"] == "REVIEW" for row in report_rows),

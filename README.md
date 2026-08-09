@@ -207,8 +207,9 @@ und jeden UR-Winkel sechs über die gesamte Bandstrecke verteilte Beispiele: Gr�
 `ANKER`, Orange bedeutet eine aus der Bahn berechnete Box. Erst **Anker übernehmen** schreibt
 noch nicht sofort den YOLO-Datensatz: Anschließend bewertet eine zweite Stufe globale
 Helligkeit, Clipping, Dynamikumfang und den lokalen Kontrast in der erwarteten OBB. Verdächtige
-Bilder erscheinen als Thumbnail-Galerie. Eindeutig schwarze oder weiße Bilder sind zum
-Ausschluss vorausgewählt, dunkle Grenzfälle bleiben eine bewusste Nutzerentscheidung. Erst
+Bilder erscheinen als Thumbnail-Galerie. Eindeutig schwarze oder weiße Bilder sowie sehr
+dunkle Bilder mit weniger als zehn Grauwerten lokalem Objektsignal sind zum Ausschluss
+vorausgewählt; kontrastierte dunkle Grenzfälle bleiben eine bewusste Nutzerentscheidung. Erst
 **Auswahl übernehmen** startet den Export; bei Abbruch bleibt der Ausgabeordner unangetastet.
 Ausgeschlossene Bilder stehen mit Sichtbarkeitsscore und Begründung weiterhin im
 `label_report.csv`, werden aber weder als Trainingsbild noch als Label geschrieben.
@@ -250,9 +251,15 @@ Der Ausgabeordner ist direkt als Ultralytics-YOLO-OBB-Datensatz aufgebaut:
 Der Train-/Val-Split erfolgt klassenübergreifend nach vollständigen UR-Posen statt zufällig
 nach Bildern. Dadurch landen Beleuchtungsvarianten derselben Ansicht nicht zugleich in
 Training und Validierung. Optional werden die Leerbilder genau einmal mit leeren Labeldateien
-als negative Beispiele übernommen.
+als negative Beispiele übernommen. Ist dieselbe Lichtlage für alle Positivklassen als
+unsichtbar ausgeschlossen, wird auch das korrespondierende Leerbild übersprungen. So lernt
+YOLO nicht fälschlich „sehr dunkel = leer“.
 Auf demselben Laufwerk nutzt das Tool Hardlinks, sodass dabei keine zweite Kopie der großen
 PNG-Dateien entsteht.
+
+Für reproduzierbare, versionierte Läufe ohne GUI steht außerdem
+`scripts/generate_obb_cli.py` bereit. Mit `--review-snapshot` bleiben die Anker- und
+Sichtbarkeitsübersichten dauerhaft neben dem erzeugten Datensatz erhalten.
 
 Die beiden BLE-Adressen werden getrennt gespeichert, sodass „Alle verbinden“ nicht beide
 Adapter demselben Panel zuordnet. Die Lichtwerte sind als „bestätigter letzter Befehl“

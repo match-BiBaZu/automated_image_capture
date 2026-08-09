@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import cv2
@@ -372,15 +373,19 @@ def test_visibility_assessment_distinguishes_black_borderline_and_visible_images
     black = np.zeros((240, 320), dtype=np.uint8)
     borderline = np.full((240, 320), 14, dtype=np.uint8)
     cv2.fillConvexPoly(borderline, np.rint(box).astype(np.int32), 2)
+    unusable_dark = np.full((240, 320), 14, dtype=np.uint8)
+    cv2.fillConvexPoly(unusable_dark, np.rint(box).astype(np.int32), 7)
     visible = np.full((240, 320), 180, dtype=np.uint8)
     cv2.fillConvexPoly(visible, np.rint(box).astype(np.int32), 30)
 
     black_result = assess_obb_visibility(black, box)
     borderline_result = assess_obb_visibility(borderline, box)
+    unusable_dark_result = assess_obb_visibility(unusable_dark, box)
     visible_result = assess_obb_visibility(visible, box)
 
     assert black_result.suspicious and black_result.recommended_exclude
     assert borderline_result.suspicious and not borderline_result.recommended_exclude
+    assert unusable_dark_result.suspicious and unusable_dark_result.recommended_exclude
     assert not visible_result.suspicious
     assert visible_result.score > borderline_result.score > black_result.score
 
@@ -431,6 +436,9 @@ def test_visibility_review_can_exclude_positive_but_keeps_audit_row(tmp_path: Pa
     assert black_path in reviewed
     assert result.positive_images == 5
     assert result.excluded_images == 1
+    assert result.negative_images == 5
+    summary = json.loads((output / "label_summary.json").read_text(encoding="utf-8"))
+    assert summary["excluded_negative_images"] == 1
     assert "True" in report
     assert black_path.name in report
     assert not any(

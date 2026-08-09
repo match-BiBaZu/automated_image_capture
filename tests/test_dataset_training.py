@@ -129,6 +129,34 @@ def test_collects_two_classes_and_deduplicates_empty_images(
     assert positive.conveyor_track_used
 
 
+def test_collect_skips_audited_exclusions_and_their_missing_empty_image(
+    tmp_path: Path, source_dataset: Path
+) -> None:
+    report_path = source_dataset / "label_report.csv"
+    with report_path.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    background_file = rows[0]["background_file"]
+    for row in rows:
+        row["excluded_from_dataset"] = str(row["background_file"] == background_file)
+        if row["background_file"] == background_file:
+            (source_dataset / "images" / "old" / row["dataset_image"]).unlink()
+            (source_dataset / "labels" / "old" / row["label_file"]).unlink()
+            row["dataset_image"] = ""
+            row["label_file"] = ""
+    empty_name = f"empty_{background_file}"
+    (source_dataset / "images" / "old" / empty_name).unlink()
+    (source_dataset / "labels" / "old" / f"{Path(empty_name).stem}.txt").unlink()
+    with report_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    records = collect_dataset_records(_config(tmp_path, source_dataset))
+
+    assert len(records) == 87
+    assert all(record.source_image.name != empty_name for record in records)
+
+
 def test_build_keeps_classes_and_pose_splits_disjoint(
     tmp_path: Path, source_dataset: Path
 ) -> None:

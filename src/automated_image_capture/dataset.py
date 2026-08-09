@@ -4,7 +4,7 @@ import csv
 import json
 import os
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -232,6 +232,8 @@ def _collect_positive_records(root: Path, class_names: dict[int, str]) -> list[D
     records: list[DatasetRecord] = []
     with (root / "label_report.csv").open(encoding="utf-8-sig", newline="") as stream:
         for row in csv.DictReader(stream):
+            if _csv_bool(row.get("excluded_from_dataset")):
+                continue
             pose_id = _integer(row, "pose_id")
             class_id = _integer(row, "class_id")
             if class_id not in class_names:
@@ -293,7 +295,11 @@ def _collect_empty_records(root: Path) -> list[DatasetRecord]:
     records: list[DatasetRecord] = []
     seen: set[str] = set()
     with (root / "label_report.csv").open(encoding="utf-8-sig", newline="") as stream:
-        for row in csv.DictReader(stream):
+        report_rows = list(csv.DictReader(stream))
+        rows_by_background: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for row in report_rows:
+            rows_by_background[row.get("background_file", "")].append(row)
+        for row in report_rows:
             background_file = row.get("background_file", "")
             if background_file in seen:
                 continue
@@ -302,6 +308,11 @@ def _collect_empty_records(root: Path) -> list[DatasetRecord]:
             old_image_name = f"empty_{background_file}"
             old_label_name = f"{Path(old_image_name).stem}.txt"
             if old_image_name not in image_index:
+                if all(
+                    _csv_bool(item.get("excluded_from_dataset"))
+                    for item in rows_by_background[background_file]
+                ):
+                    continue
                 raise DatasetError(f"Leerbild fehlt: {old_image_name}")
             if old_label_name not in label_index:
                 raise DatasetError(f"Leeres Label fehlt: {old_label_name}")
