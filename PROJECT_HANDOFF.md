@@ -523,7 +523,11 @@ UR-Winkels ausgewertet:
 5. Vor dem Export zeigt die GUI je Klasse und UR-Winkel sechs Beispiele über die gesamte
    Bandstrecke; Grün kennzeichnet Anker, Orange das berechnete Bahnmodell. Ablehnen beendet den
    Lauf, bevor der Ausgabeordner angelegt wird.
-6. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
+6. Danach prüft eine Sichtbarkeitsstufe Helligkeit, Clipping, Dynamikumfang und lokalen
+   OBB-Kontrast. Verdächtige Bilder erscheinen in einer klickbaren Galerie; nur eindeutig
+   unbrauchbare Bilder sind vorausgewählt. Ausschlüsse bleiben im CSV-Bericht auditierbar,
+   werden jedoch nicht in `images/` und `labels/` exportiert.
+7. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
    `quality=REVIEW` und einem verständlichen `quality_reason` protokolliert.
 
 Diese Änderung behebt den früheren Fehler:

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings
+import cv2
+import numpy as np
+from PyQt6.QtCore import QSettings, Qt
 
-from automated_image_capture.labeling import LabelingConfig, LabelSource
+from automated_image_capture.labeling import (
+    LabelingConfig,
+    LabelSource,
+    VisibilityReviewItem,
+)
 from automated_image_capture.settings import SettingsStore
-from automated_image_capture.ui.labeling_dialog import LabelingDialog
+from automated_image_capture.ui.labeling_dialog import LabelingDialog, VisibilityReviewDialog
 
 
 def _dialog(qtbot, tmp_path: Path) -> LabelingDialog:
@@ -70,3 +76,23 @@ def test_labeling_dialog_can_add_and_remove_pose_rows(qtbot, tmp_path) -> None:
         "Klasse 1",
         "Negativ",
     ]
+
+
+def test_visibility_review_preselects_only_clear_recommendations(qtbot, tmp_path) -> None:
+    preview = tmp_path / "preview.png"
+    source_a = tmp_path / "black.png"
+    source_b = tmp_path / "borderline.png"
+    image = np.zeros((80, 120, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(preview), image)
+    items = (
+        VisibilityReviewItem(0, "Pose 1", 155, source_a, preview, 0.0, "schwarz", True),
+        VisibilityReviewItem(
+            0, "Pose 1", 155, source_b, preview, 0.4, "sehr dunkel", False
+        ),
+    )
+    dialog = VisibilityReviewDialog(items)
+    qtbot.addWidget(dialog)
+
+    assert dialog.excluded_paths() == frozenset({source_a})
+    dialog._set_all(Qt.CheckState.Checked)
+    assert dialog.excluded_paths() == frozenset({source_a, source_b})

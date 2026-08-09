@@ -13,6 +13,7 @@ from automated_image_capture.labeling import (
     LabelingError,
     LabelSource,
     MatchedPair,
+    assess_obb_visibility,
     generate_obb_dataset,
     match_captures,
     scan_capture,
@@ -256,6 +257,61 @@ def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) ->
 
     with pytest.raises(LabelingError, match="Raster- und Rampenserie"):
         match_captures(scan_capture(foreground), scan_capture(background))
+
+
+def test_visibility_assessment_distinguishes_black_borderline_and_visible_images() -> None:
+    box = cv2.boxPoints(((160.0, 120.0), (82.0, 48.0), 20.0)).astype(np.float32)
+    black = np.zeros((240, 320), dtype=np.uint8)
+    borderline = np.full((240, 320), 14, dtype=np.uint8)
+    cv2.fillConvexPoly(borderline, np.rint(box).astype(np.int32), 2)
+    visible = np.full((240, 320), 180, dtype=np.uint8)
+    cv2.fillConvexPoly(visible, np.rint(box).astype(np.int32), 30)
+
+    black_result = assess_obb_visibility(black, box)
+    borderline_result = assess_obb_visibility(borderline, box)
+    visible_result = assess_obb_visibility(visible, box)
+
+    assert black_result.suspicious and black_result.recommended_exclude
+    assert borderline_result.suspicious and not borderline_result.recommended_exclude
+    assert not visible_result.suspicious
+    assert visible_result.score > borderline_result.score > black_result.score
+
+
+def test_visibility_review_can_exclude_positive_but_keeps_audit_row(tmp_path: Path) -> None:
+    foreground, background = _make_capture_pair(tmp_path)
+    black_path = sorted(foreground.glob("*.png"))[0]
+    assert cv2.imwrite(str(black_path), np.zeros((240, 320), dtype=np.uint8))
+    output = tmp_path / "filtered_dataset"
+    reviewed: list[Path] = []
+
+    def exclude_recommended(items):
+        reviewed.extend(item.source_path for item in items)
+        return frozenset(item.source_path for item in items if item.recommended_exclude)
+
+    result = generate_obb_dataset(
+        LabelingConfig(
+            (
+                LabelSource("Pose 1", foreground),
+                LabelSource("Leere Rutsche", background, is_empty=True),
+            ),
+            output,
+            validation_fraction=0.5,
+            minimum_difference=20,
+            consensus_fraction=0.5,
+        ),
+        visibility_review=exclude_recommended,
+    )
+
+    report = (output / "label_report.csv").read_text(encoding="utf-8-sig")
+    assert black_path in reviewed
+    assert result.positive_images == 5
+    assert result.excluded_images == 1
+    assert "True" in report
+    assert black_path.name in report
+    assert not any(
+        path.name.startswith("class_") and black_path.name in path.name
+        for path in (output / "images").rglob("*.png")
+    )
 
 
 def test_generate_yolo_obb_dataset_with_negative_images(tmp_path: Path) -> None:

@@ -3,8 +3,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, Qt, QThread, QUrl, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QCloseEvent, QDesktopServices, QPixmap
+from PyQt6.QtCore import QObject, QSize, Qt, QThread, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -15,6 +15,9 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -31,6 +34,7 @@ from automated_image_capture.labeling import (
     LabelingConfig,
     LabelingResult,
     LabelSource,
+    VisibilityReviewItem,
     generate_obb_dataset,
 )
 from automated_image_capture.settings import SettingsStore
@@ -42,6 +46,7 @@ class LabelingWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
     anchors_ready = pyqtSignal(object)
+    visibility_ready = pyqtSignal(object)
 
     def __init__(self, config: LabelingConfig) -> None:
         super().__init__()
@@ -49,10 +54,13 @@ class LabelingWorker(QObject):
         self._cancelled = threading.Event()
         self._anchor_decision = threading.Event()
         self._anchors_accepted = False
+        self._visibility_decision = threading.Event()
+        self._visibility_selection: frozenset[Path] | None = None
 
     def cancel(self) -> None:
         self._cancelled.set()
         self._anchor_decision.set()
+        self._visibility_decision.set()
 
     def resolve_anchor_review(self, accepted: bool) -> None:
         self._anchors_accepted = accepted
@@ -66,6 +74,23 @@ class LabelingWorker(QObject):
                 return False
         return self._anchors_accepted and not self._cancelled.is_set()
 
+    def resolve_visibility_review(self, selected: frozenset[Path] | None) -> None:
+        self._visibility_selection = selected
+        self._visibility_decision.set()
+
+    def _review_visibility(
+        self, items: tuple[VisibilityReviewItem, ...]
+    ) -> frozenset[Path] | None:
+        self._visibility_decision.clear()
+        self._visibility_selection = None
+        self.visibility_ready.emit(items)
+        while not self._visibility_decision.wait(0.1):
+            if self._cancelled.is_set():
+                return None
+        if self._cancelled.is_set():
+            return None
+        return self._visibility_selection
+
     @pyqtSlot()
     def run(self) -> None:
         try:
@@ -74,6 +99,7 @@ class LabelingWorker(QObject):
                 lambda done, total, message: self.progress.emit(done, total, message),
                 self._cancelled.is_set,
                 self._review_anchors,
+                self._review_visibility,
             )
         except LabelingCancelled:
             self.cancelled.emit()
@@ -183,6 +209,95 @@ class AnchorReviewDialog(QDialog):
         accept.clicked.connect(self.accept)
         reject.clicked.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class VisibilityReviewDialog(QDialog):
+    def __init__(
+        self,
+        items: tuple[VisibilityReviewItem, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.items = items
+        self.setWindowTitle("Schlecht sichtbare Bilder aussortieren")
+        self.resize(1120, 800)
+        layout = QVBoxLayout(self)
+        recommended = sum(item.recommended_exclude for item in items)
+        explanation = QLabel(
+            f"{len(items)} Bilder wirken sehr dunkel, überbelichtet oder lokal kontrastarm. "
+            f"{recommended} eindeutig unbrauchbare Bilder sind bereits zum Ausschluss "
+            "markiert. Häkchen bedeutet: nicht in den YOLO-Datensatz übernehmen."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.gallery = QListWidget()
+        self.gallery.setViewMode(QListView.ViewMode.IconMode)
+        self.gallery.setResizeMode(QListView.ResizeMode.Adjust)
+        self.gallery.setMovement(QListView.Movement.Static)
+        self.gallery.setIconSize(QSize(310, 190))
+        self.gallery.setGridSize(QSize(350, 285))
+        self.gallery.setWordWrap(True)
+        for review in items:
+            entry = QListWidgetItem(QIcon(str(review.preview_path)), "")
+            entry.setText(
+                f"Klasse {review.class_id}: {review.class_name} · "
+                f"UR {review.pose_id / 10.0:.1f}°\n"
+                f"Score {review.score:.2f} · {review.reason}\n{review.source_path.name}"
+            )
+            entry.setData(Qt.ItemDataRole.UserRole, str(review.source_path))
+            entry.setFlags(
+                entry.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            entry.setCheckState(
+                Qt.CheckState.Checked
+                if review.recommended_exclude
+                else Qt.CheckState.Unchecked
+            )
+            self.gallery.addItem(entry)
+        layout.addWidget(self.gallery, 1)
+
+        selection_row = QHBoxLayout()
+        recommended_button = QPushButton("Nur Empfehlungen markieren")
+        all_button = QPushButton("Alle markieren")
+        none_button = QPushButton("Keine markieren")
+        recommended_button.clicked.connect(self._mark_recommended)
+        all_button.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        none_button.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        selection_row.addWidget(recommended_button)
+        selection_row.addWidget(all_button)
+        selection_row.addWidget(none_button)
+        selection_row.addStretch(1)
+        layout.addLayout(selection_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Auswahl übernehmen")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        for index in range(self.gallery.count()):
+            self.gallery.item(index).setCheckState(state)
+
+    def _mark_recommended(self) -> None:
+        for index, review in enumerate(self.items):
+            self.gallery.item(index).setCheckState(
+                Qt.CheckState.Checked
+                if review.recommended_exclude
+                else Qt.CheckState.Unchecked
+            )
+
+    def excluded_paths(self) -> frozenset[Path]:
+        return frozenset(
+            Path(str(self.gallery.item(index).data(Qt.ItemDataRole.UserRole)))
+            for index in range(self.gallery.count())
+            if self.gallery.item(index).checkState() == Qt.CheckState.Checked
+        )
 
 
 class LabelingDialog(QDialog):
@@ -418,6 +533,7 @@ class LabelingDialog(QDialog):
         thread.started.connect(worker.run)
         worker.progress.connect(self._progress)
         worker.anchors_ready.connect(self._review_anchors)
+        worker.visibility_ready.connect(self._review_visibility)
         worker.completed.connect(self._completed)
         worker.failed.connect(self._failed)
         worker.cancelled.connect(self._cancelled)
@@ -444,6 +560,21 @@ class LabelingDialog(QDialog):
         )
         worker.resolve_anchor_review(accepted)
 
+    @pyqtSlot(object)
+    def _review_visibility(self, value: object) -> None:
+        items = tuple(item for item in value if isinstance(item, VisibilityReviewItem))
+        worker = self._worker
+        if worker is None:
+            return
+        self.status.setText(
+            "Bitte sehr dunkle, überbelichtete oder kontrastarme Bilder aussortieren."
+        )
+        dialog = VisibilityReviewDialog(items, self)
+        if items and dialog.exec() == QDialog.DialogCode.Accepted:
+            worker.resolve_visibility_review(dialog.excluded_paths())
+        else:
+            worker.resolve_visibility_review(None)
+
     @pyqtSlot(int, int, str)
     def _progress(self, done: int, total: int, message: str) -> None:
         self.progress.setRange(0, max(1, total))
@@ -468,6 +599,7 @@ class LabelingDialog(QDialog):
             f"Fertig: {result.positive_images} positive und {result.negative_images} negative "
             f"Bilder, {result.classes} Klassen und {result.poses} UR-Ansichten, "
             f"{result.flagged_images} Bilder zur Nachprüfung. "
+            f"{result.excluded_images} schlecht sichtbare Bilder ausgeschlossen. "
             f"Positionsbahn: {result.position_tracked_images} Bilder, "
             f"davon {result.position_corrected_images} stabilisiert und "
             f"{result.position_interpolated_images} ohne sichere Einzelsegmentierung "

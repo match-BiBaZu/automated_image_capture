@@ -186,6 +186,7 @@ class LabelingResult:
     position_tracked_images: int = 0
     position_corrected_images: int = 0
     position_interpolated_images: int = 0
+    excluded_images: int = 0
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -203,6 +204,23 @@ class AnchorReviewItem:
 
 
 AnchorReviewCallback = Callable[[tuple[AnchorReviewItem, ...]], bool]
+
+
+@dataclass(slots=True, frozen=True)
+class VisibilityReviewItem:
+    class_id: int
+    class_name: str
+    pose_id: int
+    source_path: Path
+    preview_path: Path
+    score: float
+    reason: str
+    recommended_exclude: bool
+
+
+VisibilityReviewCallback = Callable[
+    [tuple[VisibilityReviewItem, ...]], frozenset[Path] | None
+]
 
 
 def _optional_finite_float(value: object) -> float | None:
@@ -547,6 +565,9 @@ def _measurement_row(
         "track_anchor": False,
         "obb_center_x_pixels": None,
         "obb_center_y_pixels": None,
+        "visibility_score": None,
+        "visibility_reason": "",
+        "excluded_from_dataset": False,
         "quality_reason": "",
         "foreground_file": pair.foreground.path.name,
         "background_file": pair.background.path.name,
@@ -554,6 +575,9 @@ def _measurement_row(
         "foreground_area_pixels": measurement.foreground_area,
         "consensus_iou": round(float(consensus_iou), 6),
         "quality": quality,
+        "split": "",
+        "dataset_image": "",
+        "label_file": "",
     }
 
 
@@ -1019,6 +1043,108 @@ def _make_anchor_review_sheet(
     _make_review_sheet(pose, selected, destination, boxes, anchor_paths)
 
 
+@dataclass(slots=True, frozen=True)
+class _VisibilityAssessment:
+    score: float
+    reason: str
+    suspicious: bool
+    recommended_exclude: bool
+
+
+def assess_obb_visibility(image: np.ndarray, box: np.ndarray) -> _VisibilityAssessment:
+    """Estimate whether the expected object is visually usable, independent of its label."""
+    if image.ndim != 2:
+        raise LabelingError("Die Sichtbarkeitsprüfung erwartet ein Graustufenbild.")
+    sample = image[::4, ::4]
+    q01, q50, q99 = (float(value) for value in np.percentile(sample, (1, 50, 99)))
+    dynamic_range = q99 - q01
+    dark_fraction = float(np.mean(sample <= 8))
+    bright_fraction = float(np.mean(sample >= 247))
+
+    mask = np.zeros(image.shape, dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.rint(box).astype(np.int32), 255)
+    short_side = max(9, int(round(min(image.shape) * 0.025))) | 1
+    dilated = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (short_side, short_side)),
+    )
+    inner = image[mask > 0]
+    ring = image[(dilated > 0) & (mask == 0)]
+    if inner.size and ring.size:
+        inner_q10, inner_q50, inner_q90 = (
+            float(value) for value in np.percentile(inner, (10, 50, 90))
+        )
+        local_strength = max(
+            inner_q90 - inner_q10,
+            abs(inner_q50 - float(np.median(ring))),
+        )
+    else:
+        local_strength = 0.0
+
+    illumination = min(q99 / 30.0, 1.0) * min((255.0 - q01) / 30.0, 1.0)
+    score = float(
+        np.clip(
+            0.35 * illumination
+            + 0.25 * min(dynamic_range / 30.0, 1.0)
+            + 0.40 * min(local_strength / 15.0, 1.0),
+            0.0,
+            1.0,
+        )
+    )
+    recommended = bool(
+        q99 <= 4.0
+        or q01 >= 251.0
+        or dynamic_range <= 6.0
+        or dark_fraction >= 0.995
+        or bright_fraction >= 0.995
+    )
+    reasons: list[str] = []
+    if q99 < 30.0:
+        reasons.append("sehr dunkel")
+    if bright_fraction > 0.75:
+        reasons.append("stark überbelichtet")
+    if dynamic_range < 18.0:
+        reasons.append("geringer Dynamikumfang")
+    if local_strength < 6.0:
+        reasons.append("Bauteil lokal kaum erkennbar")
+    suspicious = recommended or score < 0.58 or bool(reasons)
+    return _VisibilityAssessment(
+        round(score, 3),
+        ", ".join(dict.fromkeys(reasons)) or "geringe Sichtbarkeit",
+        suspicious,
+        recommended,
+    )
+
+
+def _make_visibility_preview(
+    image: np.ndarray,
+    box: np.ndarray,
+    assessment: _VisibilityAssessment,
+    destination: Path,
+) -> None:
+    preview = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    color = (0, 0, 255) if assessment.recommended_exclude else (0, 165, 255)
+    cv2.polylines(preview, [np.rint(box).astype(np.int32)], True, color, 6)
+    cv2.rectangle(preview, (0, 0), (preview.shape[1], 95), (0, 0, 0), -1)
+    cv2.putText(
+        preview,
+        f"Sichtbarkeit {assessment.score:.2f}  {assessment.reason}",
+        (25, 62),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.25,
+        color,
+        3,
+        cv2.LINE_AA,
+    )
+    scale = min(1.0, 640.0 / preview.shape[1])
+    resized = cv2.resize(
+        preview,
+        (round(preview.shape[1] * scale), round(preview.shape[0] * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+    cv2.imwrite(str(destination), resized, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+
 def _make_pose_overview(
     consensuses: dict[int | tuple[int, int], PoseConsensus],
     grouped: dict[int | tuple[int, int], list[MatchedPair]],
@@ -1085,6 +1211,7 @@ def generate_obb_dataset(
     progress: ProgressCallback | None = None,
     cancelled: CancelCallback | None = None,
     anchor_review: AnchorReviewCallback | None = None,
+    visibility_review: VisibilityReviewCallback | None = None,
 ) -> LabelingResult:
     config = config.validated()
     background = scan_capture(config.empty_source.directory)
@@ -1225,6 +1352,44 @@ def generate_obb_dataset(
             if review_items and not anchor_review(tuple(review_items)):
                 raise LabelingCancelled("Die vorgeschlagenen OBB-Anker wurden nicht bestätigt.")
 
+    excluded_paths: frozenset[Path] = frozenset()
+    with tempfile.TemporaryDirectory(prefix="obb_visibility_review_") as temporary:
+        temporary_path = Path(temporary)
+        visibility_items: list[VisibilityReviewItem] = []
+        for item_index, (row, pair, class_id, source) in enumerate(write_records):
+            if cancelled is not None and cancelled():
+                raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+            image = _read_gray(pair.foreground.path)
+            box = output_boxes[(class_id, pair.foreground.path)]
+            assessment = assess_obb_visibility(image, box)
+            row["visibility_score"] = assessment.score
+            row["visibility_reason"] = assessment.reason if assessment.suspicious else ""
+            if assessment.suspicious and visibility_review is not None:
+                preview = temporary_path / f"visibility_{item_index:05d}.jpg"
+                _make_visibility_preview(image, box, assessment, preview)
+                visibility_items.append(
+                    VisibilityReviewItem(
+                        class_id,
+                        source.name,
+                        pair.foreground.key.pose_id,
+                        pair.foreground.path,
+                        preview,
+                        assessment.score,
+                        assessment.reason,
+                        assessment.recommended_exclude,
+                    )
+                )
+            if progress is not None and (item_index + 1) % 25 == 0:
+                progress(completed, total_steps, "Prüfe Sichtbarkeit der Bauteile")
+        if visibility_items and visibility_review is not None:
+            selected = visibility_review(tuple(visibility_items))
+            if selected is None:
+                raise LabelingCancelled("Die Sichtbarkeitsprüfung wurde abgebrochen.")
+            candidate_paths = {item.source_path for item in visibility_items}
+            excluded_paths = frozenset(path for path in selected if path in candidate_paths)
+            for row, pair, _, _ in write_records:
+                row["excluded_from_dataset"] = pair.foreground.path in excluded_paths
+
     output = config.output_directory
     output.mkdir(parents=True, exist_ok=True)
     review = output / "review"
@@ -1240,6 +1405,11 @@ def generate_obb_dataset(
         pose_id = pair.foreground.key.pose_id
         station_id = pair.foreground.key.conveyor_station_id
         split = "val" if pose_id in validation_poses else "train"
+        if pair.foreground.path in excluded_paths:
+            completed += 1
+            if progress is not None:
+                progress(completed, total_steps, f"Überspringe unsichtbares Bild · {source.name}")
+            continue
         image = _read_gray(pair.foreground.path)
         height, width = image.shape
         positive_name = (
@@ -1318,9 +1488,11 @@ def generate_obb_dataset(
         )
 
     _write_csv(output / "label_report.csv", report_rows)
+    exported_positive_count = positive_count - len(excluded_paths)
     summary = {
         "format": "YOLO OBB",
-        "positive_images": positive_count,
+        "positive_images": exported_positive_count,
+        "excluded_images": len(excluded_paths),
         "negative_images": negative_count,
         "validation_poses": sorted(validation_poses),
         "train_poses": sorted(set(pose_ids) - validation_poses),
@@ -1387,7 +1559,7 @@ def generate_obb_dataset(
     )
     return LabelingResult(
         output,
-        positive_count,
+        exported_positive_count,
         negative_count,
         len(config.pose_sources),
         len(pose_ids),
@@ -1397,4 +1569,5 @@ def generate_obb_dataset(
         position_tracked,
         position_corrected,
         position_interpolated,
+        len(excluded_paths),
     )

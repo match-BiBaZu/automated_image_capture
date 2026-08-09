@@ -197,7 +197,13 @@ Fehlen Positionsmetadaten, bleibt das bisherige Konsensverfahren unverändert ak
 Nach der einmaligen Segmentierung pausiert die GUI vor dem Export. Sie zeigt für jede Klasse
 und jeden UR-Winkel sechs über die gesamte Bandstrecke verteilte Beispiele: Grün bedeutet
 `ANKER`, Orange bedeutet eine aus der Bahn berechnete Box. Erst **Anker übernehmen** schreibt
-den YOLO-Datensatz; bei Ablehnung bleibt der gewählte Ausgabeordner unangetastet.
+noch nicht sofort den YOLO-Datensatz: Anschließend bewertet eine zweite Stufe globale
+Helligkeit, Clipping, Dynamikumfang und den lokalen Kontrast in der erwarteten OBB. Verdächtige
+Bilder erscheinen als Thumbnail-Galerie. Eindeutig schwarze oder weiße Bilder sind zum
+Ausschluss vorausgewählt, dunkle Grenzfälle bleiben eine bewusste Nutzerentscheidung. Erst
+**Auswahl übernehmen** startet den Export; bei Abbruch bleibt der Ausgabeordner unangetastet.
+Ausgeschlossene Bilder stehen mit Sichtbarkeitsscore und Begründung weiterhin im
+`label_report.csv`, werden aber weder als Trainingsbild noch als Label geschrieben.
 
 Über **OBB-Labels …** lässt sich aus beliebig vielen Bauteilserien und einer parametrisch
 identischen Leerbildserie ein gemeinsamer YOLO-OBB-Datensatz erzeugen. Die Quellenliste startet
