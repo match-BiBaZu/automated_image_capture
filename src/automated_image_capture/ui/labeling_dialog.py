@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 from automated_image_capture.dataset import default_build_config
 from automated_image_capture.labeling import (
+    AnchorReviewItem,
     LabelingCancelled,
     LabelingConfig,
     LabelingResult,
@@ -40,14 +41,30 @@ class LabelingWorker(QObject):
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
+    anchors_ready = pyqtSignal(object)
 
     def __init__(self, config: LabelingConfig) -> None:
         super().__init__()
         self.config = config
         self._cancelled = threading.Event()
+        self._anchor_decision = threading.Event()
+        self._anchors_accepted = False
 
     def cancel(self) -> None:
         self._cancelled.set()
+        self._anchor_decision.set()
+
+    def resolve_anchor_review(self, accepted: bool) -> None:
+        self._anchors_accepted = accepted
+        self._anchor_decision.set()
+
+    def _review_anchors(self, items: tuple[AnchorReviewItem, ...]) -> bool:
+        self._anchor_decision.clear()
+        self.anchors_ready.emit(items)
+        while not self._anchor_decision.wait(0.1):
+            if self._cancelled.is_set():
+                return False
+        return self._anchors_accepted and not self._cancelled.is_set()
 
     @pyqtSlot()
     def run(self) -> None:
@@ -56,6 +73,7 @@ class LabelingWorker(QObject):
                 self.config,
                 lambda done, total, message: self.progress.emit(done, total, message),
                 self._cancelled.is_set,
+                self._review_anchors,
             )
         except LabelingCancelled:
             self.cancelled.emit()
@@ -109,6 +127,62 @@ class LabelSourceRow(QWidget):
         )
         if selected:
             self.directory.setText(selected)
+
+
+class AnchorReviewDialog(QDialog):
+    def __init__(
+        self,
+        items: tuple[AnchorReviewItem, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("OBB-Anker bestätigen")
+        self.resize(1050, 760)
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Grün markiert eine zuverlässige Einzelsegmentierung (ANKER), Orange eine daraus "
+            "berechnete Box (BAHNMODELL). Pro Roboterwinkel wird der Mittelpunkt auf einer "
+            "geraden Förderbandbahn geführt. Bitte nur übernehmen, wenn alle Boxen das "
+            "Bauteil eng und vollständig umschließen."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        content = QVBoxLayout(container)
+        for item in items:
+            title = QLabel(
+                f"Klasse {item.class_id}: {item.class_name} · "
+                f"UR {item.pose_id / 10.0:.1f}° · "
+                f"{item.anchor_count}/{item.image_count} sichere Anker"
+            )
+            title.setStyleSheet("font-weight:600;")
+            content.addWidget(title)
+            image = QLabel()
+            pixmap = QPixmap(str(item.preview_path))
+            image.setPixmap(
+                pixmap.scaled(
+                    980,
+                    430,
+                    aspectRatioMode=Qt.AspectRatioMode.KeepAspectRatio,
+                    transformMode=Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            image.setStyleSheet("background:#111827; padding:6px;")
+            content.addWidget(image)
+        content.addStretch(1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+        buttons = QDialogButtonBox()
+        accept = buttons.addButton("Anker übernehmen", QDialogButtonBox.ButtonRole.AcceptRole)
+        reject = buttons.addButton(
+            "Ablehnen / nichts exportieren", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        accept.clicked.connect(self.accept)
+        reject.clicked.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class LabelingDialog(QDialog):
@@ -343,6 +417,7 @@ class LabelingDialog(QDialog):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._progress)
+        worker.anchors_ready.connect(self._review_anchors)
         worker.completed.connect(self._completed)
         worker.failed.connect(self._failed)
         worker.cancelled.connect(self._cancelled)
@@ -353,6 +428,21 @@ class LabelingDialog(QDialog):
         self._thread = thread
         self._worker = worker
         thread.start()
+
+    @pyqtSlot(object)
+    def _review_anchors(self, value: object) -> None:
+        items = tuple(item for item in value if isinstance(item, AnchorReviewItem))
+        worker = self._worker
+        if worker is None:
+            return
+        self.status.setText(
+            "Segmentierung fertig. Bitte die vorgeschlagenen OBB-Anker kontrollieren."
+        )
+        accepted = (
+            bool(items)
+            and AnchorReviewDialog(items, self).exec() == QDialog.DialogCode.Accepted
+        )
+        worker.resolve_anchor_review(accepted)
 
     @pyqtSlot(int, int, str)
     def _progress(self, done: int, total: int, message: str) -> None:

@@ -193,6 +193,59 @@ def test_measured_conveyor_track_interpolates_missing_segmentations(tmp_path: Pa
         assert "interpoliert" in str(row["quality_reason"])
 
 
+def test_measured_conveyor_track_uses_straight_anchor_line_among_blob_outliers(
+    tmp_path: Path,
+) -> None:
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray]] = []
+    true_indices = {0, 2, 4, 7, 10, 12, 14}
+    outlier_centers = (
+        (315.0, 30.0),
+        (35.0, 205.0),
+        (280.0, 190.0),
+        (60.0, 35.0),
+        (350.0, 150.0),
+        (180.0, 30.0),
+        (40.0, 150.0),
+        (330.0, 220.0),
+    )
+    outlier_index = 0
+    for index in range(15):
+        path = tmp_path / f"robust_{index}.png"
+        assert cv2.imwrite(str(path), np.zeros((240, 400), dtype=np.uint8))
+        key = CaptureKey(
+            pose_id=155,
+            panel_2=0,
+            panel_1=0,
+            exposure="auto",
+            robot_mode="angle",
+            conveyor_station_id=index,
+            conveyor_position_tenths_mm=index * 100,
+            conveyor_direction="out",
+        )
+        record = CaptureRecord(path, key, index, float(index * 10), float(index * 10))
+        if index in true_indices:
+            center = (65.0 + index * 13.0, 105.0 + index * 1.5)
+            size = (72.0, 38.0)
+        else:
+            center = outlier_centers[outlier_index]
+            outlier_index += 1
+            size = (145.0, 18.0)
+        raw_box = cv2.boxPoints((center, size, 14.0)).astype(np.float32)
+        entries.append(
+            ({"quality": "PASS", "quality_reason": ""}, MatchedPair(record, record), raw_box)
+        )
+
+    boxes, summary = stabilize_boxes_by_conveyor_position(entries)
+
+    centers = np.asarray([boxes[pair.foreground.path].mean(axis=0) for _, pair, _ in entries])
+    expected_x = 65.0 + np.arange(15) * 13.0
+    expected_y = 105.0 + np.arange(15) * 1.5
+    assert summary.active
+    assert np.max(np.abs(centers[:, 0] - expected_x)) < 3.0
+    assert np.max(np.abs(centers[:, 1] - expected_y)) < 3.0
+    assert sum(bool(row["track_anchor"]) for row, _, _ in entries) == len(true_indices)
+
+
 def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) -> None:
     foreground = tmp_path / "parts_ramp"
     background = tmp_path / "empty_grid"

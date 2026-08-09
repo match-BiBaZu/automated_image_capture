@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -189,6 +190,19 @@ class LabelingResult:
 
 ProgressCallback = Callable[[int, int, str], None]
 CancelCallback = Callable[[], bool]
+
+
+@dataclass(slots=True, frozen=True)
+class AnchorReviewItem:
+    class_id: int
+    class_name: str
+    pose_id: int
+    preview_path: Path
+    anchor_count: int
+    image_count: int
+
+
+AnchorReviewCallback = Callable[[tuple[AnchorReviewItem, ...]], bool]
 
 
 def _optional_finite_float(value: object) -> float | None:
@@ -530,6 +544,7 @@ def _measurement_row(
         "track_center_residual_pixels": None,
         "track_raw_box_iou": None,
         "track_correction_applied": False,
+        "track_anchor": False,
         "obb_center_x_pixels": None,
         "obb_center_y_pixels": None,
         "quality_reason": "",
@@ -575,22 +590,74 @@ def stabilize_boxes_by_conveyor_position(
         return result, ConveyorTrackSummary(False)
 
     features = np.asarray([_box_features(raw_box) for _, _, raw_box in usable])
-    model_x, inliers_x = _robust_position_model(positions, features[:, 0], 10.0)
-    model_y, inliers_y = _robust_position_model(positions, features[:, 1], 10.0)
-    predicted_x = model_x.predict(positions)
-    predicted_y = model_y.predict(positions)
-    center_residuals = np.hypot(features[:, 0] - predicted_x, features[:, 1] - predicted_y)
-    center_median = float(np.median(center_residuals))
-    center_mad = float(np.median(np.abs(center_residuals - center_median)))
-    center_limit = max(18.0, center_median + max(12.0, 3.5 * 1.4826 * center_mad))
-    center_inliers = inliers_x & inliers_y & (center_residuals <= center_limit)
-    if int(np.count_nonzero(center_inliers)) < 6:
+    centers = features[:, :2]
+    position_span = float(np.ptp(positions))
+
+    # Determine the dominant straight trajectory.  Pair hypotheses are deterministic and
+    # cope with a majority of shadow/blob candidates better than independent polynomial fits.
+    best_inliers: np.ndarray | None = None
+    best_score = (-1, -1.0, -1.0)
+    minimum_hypothesis_span = max(15.0, position_span * 0.25)
+    for left in range(len(usable) - 1):
+        for right in range(left + 1, len(usable)):
+            delta = positions[right] - positions[left]
+            if abs(delta) < minimum_hypothesis_span:
+                continue
+            velocity = (centers[right] - centers[left]) / delta
+            predicted = centers[left] + (positions[:, None] - positions[left]) * velocity
+            residuals = np.linalg.norm(centers - predicted, axis=1)
+            inliers = residuals <= 16.0
+            count = int(np.count_nonzero(inliers))
+            if count < 6:
+                continue
+            coverage = float(np.ptp(positions[inliers]))
+            median_residual = float(np.median(residuals[inliers]))
+            score = (count, coverage, -median_residual)
+            if score > best_score:
+                best_score = score
+                best_inliers = inliers
+    if best_inliers is None or best_score[1] < position_span * 0.45:
         return result, ConveyorTrackSummary(False)
 
-    major = float(np.median(features[center_inliers, 2]))
-    minor = float(np.median(features[center_inliers, 3]))
-    cos_double = float(np.median(np.cos(2.0 * features[center_inliers, 4])))
-    sin_double = float(np.median(np.sin(2.0 * features[center_inliers, 4])))
+    center_inliers = best_inliers
+    for _ in range(5):
+        design = np.column_stack(
+            (positions[center_inliers], np.ones(np.count_nonzero(center_inliers)))
+        )
+        coefficients = np.linalg.lstsq(design, centers[center_inliers], rcond=None)[0]
+        predicted_centers = np.column_stack((positions, np.ones(len(positions)))) @ coefficients
+        center_residuals = np.linalg.norm(centers - predicted_centers, axis=1)
+        inlier_residuals = center_residuals[center_inliers]
+        median = float(np.median(inlier_residuals))
+        mad = float(np.median(np.abs(inlier_residuals - median)))
+        limit = max(10.0, median + max(6.0, 3.5 * 1.4826 * mad))
+        updated = center_residuals <= min(limit, 20.0)
+        if np.count_nonzero(updated) < 6 or np.array_equal(updated, center_inliers):
+            break
+        center_inliers = updated
+
+    # Reject geometrically implausible blobs before they can determine size and angle.
+    log_sizes = np.log(np.maximum(features[:, 2:4], 1.0))
+    size_center = np.median(log_sizes[center_inliers], axis=0)
+    size_deviation = np.abs(log_sizes - size_center)
+    size_mad = np.median(size_deviation[center_inliers], axis=0)
+    size_limit = np.maximum(0.18, 3.5 * 1.4826 * size_mad)
+    geometry_inliers = center_inliers & np.all(size_deviation <= size_limit, axis=1)
+    if int(np.count_nonzero(geometry_inliers)) < 6:
+        geometry_inliers = center_inliers
+
+    design = np.column_stack(
+        (positions[geometry_inliers], np.ones(np.count_nonzero(geometry_inliers)))
+    )
+    coefficients = np.linalg.lstsq(design, centers[geometry_inliers], rcond=None)[0]
+    predicted_centers = np.column_stack((positions, np.ones(len(positions)))) @ coefficients
+    center_residuals = np.linalg.norm(centers - predicted_centers, axis=1)
+    center_median = float(np.median(center_residuals[geometry_inliers]))
+
+    major = float(np.median(features[geometry_inliers, 2]))
+    minor = float(np.median(features[geometry_inliers, 3]))
+    cos_double = float(np.median(np.cos(2.0 * features[geometry_inliers, 4])))
+    sin_double = float(np.median(np.sin(2.0 * features[geometry_inliers, 4])))
     angle = math.atan2(sin_double, cos_double) / 2.0
 
     all_usable = [
@@ -603,12 +670,15 @@ def stabilize_boxes_by_conveyor_position(
         [pair.foreground.measured_conveyor_position_mm for _, pair, _ in all_usable],
         dtype=np.float64,
     )
-    all_predicted_x = model_x.predict(all_positions)
-    all_predicted_y = model_y.predict(all_positions)
+    all_predicted = np.column_stack((all_positions, np.ones(len(all_positions)))) @ coefficients
+    all_predicted_x = all_predicted[:, 0]
+    all_predicted_y = all_predicted[:, 1]
     residual_by_path = {
-        pair.foreground.path: (float(center_residuals[index]), bool(center_inliers[index]))
+        pair.foreground.path: (float(center_residuals[index]), bool(geometry_inliers[index]))
         for index, (_, pair, _) in enumerate(usable)
     }
+    for index, (row, _, _) in enumerate(usable):
+        row["track_anchor"] = bool(geometry_inliers[index])
 
     corrected = 0
     reviewed = 0
@@ -871,6 +941,7 @@ def _make_review_sheet(
     pairs: list[MatchedPair],
     destination: Path,
     boxes: dict[Path, np.ndarray] | None = None,
+    anchor_paths: set[Path] | None = None,
 ) -> None:
     selection = np.linspace(0, len(pairs) - 1, min(6, len(pairs)), dtype=int)
     tiles: list[np.ndarray] = []
@@ -880,7 +951,9 @@ def _make_review_sheet(
         if image is None:
             continue
         box = pose.box if boxes is None else boxes.get(pair.foreground.path, pose.box)
-        cv2.polylines(image, [np.rint(box).astype(np.int32)], True, (0, 255, 0), 5)
+        is_anchor = anchor_paths is None or pair.foreground.path in anchor_paths
+        color = (0, 255, 0) if is_anchor else (0, 165, 255)
+        cv2.polylines(image, [np.rint(box).astype(np.int32)], True, color, 5)
         sample = pair.foreground.key.ramp_sample_id
         measured_position = pair.foreground.measured_conveyor_position_mm
         cv2.putText(
@@ -900,6 +973,17 @@ def _make_review_sheet(
             3,
             cv2.LINE_AA,
         )
+        if anchor_paths is not None:
+            cv2.putText(
+                image,
+                "ANKER" if is_anchor else "BAHNMODELL",
+                (25, 105),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.1,
+                color,
+                3,
+                cv2.LINE_AA,
+            )
         scale = 480 / image.shape[1]
         tiles.append(cv2.resize(image, (480, round(image.shape[0] * scale))))
     if not tiles:
@@ -910,6 +994,29 @@ def _make_review_sheet(
         tiles.append(blank.copy())
     sheet = np.vstack((np.hstack(tiles[:3]), np.hstack(tiles[3:6])))
     cv2.imwrite(str(destination), sheet, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+
+def _make_anchor_review_sheet(
+    pose_id: int,
+    pairs: list[MatchedPair],
+    boxes: dict[Path, np.ndarray],
+    destination: Path,
+    anchor_paths: set[Path],
+) -> None:
+    """Render anchors and extrapolated boxes across the complete belt trajectory."""
+    ordered = sorted(
+        pairs,
+        key=lambda pair: (
+            float(pair.foreground.measured_conveyor_position_mm or 0.0),
+            pair.foreground.sequence_index,
+        ),
+    )
+    selection = np.linspace(0, len(ordered) - 1, min(6, len(ordered)), dtype=int)
+    selected = [ordered[int(index)] for index in selection]
+    first_box = boxes[selected[0].foreground.path]
+    dummy_mask = np.zeros(_read_gray(selected[0].foreground.path).shape, dtype=np.uint8)
+    pose = PoseConsensus(pose_id, first_box, dummy_mask, len(ordered), 1.0, 1.0, 0)
+    _make_review_sheet(pose, selected, destination, boxes, anchor_paths)
 
 
 def _make_pose_overview(
@@ -977,6 +1084,7 @@ def generate_obb_dataset(
     config: LabelingConfig,
     progress: ProgressCallback | None = None,
     cancelled: CancelCallback | None = None,
+    anchor_review: AnchorReviewCallback | None = None,
 ) -> LabelingResult:
     config = config.validated()
     background = scan_capture(config.empty_source.directory)
@@ -1071,6 +1179,51 @@ def generate_obb_dataset(
                 row["conveyor_direction"] = pair.foreground.key.conveyor_direction
                 report_rows.append(row)
                 write_records.append((row, pair, class_id, source))
+
+    if anchor_review is not None:
+        with tempfile.TemporaryDirectory(prefix="obb_anchor_review_") as temporary:
+            temporary_path = Path(temporary)
+            review_items: list[AnchorReviewItem] = []
+            for class_id, source, _, _ in source_data:
+                class_pose_ids = {
+                    pair.foreground.key.pose_id
+                    for _, pair, cid, _ in write_records
+                    if cid == class_id
+                }
+                for pose_id in sorted(class_pose_ids):
+                    pose_records = [
+                        (row, pair)
+                        for row, pair, cid, _ in write_records
+                        if cid == class_id and pair.foreground.key.pose_id == pose_id
+                    ]
+                    anchors = [pair for row, pair in pose_records if bool(row.get("track_anchor"))]
+                    if not anchors:
+                        continue
+                    sheet = temporary_path / f"class_{class_id:03d}_pose_{pose_id}_anchors.jpg"
+                    all_pairs = [pair for _, pair in pose_records]
+                    class_boxes = {
+                        pair.foreground.path: output_boxes[(class_id, pair.foreground.path)]
+                        for _, pair in pose_records
+                    }
+                    _make_anchor_review_sheet(
+                        pose_id,
+                        all_pairs,
+                        class_boxes,
+                        sheet,
+                        {pair.foreground.path for pair in anchors},
+                    )
+                    review_items.append(
+                        AnchorReviewItem(
+                            class_id,
+                            source.name,
+                            pose_id,
+                            sheet,
+                            len(anchors),
+                            len(pose_records),
+                        )
+                    )
+            if review_items and not anchor_review(tuple(review_items)):
+                raise LabelingCancelled("Die vorgeschlagenen OBB-Anker wurden nicht bestätigt.")
 
     output = config.output_directory
     output.mkdir(parents=True, exist_ok=True)

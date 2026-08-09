@@ -188,10 +188,16 @@ Fortsetzen die nächste benötigte freigegebene Pose erneut über den normalen H
 
 Bei synchronen Förderbandaufnahmen liest das Labeling zusätzlich
 `conveyor.measured_logical_offset_mm` aus jeder Bild-YAML. Die OBB-Mittelpunkte werden pro
-UR-Orientierung robust über der gemessenen Bandposition modelliert; fehlerhafte
-Einzelsegmentierungen werden durch die Bahn stabilisiert und im `label_report.csv` weiterhin
-als `REVIEW` nachvollziehbar markiert. Fehlen Positionsmetadaten, bleibt das bisherige
-Konsensverfahren unverändert aktiv.
+UR-Orientierung als gerade Bildbahn über der gemessenen Bandposition modelliert. Ein robuster
+Ankerfilter verwirft Schatten, Rutschenkanten sowie unplausibel große Boxen, bevor Größe und
+Orientierung bestimmt werden. Fehlerhafte Einzelsegmentierungen werden durch die Bahn
+stabilisiert und im `label_report.csv` weiterhin als `REVIEW` nachvollziehbar markiert.
+Fehlen Positionsmetadaten, bleibt das bisherige Konsensverfahren unverändert aktiv.
+
+Nach der einmaligen Segmentierung pausiert die GUI vor dem Export. Sie zeigt für jede Klasse
+und jeden UR-Winkel sechs über die gesamte Bandstrecke verteilte Beispiele: Grün bedeutet
+`ANKER`, Orange bedeutet eine aus der Bahn berechnete Box. Erst **Anker übernehmen** schreibt
+den YOLO-Datensatz; bei Ablehnung bleibt der gewählte Ausgabeordner unangetastet.
 
 Über **OBB-Labels …** lässt sich aus beliebig vielen Bauteilserien und einer parametrisch
 identischen Leerbildserie ein gemeinsamer YOLO-OBB-Datensatz erzeugen. Die Quellenliste startet

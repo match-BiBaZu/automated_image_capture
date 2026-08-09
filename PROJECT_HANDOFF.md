@@ -515,11 +515,15 @@ Bei synchronisierten Serien existiert pro Bandstation häufig nur ein Bild. Beso
 Licht ist eine direkte Segmentierung unmöglich. Deshalb wird zuerst die vollständige Bahn eines
 UR-Winkels ausgewertet:
 
-1. Sichere Differenzsegmentierungen liefern OBB-Kandidaten.
-2. Aus den gemessenen ADS-Positionen wird robust eine Bahn der OBB-Mittelpunkte modelliert.
-3. Größe und Orientierung werden aus den sicheren Kandidaten stabilisiert.
-4. Fehlende oder stark abweichende Einzelboxen werden aus der Bandbahn ergänzt.
-5. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
+1. Differenzsegmentierungen liefern zunächst OBB-Kandidaten.
+2. Ein deterministischer RANSAC-Filter sucht die dominante gerade Mittelpunktbahn und verwirft
+   Schatten, Rutschenkanten sowie geometrisch unplausible Boxen.
+3. Größe und Orientierung werden ausschließlich aus den verbleibenden Ankern stabilisiert.
+4. Fehlende oder stark abweichende Einzelboxen werden aus der geraden Bandbahn ergänzt.
+5. Vor dem Export zeigt die GUI je Klasse und UR-Winkel sechs Beispiele über die gesamte
+   Bandstrecke; Grün kennzeichnet Anker, Orange das berechnete Bahnmodell. Ablehnen beendet den
+   Lauf, bevor der Ausgabeordner angelegt wird.
+6. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
    `quality=REVIEW` und einem verständlichen `quality_reason` protokolliert.
 
 Diese Änderung behebt den früheren Fehler:
