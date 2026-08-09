@@ -445,6 +445,37 @@ def _box_from_mask(mask: np.ndarray, margin: int) -> np.ndarray:
     return box
 
 
+def _trim_thin_mask_protrusions(mask: np.ndarray) -> np.ndarray:
+    """Remove long thin attachments only when they clearly inflate a raw component box."""
+    points = cv2.findNonZero(mask)
+    if points is None or len(points) < 4:
+        return mask
+    _, size, _ = cv2.minAreaRect(points)
+    box_area = max(1.0, float(size[0]) * float(size[1]))
+    original_area = int(np.count_nonzero(mask))
+    original_fill = original_area / box_area
+    if original_fill >= 0.45:
+        return mask
+
+    kernel_size = max(5, min(21, round(min(mask.shape) / 160))) | 1
+    opened = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+    )
+    opened = _largest_component(opened)
+    opened_area = int(np.count_nonzero(opened))
+    if opened_area < original_area * 0.70:
+        return mask
+    opened_points = cv2.findNonZero(opened)
+    if opened_points is None:
+        return mask
+    _, opened_size, _ = cv2.minAreaRect(opened_points)
+    opened_box_area = max(1.0, float(opened_size[0]) * float(opened_size[1]))
+    opened_fill = opened_area / opened_box_area
+    return opened if opened_fill >= original_fill * 1.25 else mask
+
+
 def _box_features(box: np.ndarray) -> tuple[float, float, float, float, float]:
     center, size, angle_degrees = cv2.minAreaRect(box.astype(np.float32))
     major, minor = float(size[0]), float(size[1])
@@ -581,6 +612,45 @@ def _measurement_row(
     }
 
 
+def _spatial_line_seed(
+    positions: np.ndarray,
+    centers: np.ndarray,
+    position_span: float,
+) -> np.ndarray | None:
+    """Find collinear centers without assuming constant image speed per belt millimeter."""
+    best_inliers: np.ndarray | None = None
+    best_score = (-1, -1.0, -1.0, -1.0, -math.inf)
+    for left in range(len(centers) - 1):
+        for right in range(left + 1, len(centers)):
+            delta = centers[right] - centers[left]
+            length = float(np.linalg.norm(delta))
+            if length < 30.0:
+                continue
+            direction = delta / length
+            offsets = centers - centers[left]
+            projections = offsets @ direction
+            perpendicular = np.abs(
+                offsets[:, 0] * direction[1] - offsets[:, 1] * direction[0]
+            )
+            inliers = perpendicular <= 16.0
+            count = int(np.count_nonzero(inliers))
+            if count < 6:
+                continue
+            coverage = float(np.ptp(positions[inliers]))
+            motion = float(np.ptp(projections[inliers]))
+            if coverage < position_span * 0.45 or motion < 30.0:
+                continue
+            correlation = float(abs(np.corrcoef(positions[inliers], projections[inliers])[0, 1]))
+            if not math.isfinite(correlation) or correlation < 0.65:
+                continue
+            median_residual = float(np.median(perpendicular[inliers]))
+            score = (count, coverage, correlation, motion, -median_residual)
+            if score > best_score:
+                best_score = score
+                best_inliers = inliers
+    return best_inliers
+
+
 def stabilize_boxes_by_conveyor_position(
     entries: list[tuple[dict[str, object], MatchedPair, np.ndarray | None]],
 ) -> tuple[dict[Path, np.ndarray], ConveyorTrackSummary]:
@@ -620,7 +690,7 @@ def stabilize_boxes_by_conveyor_position(
     # Determine the dominant straight trajectory.  Pair hypotheses are deterministic and
     # cope with a majority of shadow/blob candidates better than independent polynomial fits.
     best_inliers: np.ndarray | None = None
-    best_score = (-1, -1.0, -1.0)
+    best_score = (-1.0, -1, -1.0, -math.inf)
     minimum_hypothesis_span = max(15.0, position_span * 0.25)
     for left in range(len(usable) - 1):
         for right in range(left + 1, len(usable)):
@@ -636,29 +706,52 @@ def stabilize_boxes_by_conveyor_position(
                 continue
             coverage = float(np.ptp(positions[inliers]))
             median_residual = float(np.median(residuals[inliers]))
-            score = (count, coverage, -median_residual)
+            score = (count * coverage, count, coverage, -median_residual)
             if score > best_score:
                 best_score = score
                 best_inliers = inliers
-    if best_inliers is None or best_score[1] < position_span * 0.45:
-        return result, ConveyorTrackSummary(False)
+    use_spatial_progression = best_inliers is None or best_score[2] < position_span * 0.45
+    if use_spatial_progression:
+        best_inliers = _spatial_line_seed(positions, centers, position_span)
+        if best_inliers is None:
+            return result, ConveyorTrackSummary(False)
 
     center_inliers = best_inliers
-    for _ in range(5):
-        design = np.column_stack(
-            (positions[center_inliers], np.ones(np.count_nonzero(center_inliers)))
-        )
-        coefficients = np.linalg.lstsq(design, centers[center_inliers], rcond=None)[0]
-        predicted_centers = np.column_stack((positions, np.ones(len(positions)))) @ coefficients
-        center_residuals = np.linalg.norm(centers - predicted_centers, axis=1)
-        inlier_residuals = center_residuals[center_inliers]
-        median = float(np.median(inlier_residuals))
-        mad = float(np.median(np.abs(inlier_residuals - median)))
-        limit = max(10.0, median + max(6.0, 3.5 * 1.4826 * mad))
-        updated = center_residuals <= min(limit, 20.0)
-        if np.count_nonzero(updated) < 6 or np.array_equal(updated, center_inliers):
-            break
-        center_inliers = updated
+    if use_spatial_progression:
+        for _ in range(5):
+            line_origin = np.mean(centers[center_inliers], axis=0)
+            _, _, axes = np.linalg.svd(centers[center_inliers] - line_origin)
+            line_direction = axes[0]
+            offsets = centers - line_origin
+            perpendicular = np.abs(
+                offsets[:, 0] * line_direction[1] - offsets[:, 1] * line_direction[0]
+            )
+            inlier_residuals = perpendicular[center_inliers]
+            median = float(np.median(inlier_residuals))
+            mad = float(np.median(np.abs(inlier_residuals - median)))
+            limit = min(20.0, max(10.0, median + max(6.0, 3.5 * 1.4826 * mad)))
+            updated = perpendicular <= limit
+            if np.count_nonzero(updated) < 6 or np.array_equal(updated, center_inliers):
+                break
+            center_inliers = updated
+    else:
+        for _ in range(5):
+            design = np.column_stack(
+                (positions[center_inliers], np.ones(np.count_nonzero(center_inliers)))
+            )
+            coefficients = np.linalg.lstsq(design, centers[center_inliers], rcond=None)[0]
+            predicted_centers = (
+                np.column_stack((positions, np.ones(len(positions)))) @ coefficients
+            )
+            center_residuals = np.linalg.norm(centers - predicted_centers, axis=1)
+            inlier_residuals = center_residuals[center_inliers]
+            median = float(np.median(inlier_residuals))
+            mad = float(np.median(np.abs(inlier_residuals - median)))
+            limit = max(10.0, median + max(6.0, 3.5 * 1.4826 * mad))
+            updated = center_residuals <= min(limit, 20.0)
+            if np.count_nonzero(updated) < 6 or np.array_equal(updated, center_inliers):
+                break
+            center_inliers = updated
 
     # Reject geometrically implausible blobs before they can determine size and angle.
     log_sizes = np.log(np.maximum(features[:, 2:4], 1.0))
@@ -670,11 +763,39 @@ def stabilize_boxes_by_conveyor_position(
     if int(np.count_nonzero(geometry_inliers)) < 6:
         geometry_inliers = center_inliers
 
-    design = np.column_stack(
-        (positions[geometry_inliers], np.ones(np.count_nonzero(geometry_inliers)))
-    )
-    coefficients = np.linalg.lstsq(design, centers[geometry_inliers], rcond=None)[0]
-    predicted_centers = np.column_stack((positions, np.ones(len(positions)))) @ coefficients
+    progression_model: _PositionModel | None = None
+    if use_spatial_progression:
+        line_origin = np.mean(centers[geometry_inliers], axis=0)
+        _, _, axes = np.linalg.svd(centers[geometry_inliers] - line_origin)
+        line_direction = axes[0]
+        projections = (centers[geometry_inliers] - line_origin) @ line_direction
+        progression_model, progression_inliers = _robust_position_model(
+            positions[geometry_inliers], projections, 10.0
+        )
+        geometry_indices = np.flatnonzero(geometry_inliers)
+        anchor_indices = geometry_indices[progression_inliers]
+        anchor_coverage = float(np.ptp(positions[anchor_indices]))
+        if len(anchor_indices) < 6 or anchor_coverage < position_span * 0.45:
+            return result, ConveyorTrackSummary(False)
+        geometry_inliers = np.zeros(len(usable), dtype=bool)
+        geometry_inliers[anchor_indices] = True
+        line_origin = np.mean(centers[geometry_inliers], axis=0)
+        _, _, axes = np.linalg.svd(centers[geometry_inliers] - line_origin)
+        line_direction = axes[0]
+        projections = (centers[geometry_inliers] - line_origin) @ line_direction
+        progression_model, _ = _robust_position_model(
+            positions[geometry_inliers], projections, 10.0
+        )
+        progression = progression_model.predict(positions)
+        predicted_centers = line_origin + progression[:, None] * line_direction
+    else:
+        design = np.column_stack(
+            (positions[geometry_inliers], np.ones(np.count_nonzero(geometry_inliers)))
+        )
+        coefficients = np.linalg.lstsq(design, centers[geometry_inliers], rcond=None)[0]
+        predicted_centers = (
+            np.column_stack((positions, np.ones(len(positions)))) @ coefficients
+        )
     center_residuals = np.linalg.norm(centers - predicted_centers, axis=1)
     center_median = float(np.median(center_residuals[geometry_inliers]))
 
@@ -694,7 +815,14 @@ def stabilize_boxes_by_conveyor_position(
         [pair.foreground.measured_conveyor_position_mm for _, pair, _ in all_usable],
         dtype=np.float64,
     )
-    all_predicted = np.column_stack((all_positions, np.ones(len(all_positions)))) @ coefficients
+    if use_spatial_progression:
+        assert progression_model is not None
+        all_progression = progression_model.predict(all_positions)
+        all_predicted = line_origin + all_progression[:, None] * line_direction
+    else:
+        all_predicted = (
+            np.column_stack((all_positions, np.ones(len(all_positions)))) @ coefficients
+        )
     all_predicted_x = all_predicted[:, 0]
     all_predicted_y = all_predicted[:, 1]
     residual_by_path = {
@@ -804,7 +932,8 @@ def build_conveyor_track(
         raw_box = None
         if measurement.foreground_area >= 500:
             try:
-                raw_box = _box_from_mask(measurement.mask, config.box_margin_pixels)
+                box_mask = _trim_thin_mask_protrusions(measurement.mask)
+                raw_box = _box_from_mask(box_mask, config.box_margin_pixels)
             except LabelingError:
                 pass
         row = _measurement_row(

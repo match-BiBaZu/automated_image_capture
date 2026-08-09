@@ -13,6 +13,7 @@ from automated_image_capture.labeling import (
     LabelingError,
     LabelSource,
     MatchedPair,
+    _trim_thin_mask_protrusions,
     assess_obb_visibility,
     generate_obb_dataset,
     match_captures,
@@ -247,6 +248,49 @@ def test_measured_conveyor_track_uses_straight_anchor_line_among_blob_outliers(
     assert sum(bool(row["track_anchor"]) for row, _, _ in entries) == len(true_indices)
 
 
+def test_measured_conveyor_track_allows_nonlinear_progress_on_straight_image_line(
+    tmp_path: Path,
+) -> None:
+    entries: list[tuple[dict[str, object], MatchedPair, np.ndarray]] = []
+    expected: list[tuple[float, float]] = []
+    for index in range(12):
+        path = tmp_path / f"nonlinear_{index}.png"
+        assert cv2.imwrite(str(path), np.zeros((400, 900), dtype=np.uint8))
+        position = float(index * 10)
+        center_x = 70.0 + 0.04 * position**2
+        center_y = 110.0 + 0.15 * center_x
+        expected.append((center_x, center_y))
+        key = CaptureKey(
+            pose_id=210,
+            panel_2=0,
+            panel_1=0,
+            exposure="auto",
+            robot_mode="angle",
+            conveyor_station_id=index,
+            conveyor_position_tenths_mm=index * 100,
+            conveyor_direction="out",
+        )
+        record = CaptureRecord(path, key, index, position, position)
+        raw_box = cv2.boxPoints(((center_x, center_y), (72.0, 38.0), 14.0)).astype(
+            np.float32
+        )
+        entries.append(
+            ({"quality": "PASS", "quality_reason": ""}, MatchedPair(record, record), raw_box)
+        )
+
+    boxes, summary = stabilize_boxes_by_conveyor_position(entries)
+
+    predicted = np.asarray(
+        [boxes[pair.foreground.path].mean(axis=0) for _, pair, _ in entries]
+    )
+    assert summary.active
+    assert np.max(np.linalg.norm(predicted - np.asarray(expected), axis=1)) < 3.0
+    direction = predicted[-1] - predicted[0]
+    offsets = predicted - predicted[0]
+    perpendicular = np.abs(offsets[:, 0] * direction[1] - offsets[:, 1] * direction[0])
+    assert np.max(perpendicular / np.linalg.norm(direction)) < 0.5
+
+
 def test_ramp_and_grid_profiles_report_concrete_pairing_error(tmp_path: Path) -> None:
     foreground = tmp_path / "parts_ramp"
     background = tmp_path / "empty_grid"
@@ -275,6 +319,23 @@ def test_visibility_assessment_distinguishes_black_borderline_and_visible_images
     assert borderline_result.suspicious and not borderline_result.recommended_exclude
     assert not visible_result.suspicious
     assert visible_result.score > borderline_result.score > black_result.score
+
+
+def test_thin_mask_protrusion_is_trimmed_but_compact_component_is_unchanged() -> None:
+    mask = np.zeros((240, 400), dtype=np.uint8)
+    cv2.rectangle(mask, (130, 80), (250, 170), 255, -1)
+    cv2.line(mask, (20, 125), (380, 125), 255, 1)
+    compact = np.zeros_like(mask)
+    cv2.rectangle(compact, (130, 80), (250, 170), 255, -1)
+
+    trimmed = _trim_thin_mask_protrusions(mask)
+    untouched = _trim_thin_mask_protrusions(compact)
+
+    original_width = max(cv2.minAreaRect(cv2.findNonZero(mask))[1])
+    trimmed_size = cv2.minAreaRect(cv2.findNonZero(trimmed))[1]
+    assert max(trimmed_size) < original_width * 0.5
+    assert np.count_nonzero(trimmed) > np.count_nonzero(compact) * 0.95
+    assert np.array_equal(untouched, compact)
 
 
 def test_visibility_review_can_exclude_positive_but_keeps_audit_row(tmp_path: Path) -> None:
