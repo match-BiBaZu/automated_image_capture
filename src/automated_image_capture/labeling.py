@@ -9,8 +9,10 @@ import shutil
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import cv2
 import numpy as np
@@ -221,6 +223,60 @@ class VisibilityReviewItem:
 VisibilityReviewCallback = Callable[
     [tuple[VisibilityReviewItem, ...]], frozenset[Path] | None
 ]
+
+def _labeling_worker_count(item_count: int) -> int:
+    logical_cpus = os.cpu_count() or 2
+    return max(1, min(12, logical_cpus // 2, item_count))
+
+
+def _parallel_map_ordered[ItemT, ResultT](
+    items: list[ItemT],
+    function: Callable[[ItemT], ResultT],
+    cancelled: CancelCallback | None = None,
+    completed: Callable[[int], None] | None = None,
+) -> list[ResultT]:
+    """Run independent OpenCV work concurrently while preserving input order."""
+    worker_count = _labeling_worker_count(len(items))
+    if worker_count == 1:
+        results: list[ResultT] = []
+        for index, item in enumerate(items):
+            if cancelled is not None and cancelled():
+                raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+            results.append(function(item))
+            if completed is not None:
+                completed(index + 1)
+        return results
+
+    ordered: list[ResultT | None] = [None] * len(items)
+    if cancelled is not None and cancelled():
+        raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+
+    def guarded(item: ItemT) -> ResultT:
+        if cancelled is not None and cancelled():
+            raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+        return function(item)
+
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="obb-segment",
+    )
+    futures = {executor.submit(guarded, item): index for index, item in enumerate(items)}
+    try:
+        done_count = 0
+        for future in as_completed(futures):
+            if cancelled is not None and cancelled():
+                raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+            ordered[futures[future]] = future.result()
+            done_count += 1
+            if completed is not None:
+                completed(done_count)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True)
+    return [cast(ResultT, result) for result in ordered]
 
 
 def _optional_finite_float(value: object) -> float | None:
@@ -920,9 +976,8 @@ def build_conveyor_track(
 ]:
     """Build OBBs across one angle, including visually weak conveyor samples."""
     entries: list[tuple[dict[str, object], MatchedPair, np.ndarray | None]] = []
-    for item_index, pair in enumerate(pairs):
-        if cancelled is not None and cancelled():
-            raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+
+    def process_pair(pair: MatchedPair) -> tuple[SegmentationMeasurement, np.ndarray | None]:
         measurement = segment_pair(
             _read_gray(pair.foreground.path),
             _read_gray(pair.background.path),
@@ -935,6 +990,28 @@ def build_conveyor_track(
                 raw_box = _box_from_mask(box_mask, config.box_margin_pixels)
             except LabelingError:
                 pass
+        compact = SegmentationMeasurement(
+            measurement.threshold,
+            measurement.foreground_area,
+            np.empty((0, 0), dtype=np.uint8),
+        )
+        return compact, raw_box
+
+    def report_progress(done: int) -> None:
+        if progress is not None:
+            progress(
+                progress_offset + done,
+                progress_total,
+                f"Segmentiere Förderbandbahn bei Winkel {pose_id / 10.0:.1f}°",
+            )
+
+    processed = _parallel_map_ordered(
+        pairs,
+        process_pair,
+        cancelled,
+        report_progress,
+    )
+    for pair, (measurement, raw_box) in zip(pairs, processed, strict=True):
         row = _measurement_row(
             pose_id,
             pair,
@@ -943,12 +1020,6 @@ def build_conveyor_track(
             "PASS" if raw_box is not None else "REVIEW",
         )
         entries.append((row, pair, raw_box))
-        if progress is not None:
-            progress(
-                progress_offset + item_index + 1,
-                progress_total,
-                f"Segmentiere Förderbandbahn bei Winkel {pose_id / 10.0:.1f}°",
-            )
 
     boxes, summary = stabilize_boxes_by_conveyor_position(entries)
     if not summary.active or len(boxes) != len(pairs):
@@ -992,26 +1063,34 @@ def build_pose_consensus(
     progress_total: int = 1,
     cancelled: CancelCallback | None = None,
 ) -> tuple[PoseConsensus, list[dict[str, object]]]:
-    votes: np.ndarray | None = None
-    measurements: list[tuple[MatchedPair, SegmentationMeasurement]] = []
-    for item_index, pair in enumerate(pairs):
-        if cancelled is not None and cancelled():
-            raise LabelingCancelled("Label-Erzeugung abgebrochen.")
-        measurement = segment_pair(
+    def process_pair(pair: MatchedPair) -> SegmentationMeasurement:
+        return segment_pair(
             _read_gray(pair.foreground.path),
             _read_gray(pair.background.path),
             config.minimum_difference,
         )
+
+    def report_progress(done: int) -> None:
+        if progress is not None:
+            progress(
+                progress_offset + done,
+                progress_total,
+                f"Segmentiere Pose {pose_id}",
+            )
+
+    segmented = _parallel_map_ordered(
+        pairs,
+        process_pair,
+        cancelled,
+        report_progress,
+    )
+    votes: np.ndarray | None = None
+    measurements: list[tuple[MatchedPair, SegmentationMeasurement]] = []
+    for pair, measurement in zip(pairs, segmented, strict=True):
         if votes is None:
             votes = np.zeros(measurement.mask.shape, dtype=np.uint16)
         votes += (measurement.mask > 0).astype(np.uint16)
         measurements.append((pair, measurement))
-        if progress is not None:
-            progress(
-                progress_offset + item_index + 1,
-                progress_total,
-                f"Segmentiere Pose {pose_id}",
-            )
     assert votes is not None
     required = max(1, math.ceil(len(pairs) * config.consensus_fraction))
     consensus = np.where(votes >= required, 255, 0).astype(np.uint8)
@@ -1480,17 +1559,41 @@ def generate_obb_dataset(
     with tempfile.TemporaryDirectory(prefix="obb_visibility_review_") as temporary:
         temporary_path = Path(temporary)
         visibility_items: list[VisibilityReviewItem] = []
-        for item_index, (row, pair, class_id, source) in enumerate(write_records):
-            if cancelled is not None and cancelled():
-                raise LabelingCancelled("Label-Erzeugung abgebrochen.")
+
+        def assess_record(
+            indexed_record: tuple[
+                int,
+                tuple[dict[str, object], MatchedPair, int, LabelSource],
+            ],
+        ) -> tuple[_VisibilityAssessment, Path | None]:
+            item_index, (_, pair, class_id, _) = indexed_record
             image = _read_gray(pair.foreground.path)
             box = output_boxes[(class_id, pair.foreground.path)]
             assessment = assess_obb_visibility(image, box)
-            row["visibility_score"] = assessment.score
-            row["visibility_reason"] = assessment.reason if assessment.suspicious else ""
+            preview: Path | None = None
             if assessment.suspicious and visibility_review is not None:
                 preview = temporary_path / f"visibility_{item_index:05d}.jpg"
                 _make_visibility_preview(image, box, assessment, preview)
+            return assessment, preview
+
+        def report_visibility_progress(done: int) -> None:
+            if progress is not None and done % 25 == 0:
+                progress(completed, total_steps, "Prüfe Sichtbarkeit der Bauteile")
+
+        assessments = _parallel_map_ordered(
+            list(enumerate(write_records)),
+            assess_record,
+            cancelled,
+            report_visibility_progress,
+        )
+        for (row, pair, class_id, source), (assessment, preview) in zip(
+            write_records,
+            assessments,
+            strict=True,
+        ):
+            row["visibility_score"] = assessment.score
+            row["visibility_reason"] = assessment.reason if assessment.suspicious else ""
+            if preview is not None:
                 visibility_items.append(
                     VisibilityReviewItem(
                         class_id,
@@ -1503,8 +1606,6 @@ def generate_obb_dataset(
                         assessment.recommended_exclude,
                     )
                 )
-            if progress is not None and (item_index + 1) % 25 == 0:
-                progress(completed, total_steps, "Prüfe Sichtbarkeit der Bauteile")
         if visibility_items and visibility_review is not None:
             selected = visibility_review(tuple(visibility_items))
             if selected is None:

@@ -6,13 +6,17 @@ import cv2
 import numpy as np
 import pytest
 
+import automated_image_capture.labeling as labeling_module
 from automated_image_capture.labeling import (
     CaptureKey,
     CaptureRecord,
+    LabelingCancelled,
     LabelingConfig,
     LabelingError,
     LabelSource,
     MatchedPair,
+    _labeling_worker_count,
+    _parallel_map_ordered,
     _trim_thin_mask_protrusions,
     assess_obb_visibility,
     generate_obb_dataset,
@@ -20,6 +24,31 @@ from automated_image_capture.labeling import (
     scan_capture,
     stabilize_boxes_by_conveyor_position,
 )
+
+
+def test_parallel_labeling_worker_limit_and_order(monkeypatch) -> None:
+    monkeypatch.setattr(labeling_module.os, "cpu_count", lambda: 24)
+
+    result = _parallel_map_ordered(list(range(40)), lambda value: value * value)
+
+    assert _labeling_worker_count(100) == 12
+    assert result == [value * value for value in range(40)]
+
+
+def test_parallel_labeling_honors_cancellation() -> None:
+    cancelled = False
+
+    def mark_cancelled(_: int) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    with pytest.raises(LabelingCancelled):
+        _parallel_map_ordered(
+            list(range(40)),
+            lambda value: value,
+            lambda: cancelled,
+            mark_cancelled,
+        )
 
 
 def _write_capture(

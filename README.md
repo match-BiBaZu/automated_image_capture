@@ -218,6 +218,14 @@ mit sechs über die Strecke verteilten Bildern sowie eine Klassenübersicht. Dad
 hochauflösenden Serien nicht mehr pro einzelner Bandposition redundante Vollmasken und
 2×3-Blätter erzeugt. Klassische Rasterserien behalten ihre bisherigen Konsensmasken.
 
+Bildpaarregistrierung, Differenzsegmentierung und Sichtbarkeitsbewertung laufen parallel, da
+jedes Vorder-/Leerbildpaar unabhängig ist. Die Workerzahl wird automatisch auf die Hälfte der
+logischen CPUs, höchstens jedoch zwölf, begrenzt. OBB-Bahnmodell, Nutzerentscheidungen und
+Dateiexport bleiben geordnet und deterministisch. Auf dem 24-Thread-Testrechner sank die reine
+Df1a-Segmentierung eines 121-Bilder-Winkels bei identischen Ergebnissen von etwa 46 auf 7
+Sekunden. Mehr als zwölf Worker brachten nur noch wenig Zusatzdurchsatz bei deutlich höherem
+Speicherbedarf.
+
 Über **OBB-Labels …** lässt sich aus beliebig vielen Bauteilserien und einer parametrisch
 identischen Leerbildserie ein gemeinsamer YOLO-OBB-Datensatz erzeugen. Die Quellenliste startet
 mit `Pose 1`, `Pose 2` und `Leere Rutsche`; weitere Posen lassen sich hinzufügen oder wieder

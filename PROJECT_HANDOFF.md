@@ -542,6 +542,13 @@ Klasse/Winkel und eine Klassenübersicht. Die früheren Vollmasken und Einzelbl�
 Bandstation waren redundant und konnten bei hochauflösenden Datensätzen mehrere Gigabyte RAM
 belegen. Stationäre Rasterserien behalten ihre detaillierten Konsensmasken.
 
+Registrierung, Segmentierung und Sichtbarkeitsbewertung werden über einen begrenzten
+`ThreadPoolExecutor` parallelisiert. OpenCV gibt bei den rechenintensiven Operationen den GIL
+frei; deshalb skalieren unabhängige Bildpaare auf diesem Pfad gut. Die automatische Workerzahl
+ist `min(12, logische CPUs / 2, Anzahl Bilder)`. Ergebnisse werden wieder in Eingabereihenfolge
+zusammengesetzt, Fortschrittssignale kommen aus dem Labeling-Worker, und ein Abbruch verwirft
+noch wartende Futures. Bahnmodellierung, GUI-Entscheidungen und Export bleiben seriell.
+
 Diese Änderung behebt den früheren Fehler:
 
 ```text
