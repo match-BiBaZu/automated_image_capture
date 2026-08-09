@@ -920,7 +920,6 @@ def build_conveyor_track(
 ]:
     """Build OBBs across one angle, including visually weak conveyor samples."""
     entries: list[tuple[dict[str, object], MatchedPair, np.ndarray | None]] = []
-    measurements: dict[Path, SegmentationMeasurement] = {}
     for item_index, pair in enumerate(pairs):
         if cancelled is not None and cancelled():
             raise LabelingCancelled("Label-Erzeugung abgebrochen.")
@@ -944,7 +943,6 @@ def build_conveyor_track(
             "PASS" if raw_box is not None else "REVIEW",
         )
         entries.append((row, pair, raw_box))
-        measurements[pair.foreground.path] = measurement
         if progress is not None:
             progress(
                 progress_offset + item_index + 1,
@@ -970,16 +968,13 @@ def build_conveyor_track(
     consensuses: dict[int, PoseConsensus] = {}
     for station_id, items in station_entries.items():
         _, first_pair = items[0]
-        measurement = measurements[first_pair.foreground.path]
         box = boxes[first_pair.foreground.path]
-        track_mask = np.zeros_like(measurement.mask)
-        cv2.fillConvexPoly(track_mask, np.rint(box).astype(np.int32), 255)
         ious = [float(row["consensus_iou"]) for row, _ in items]
         flagged = sum(row["quality"] == "REVIEW" for row, _ in items)
         consensuses[station_id] = PoseConsensus(
             pose_id,
             box,
-            track_mask,
+            np.empty((0, 0), dtype=np.uint8),
             len(items),
             float(np.median(ious)),
             float(np.min(ious)),
@@ -1167,7 +1162,7 @@ def _make_anchor_review_sheet(
     selection = np.linspace(0, len(ordered) - 1, min(6, len(ordered)), dtype=int)
     selected = [ordered[int(index)] for index in selection]
     first_box = boxes[selected[0].foreground.path]
-    dummy_mask = np.zeros(_read_gray(selected[0].foreground.path).shape, dtype=np.uint8)
+    dummy_mask = np.empty((0, 0), dtype=np.uint8)
     pose = PoseConsensus(pose_id, first_box, dummy_mask, len(ordered), 1.0, 1.0, 0)
     _make_review_sheet(pose, selected, destination, boxes, anchor_paths)
 
@@ -1585,15 +1580,59 @@ def generate_obb_dataset(
                 progress(completed, total_steps, f"Übernehme Leerbild · UR-Pose {pose_id}")
 
     for class_id, source, _, grouped in source_data:
-        class_consensuses: dict[tuple[int, int], PoseConsensus] = {}
+        class_consensuses: dict[int | tuple[int, int], PoseConsensus] = {}
+        review_grouped: dict[int | tuple[int, int], list[MatchedPair]] = {}
         prefix = f"class_{class_id:03d}_{_filename_slug(source.name)}"
+        handled_track_poses: set[int] = set()
         for view_id in sorted(grouped):
             pose_id, station_id = view_id
             consensus = all_consensuses[(class_id, pose_id, station_id)]
+            if track_summaries[(class_id, pose_id)].active:
+                if pose_id in handled_track_poses:
+                    continue
+                handled_track_poses.add(pose_id)
+                pose_pairs = [
+                    pair
+                    for grouped_view_id, view_pairs in grouped.items()
+                    if grouped_view_id[0] == pose_id
+                    for pair in view_pairs
+                ]
+                pose_pairs.sort(key=lambda pair: pair.foreground.sequence_index)
+                representative = pose_pairs[len(pose_pairs) // 2]
+                representative_consensus = all_consensuses[
+                    (
+                        class_id,
+                        pose_id,
+                        representative.foreground.key.conveyor_station_id,
+                    )
+                ]
+                class_consensuses[pose_id] = representative_consensus
+                review_grouped[pose_id] = pose_pairs
+                _make_review_sheet(
+                    representative_consensus,
+                    pose_pairs,
+                    review / f"{prefix}_ur_{pose_id}_track_obb.jpg",
+                    {
+                        path: box
+                        for (box_class_id, path), box in output_boxes.items()
+                        if box_class_id == class_id
+                    },
+                )
+                continue
             class_consensuses[view_id] = consensus
+            review_grouped[view_id] = grouped[view_id]
+            consensus_mask = consensus.mask
+            if consensus_mask.size == 0:
+                shape = _read_gray(grouped[view_id][0].foreground.path).shape
+                consensus_mask = np.zeros(shape, dtype=np.uint8)
+                cv2.fillConvexPoly(
+                    consensus_mask,
+                    np.rint(consensus.box).astype(np.int32),
+                    255,
+                )
             cv2.imwrite(
                 str(review / f"{prefix}_ur_{pose_id}_belt_{station_id}_consensus_mask.png"),
-                consensus.mask,
+                consensus_mask,
             )
             _make_review_sheet(
                 consensus,
@@ -1607,7 +1646,7 @@ def generate_obb_dataset(
             )
         _make_pose_overview(
             class_consensuses,
-            grouped,
+            review_grouped,
             review / f"{prefix}_all_poses_obb.jpg",
             {
                 path: box

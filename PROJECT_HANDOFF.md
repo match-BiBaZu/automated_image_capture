@@ -517,18 +517,30 @@ UR-Winkels ausgewertet:
 
 1. Differenzsegmentierungen liefern zunächst OBB-Kandidaten.
 2. Ein deterministischer RANSAC-Filter sucht die dominante gerade Mittelpunktbahn und verwirft
-   Schatten, Rutschenkanten sowie geometrisch unplausible Boxen.
+   Schatten, Rutschenkanten sowie geometrisch unplausible Boxen. Die Bewertung gewichtet
+   Trefferzahl und abgedeckte Bandstrecke, damit eine kurze lokale Kandidatengruppe keine
+   schwächer besetzte, aber vollständige Bahn verdrängt.
 3. Größe und Orientierung werden ausschließlich aus den verbleibenden Ankern stabilisiert.
-4. Fehlende oder stark abweichende Einzelboxen werden aus der geraden Bandbahn ergänzt.
-5. Vor dem Export zeigt die GUI je Klasse und UR-Winkel sechs Beispiele über die gesamte
+4. Falls Bildfortschritt und gemessene Millimeterposition nicht linear gekoppelt sind, wird der
+   Fortschritt robust auf einer weiterhin räumlich geraden Bahn modelliert.
+5. Schlecht gefüllte Rohmasken werden auf lange dünne Ausläufer geprüft. Eine
+   auflösungsabhängige morphologische Öffnung wird nur übernommen, wenn sie den Boxfüllgrad
+   deutlich verbessert und mindestens 70 % der Maskenfläche erhält.
+6. Fehlende oder stark abweichende Einzelboxen werden aus der geraden Bandbahn ergänzt.
+7. Vor dem Export zeigt die GUI je Klasse und UR-Winkel sechs Beispiele über die gesamte
    Bandstrecke; Grün kennzeichnet Anker, Orange das berechnete Bahnmodell. Ablehnen beendet den
    Lauf, bevor der Ausgabeordner angelegt wird.
-6. Danach prüft eine Sichtbarkeitsstufe Helligkeit, Clipping, Dynamikumfang und lokalen
+8. Danach prüft eine Sichtbarkeitsstufe Helligkeit, Clipping, Dynamikumfang und lokalen
    OBB-Kontrast. Verdächtige Bilder erscheinen in einer klickbaren Galerie; nur eindeutig
    unbrauchbare Bilder sind vorausgewählt. Ausschlüsse bleiben im CSV-Bericht auditierbar,
    werden jedoch nicht in `images/` und `labels/` exportiert.
-7. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
+9. Ergänzte Bilder werden nicht stillschweigend als korrekt behandelt, sondern mit
    `quality=REVIEW` und einem verständlichen `quality_reason` protokolliert.
+
+Synchronisierte Bandserien schreiben im finalen `review/` nur noch ein Sechserblatt pro
+Klasse/Winkel und eine Klassenübersicht. Die früheren Vollmasken und Einzelblätter pro
+Bandstation waren redundant und konnten bei hochauflösenden Datensätzen mehrere Gigabyte RAM
+belegen. Stationäre Rasterserien behalten ihre detaillierten Konsensmasken.
 
 Diese Änderung behebt den früheren Fehler:
 

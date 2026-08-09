@@ -58,6 +58,41 @@ def _make_capture_pair(tmp_path: Path) -> tuple[Path, Path]:
     return foreground, background
 
 
+def _make_continuous_capture_pair(tmp_path: Path) -> tuple[Path, Path]:
+    foreground = tmp_path / "continuous_parts"
+    background = tmp_path / "continuous_empty"
+    foreground.mkdir()
+    background.mkdir()
+    height, width = 240, 400
+    yy, xx = np.indices((height, width))
+    base = (120 + ((xx // 16 + yy // 16) % 2) * 25).astype(np.uint8)
+    for index in range(8):
+        name = (
+            f"img_{index + 1:06d}_ura-0155_belt-{index:03d}_pos-{index * 100:04d}_out_"
+            f"p1-{index:03d}_p2-000_auto.png"
+        )
+        empty_path = background / name
+        part_path = foreground / name
+        image = base.copy()
+        cv2.fillConvexPoly(
+            image,
+            np.rint(
+                cv2.boxPoints(((65.0 + index * 35.0, 120.0), (70.0, 38.0), 12.0))
+            ).astype(np.int32),
+            20,
+        )
+        assert cv2.imwrite(str(empty_path), base)
+        assert cv2.imwrite(str(part_path), image)
+        metadata = (
+            "conveyor:\n"
+            f"  nominal_offset_mm: {index * 10.0}\n"
+            f"  measured_logical_offset_mm: {index * 10.0}\n"
+        )
+        empty_path.with_suffix(".yaml").write_text(metadata, encoding="utf-8")
+        part_path.with_suffix(".yaml").write_text(metadata, encoding="utf-8")
+    return foreground, background
+
+
 def test_capture_pairing_reports_missing_background(tmp_path: Path) -> None:
     foreground, background = _make_capture_pair(tmp_path)
     next(background.glob("*.png")).unlink()
@@ -405,6 +440,27 @@ def test_generate_yolo_obb_dataset_with_negative_images(tmp_path: Path) -> None:
     assert "train: images/train" in (output / "data.yaml").read_text(encoding="utf-8")
     assert (output / "label_report.csv").is_file()
     assert len(list((output / "review").glob("class_*_ur_*_obb.jpg"))) == 2
+
+
+def test_continuous_dataset_writes_compact_track_review(tmp_path: Path) -> None:
+    foreground, background = _make_continuous_capture_pair(tmp_path)
+    output = tmp_path / "continuous_dataset"
+
+    result = generate_obb_dataset(
+        LabelingConfig(
+            (
+                LabelSource("Moving part", foreground),
+                LabelSource("Empty", background, is_empty=True),
+            ),
+            output,
+            minimum_difference=20,
+        )
+    )
+
+    assert result.positive_images == 8
+    assert len(list((output / "review").glob("class_*_track_obb.jpg"))) == 1
+    assert not list((output / "review").glob("class_*_belt_*"))
+    assert (output / "label_summary.json").is_file()
 
 
 def test_generate_multiple_pose_classes_and_deduplicate_empty_images(tmp_path: Path) -> None:

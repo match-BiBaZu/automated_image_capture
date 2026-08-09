@@ -194,6 +194,14 @@ Orientierung bestimmt werden. Fehlerhafte Einzelsegmentierungen werden durch die
 stabilisiert und im `label_report.csv` weiterhin als `REVIEW` nachvollziehbar markiert.
 Fehlen Positionsmetadaten, bleibt das bisherige Konsensverfahren unverändert aktiv.
 
+Bei mehreren konkurrierenden Bahnhypothesen zählt nicht nur die Trefferzahl, sondern auch die
+abgedeckte Förderbandstrecke. Falls der Bildfortschritt durch Abtastverzug oder Schlupf nicht
+linear zur Millimeterposition ist, bleibt die Mittelpunktbahn räumlich gerade und nur der
+Fortschritt auf dieser Geraden wird robust quadratisch modelliert. Lange, dünne Ausläufer einer
+Differenzmaske (zum Beispiel eine angeschlossene Rutschenkante) werden nur bei auffällig
+schlecht gefüllten Rohboxen entfernt; dabei müssen mindestens 70 % der Maskenfläche erhalten
+bleiben. Kompakte Masken verwenden unverändert den bisherigen Pfad.
+
 Nach der einmaligen Segmentierung pausiert die GUI vor dem Export. Sie zeigt für jede Klasse
 und jeden UR-Winkel sechs über die gesamte Bandstrecke verteilte Beispiele: Grün bedeutet
 `ANKER`, Orange bedeutet eine aus der Bahn berechnete Box. Erst **Anker übernehmen** schreibt
@@ -204,6 +212,11 @@ Ausschluss vorausgewählt, dunkle Grenzfälle bleiben eine bewusste Nutzerentsch
 **Auswahl übernehmen** startet den Export; bei Abbruch bleibt der Ausgabeordner unangetastet.
 Ausgeschlossene Bilder stehen mit Sichtbarkeitsscore und Begründung weiterhin im
 `label_report.csv`, werden aber weder als Trainingsbild noch als Label geschrieben.
+
+Für synchronisierte Bandserien enthält `review/` je Klasse und UR-Winkel ein kompaktes Blatt
+mit sechs über die Strecke verteilten Bildern sowie eine Klassenübersicht. Dadurch werden bei
+hochauflösenden Serien nicht mehr pro einzelner Bandposition redundante Vollmasken und
+2×3-Blätter erzeugt. Klassische Rasterserien behalten ihre bisherigen Konsensmasken.
 
 Über **OBB-Labels …** lässt sich aus beliebig vielen Bauteilserien und einer parametrisch
 identischen Leerbildserie ein gemeinsamer YOLO-OBB-Datensatz erzeugen. Die Quellenliste startet
