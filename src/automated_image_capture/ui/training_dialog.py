@@ -221,6 +221,12 @@ class TrainingDialog(QDialog):
         self.image_size.setRange(128, 4096)
         self.image_size.setSingleStep(32)
         self.image_size.setValue(640)
+        self.batch = QSpinBox()
+        self.batch.setRange(1, 256)
+        self.batch.setValue(16)
+        self.workers = QSpinBox()
+        self.workers.setRange(0, 32)
+        self.workers.setValue(8)
         training_form.addWidget(QLabel("Modell:"))
         training_form.addWidget(self.model)
         training_form.addWidget(QLabel("Epochen:"))
@@ -229,6 +235,10 @@ class TrainingDialog(QDialog):
         training_form.addWidget(self.patience)
         training_form.addWidget(QLabel("Bildgröße:"))
         training_form.addWidget(self.image_size)
+        training_form.addWidget(QLabel("Batch:"))
+        training_form.addWidget(self.batch)
+        training_form.addWidget(QLabel("Loader:"))
+        training_form.addWidget(self.workers)
         training_form.addStretch(1)
         root.addLayout(training_form)
 
@@ -594,6 +604,10 @@ class TrainingDialog(QDialog):
             str(self.patience.value()),
             "--imgsz",
             str(self.image_size.value()),
+            "--batch",
+            str(self.batch.value()),
+            "--workers",
+            str(self.workers.value()),
         ]
         self._process_buffer = ""
         self.progress.setRange(0, self.epochs.value())

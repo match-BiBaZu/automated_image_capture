@@ -274,7 +274,10 @@ Alle Lichtvarianten derselben UR-Pose bleiben im selben Split. `dataset_manifest
 dokumentiert Quelle, Klasse, Beleuchtung, Split und Review-Entscheidung jeder Aufnahme.
 
 Nach der Datensatzprüfung startet **Training starten** `yolo26n-obb.pt` in einem separaten
-Prozess. Standardmäßig werden 200 Epochen bei 640 Pixeln mit Early Stopping trainiert. Das
+Prozess. Standardmäßig werden 200 Epochen bei 640 Pixeln mit Early Stopping, Batch 16 und acht
+Loader-Prozessen trainiert. Batch und Loader sind im Dialog anpassbar; bei einem CUDA-
+Speicherfehler sollte zuerst die Batchgröße reduziert werden. Vor dem GPU-Lauf werden die Bilder
+einmalig verlustfrei auf die Trainingsgröße verkleinert und bei späteren Läufen wiederverwendet. Das
 Training verwendet keine Spiegelungen oder starken Rotationen, da diese die beiden physisch
 unterschiedlichen Bauteilposen verfälschen könnten. `best.pt`, Validierungs-/Testmetriken,
 Confusion-Matrizen und die Fehlalarmrate auf leeren Testbildern liegen anschließend im
@@ -289,7 +292,8 @@ uv run python -m automated_image_capture.training diagnose
 ```
 
 Der erste Modellaufruf lädt die vortrainierten Gewichte, sofern sie noch nicht lokal vorhanden
-sind. Das Projekt verwendet für die vorhandene RTX 3060 PyTorch mit CUDA 11.8.
+sind. Das Projekt verwendet PyTorch mit CUDA 11.8; Batch 16 und acht Loader wurden auf der
+RTX 2000 Ada mit 8 GB VRAM getestet.
 
 ## Sicherheit
 

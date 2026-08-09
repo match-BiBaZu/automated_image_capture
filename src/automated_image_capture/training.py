@@ -34,9 +34,9 @@ class TrainingConfig:
     epochs: int = 200
     patience: int = 40
     image_size: int = 640
-    batch: int = 4
+    batch: int = 16
     device: str = "0"
-    workers: int = 0
+    workers: int = 8
     seed: int = 42
     confidence: float = 0.25
     run_name: str | None = None
@@ -65,6 +65,10 @@ class TrainingConfig:
             raise TrainingError("Epochen müssen positiv und Patience darf nicht negativ sein.")
         if self.image_size < 128:
             raise TrainingError("Die Eingangsgröße muss mindestens 128 Pixel betragen.")
+        if self.batch < 1:
+            raise TrainingError("Die Batchgröße muss mindestens 1 betragen.")
+        if self.workers < 0:
+            raise TrainingError("Die Anzahl der Loader-Prozesse darf nicht negativ sein.")
         if not 0 < self.confidence < 1:
             raise TrainingError("Der Konfidenzschwellwert muss zwischen 0 und 1 liegen.")
         return replace(self, dataset_directory=dataset, output_root=output)
@@ -508,9 +512,9 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--epochs", type=int, default=200)
     train.add_argument("--patience", type=int, default=40)
     train.add_argument("--imgsz", type=int, default=640)
-    train.add_argument("--batch", type=int, default=4)
+    train.add_argument("--batch", type=int, default=16)
     train.add_argument("--device", default="0")
-    train.add_argument("--workers", type=int, default=0)
+    train.add_argument("--workers", type=int, default=8)
     train.add_argument("--name")
 
     evaluate = subparsers.add_parser("evaluate", help="Vorhandenen Checkpoint auswerten")
