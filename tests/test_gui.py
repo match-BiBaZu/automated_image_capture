@@ -251,6 +251,7 @@ def test_acquisition_dialog_configures_continuous_angles_and_conveyor(qtbot, tmp
 
 def test_conveyor_card_shows_calibration_and_enables_manual_controls(qtbot, tmp_path) -> None:
     window = make_window(qtbot, tmp_path)
+    jog_spy = QSignalSpy(window.conveyor_card.jog_requested)
     window.conveyor_card.set_state(ConnectionState.CONNECTED)
     window._conveyor_status(
         ConveyorStatus(
@@ -266,7 +267,29 @@ def test_conveyor_card_shows_calibration_and_enables_manual_controls(qtbot, tmp_
     assert "gültig" in window.conveyor_card.details.text()
     assert window.conveyor_card.left_button.isEnabled()
     assert window.conveyor_card.right_button.isEnabled()
+    assert window.conveyor_card.jog_distance.isEnabled()
     assert window.conveyor_card.origin_button.isEnabled()
+
+    window.conveyor_card.jog_distance.setValue(12.5)
+    window.conveyor_card.right_button.click()
+
+    assert len(jog_spy) == 1
+    assert jog_spy[0][0] == "right"
+    assert jog_spy[0][1] == 12.5
+
+
+def test_manual_conveyor_jog_starts_without_confirmation(qtbot, tmp_path, monkeypatch) -> None:
+    window = make_window(qtbot, tmp_path)
+    requests: list[tuple[str, float, float]] = []
+    monkeypatch.setattr(
+        window.conveyor,
+        "jog",
+        lambda direction, distance, speed: requests.append((direction, distance, speed)),
+    )
+
+    window._jog_conveyor("left", 37.5)
+
+    assert requests == [("left", 37.5, 10.0)]
 
 
 def test_robot_pose_requires_running_program_and_one_time_consent(qtbot, tmp_path) -> None:

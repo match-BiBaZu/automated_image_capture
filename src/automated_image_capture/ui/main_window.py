@@ -571,16 +571,8 @@ class MainWindow(QMainWindow):
         self.conveyor_card.set_status(status)
         self._refresh_acquisition_preflight()
 
-    def _jog_conveyor(self, direction: str) -> None:
-        answer = QMessageBox.question(
-            self,
-            "Förderband-Testfahrt",
-            f"Das Förderband fährt 1 mm nach {direction}. Ist der Arbeitsraum frei?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer is QMessageBox.StandardButton.Yes:
-            self.conveyor.jog(direction, 1.0, 10.0)
+    def _jog_conveyor(self, direction: str, distance_mm: float) -> None:
+        self.conveyor.jog(direction, distance_mm, 10.0)
 
     def _set_conveyor_forward_direction(self, direction: str) -> None:
         if not direction:
@@ -600,18 +592,7 @@ class MainWindow(QMainWindow):
         expected = self.acquisition.expected_resume_offset_mm
         if expected is None:
             return
-        current = self.conveyor.status.logical_offset_mm
-        answer = QMessageBox.question(
-            self,
-            "Förderband auf Checkpoint ausrichten",
-            f"Das Förderband fährt von "
-            f"{'unbekannt' if current is None else f'{current:.3f} mm'} auf "
-            f"{expected:g} mm. Ist der Arbeitsraum frei?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer is QMessageBox.StandardButton.Yes:
-            self.acquisition.align_for_resume()
+        self.acquisition.align_for_resume()
 
     def _light_state(self, state: ConnectionState) -> None:
         self.light_card.set_connection_state(state)

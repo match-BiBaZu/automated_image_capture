@@ -242,7 +242,7 @@ class RobotPoseControlCard(DeviceCard):
 
 
 class ConveyorControlCard(DeviceCard):
-    jog_requested = pyqtSignal(str)
+    jog_requested = pyqtSignal(str, float)
     stop_requested = pyqtSignal()
     origin_requested = pyqtSignal()
     forward_direction_changed = pyqtSignal(str)
@@ -255,20 +255,24 @@ class ConveyorControlCard(DeviceCard):
     ) -> None:
         super().__init__(title, parent)
         self._status = ConveyorStatus(forward_direction=forward_direction)
-        warning = QLabel(
-            "Förderbandbewegungen sind reale Maschinenbewegungen. "
-            "Vor Testfahrten Arbeitsraum prüfen."
-        )
-        warning.setWordWrap(True)
-        warning.setStyleSheet("color:#b45309; font-weight:600;")
-        self.content_layout.addWidget(warning)
+        distance_row = QHBoxLayout()
+        distance_row.addWidget(QLabel("Manueller Fahrweg"))
+        self.jog_distance = QDoubleSpinBox()
+        self.jog_distance.setRange(0.1, 5000.0)
+        self.jog_distance.setDecimals(1)
+        self.jog_distance.setSingleStep(1.0)
+        self.jog_distance.setValue(1.0)
+        self.jog_distance.setSuffix(" mm")
+        self.jog_distance.setToolTip("Gewünschte relative Fahrstrecke")
+        distance_row.addWidget(self.jog_distance, 1)
+        self.content_layout.addLayout(distance_row)
 
         direction_row = QHBoxLayout()
-        self.left_button = QPushButton("← 1 mm")
+        self.left_button = QPushButton("← Links")
         self.stop_button = QPushButton("Stop")
-        self.right_button = QPushButton("1 mm →")
-        self.left_button.clicked.connect(lambda: self.jog_requested.emit("left"))
-        self.right_button.clicked.connect(lambda: self.jog_requested.emit("right"))
+        self.right_button = QPushButton("Rechts →")
+        self.left_button.clicked.connect(lambda: self._request_jog("left"))
+        self.right_button.clicked.connect(lambda: self._request_jog("right"))
         self.stop_button.clicked.connect(self.stop_requested.emit)
         direction_row.addWidget(self.left_button)
         direction_row.addWidget(self.stop_button)
@@ -294,6 +298,9 @@ class ConveyorControlCard(DeviceCard):
         self.origin_button.clicked.connect(self.origin_requested.emit)
         self.content_layout.addWidget(self.origin_button)
         self._update_controls()
+
+    def _request_jog(self, direction: str) -> None:
+        self.jog_requested.emit(direction, self.jog_distance.value())
 
     def set_status(self, status: ConveyorStatus) -> None:
         self._status = status
@@ -339,6 +346,7 @@ class ConveyorControlCard(DeviceCard):
         )
         self.left_button.setEnabled(controls_available)
         self.right_button.setEnabled(controls_available)
+        self.jog_distance.setEnabled(controls_available)
         self.origin_button.setEnabled(
             controls_available and self._status.internal_position is not None
         )

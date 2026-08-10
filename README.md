@@ -77,7 +77,9 @@ Runtime, eine beidseitige AMS-Route und eine Netzwerkkonfiguration, welche die S
 `PressureControlGUI` darf während der Aufnahme nicht gleichzeitig das Band steuern.
 
 Vor einer neuen Serie wird das Bauteil hinten platziert und in der Förderbandkarte
-**Aktuelle Position = 0 mm** gewählt. Nach zwei 1-mm-Testfahrten wird Links oder Rechts als
+**Aktuelle Position = 0 mm** gewählt. Für manuelle Testfahrten wird der Fahrweg in Millimetern
+eingetragen und anschließend **Links** oder **Rechts** gewählt. Eine zusätzliche Rückfrage wird
+nicht angezeigt. Nach kurzen Testfahrten wird Links oder Rechts als
 Vorwärtsrichtung gespeichert. `Term 19 → POS Status → Actual position` muss in TwinCAT
 mit `MAIN.StepperInternalPosition` verknüpft sein. Die GUI gibt den synchronisierten Modus erst
 frei, nachdem eine Testfahrt eine echte Änderung dieses Werts gezeigt hat.
@@ -148,7 +150,7 @@ deutlich länger als die folgenden Frames.
    zeitbasierter Dreieckskurven beider Panels kontinuierlich Bilder auf.
 4. Für eine Bandserie Vorwärtsrichtung bestätigen, das Bauteil hinten platzieren und die
    aktuelle Position ausdrücklich als logischen Nullpunkt übernehmen. Für den
-   synchronisierten Modus zuvor per 1-mm-Testfahrt die Positionsrückmeldung prüfen.
+   synchronisierten Modus zuvor per manueller Testfahrt die Positionsrückmeldung prüfen.
 5. Optional die Belichtungsvariation aktivieren, wenn die verbundene Kamera eine manuell
    beschreibbare `ExposureTime` meldet.
 6. **Aufnahme starten** wählen und die Freigabe des Arbeitsraums bestätigen.

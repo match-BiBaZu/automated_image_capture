@@ -1304,7 +1304,7 @@ class AcquisitionController(QObject):
                         (
                             "SPS-Positionswert durch eine Positionsänderung bestätigt"
                             if position_ready
-                            else "Bitte nach dem PDO-Mapping eine 1-mm-Testfahrt ausführen; "
+                            else "Bitte nach dem PDO-Mapping eine manuelle Testfahrt ausführen; "
                             "MAIN.StepperInternalPosition muss sich dabei ändern"
                         ),
                     )

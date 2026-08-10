@@ -1,6 +1,6 @@
 # Projektübergabe: Automated Image Capture
 
-Stand: 9. August 2026
+Stand: 10. August 2026
 
 Repository: `https://github.com/match-BiBaZu/automated_image_capture`
 
@@ -367,7 +367,9 @@ synchronisierte Serie nicht starten.
 ### Bedien- und Sicherheitslogik
 
 - Beim Verbinden erfolgen keine Schreibzugriffe und keine Bewegung.
-- Vor der ersten Serie müssen 1-mm-Testfahrten erfolgen.
+- Vor der ersten Serie muss die Positionsrückmeldung durch eine manuelle Testfahrt geprüft
+  werden. Der Fahrweg ist frei in Millimetern wählbar; Links/Rechts startet unmittelbar ohne
+  zusätzliche Bestätigungsfrage.
 - Der Bediener bestätigt einmal, ob Links oder Rechts „vorwärts“ ist.
 - Das Bauteil wird hinten platziert und „Aktuelle Position = 0 mm“ gewählt.
 - Die vorhandene SPS-Kalibrierung wird nur gelesen.
@@ -904,7 +906,7 @@ Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioni
 - [ ] Kamera, UR, Förderband und beide Panels einzeln verbinden.
 - [ ] Status und Livebild prüfen.
 - [ ] Förderbandkalibrierung muss gültig sein.
-- [ ] 1-mm-Testfahrt links/rechts durchführen.
+- [ ] Fahrweg eingeben und eine kurze Testfahrt links/rechts durchführen.
 - [ ] Vorwärtsrichtung bestätigen.
 - [ ] Bauteil hinten platzieren und logischen Nullpunkt setzen.
 - [ ] Zunächst Pilotserie mit einem Winkel und kleiner Strecke aufnehmen.
@@ -932,7 +934,7 @@ uv run ruff check .
 Stand bei Erstellung dieses Dokuments:
 
 ```text
-130 Tests bestanden, 6 Hardwaretests standardmäßig übersprungen
+131 Tests bestanden, 6 Hardwaretests standardmäßig übersprungen
 ```
 
 Hardwaretests:

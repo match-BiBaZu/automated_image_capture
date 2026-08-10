@@ -682,7 +682,7 @@ def test_synchronized_preflight_requires_position_feedback_test(tmp_path: Path) 
     )
 
     assert not feedback.ready
-    assert "1-mm-Testfahrt" in feedback.detail
+    assert "manuelle Testfahrt" in feedback.detail
     controller.close()
 
 
