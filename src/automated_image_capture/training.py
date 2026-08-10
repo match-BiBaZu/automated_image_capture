@@ -154,6 +154,27 @@ def _load_manifest(dataset: Path) -> dict[str, object]:
         raise TrainingError(f"Datensatzmanifest kann nicht gelesen werden: {exc}") from exc
 
 
+def _dataset_class_names(dataset: Path) -> dict[int, str]:
+    classes = _load_manifest(dataset).get("classes")
+    if not isinstance(classes, dict):
+        raise TrainingError("Datensatzmanifest enthält keine gültigen Klassennamen.")
+    names: dict[int, str] = {}
+    for raw_class_id, raw_name in classes.items():
+        try:
+            class_id = int(raw_class_id)
+        except (TypeError, ValueError) as exc:
+            raise TrainingError(
+                f"Ungültige Klassen-ID im Datensatzmanifest: {raw_class_id!r}"
+            ) from exc
+        name = str(raw_name).strip()
+        if not name:
+            raise TrainingError(f"Klasse {class_id} besitzt keinen Namen.")
+        names[class_id] = name
+    if not names:
+        raise TrainingError("Datensatzmanifest enthält keine Klassen.")
+    return names
+
+
 def _empty_test_images(dataset: Path) -> list[Path]:
     manifest = _load_manifest(dataset)
     result: list[Path] = []
@@ -329,7 +350,7 @@ def run_training(
     false_positives, empty_count, false_positive_rate = _evaluate_empty_images(
         best_model, replace(config, dataset_directory=training_dataset), run_directory, event
     )
-    names = {0: "Pose 1", 1: "Pose 2"}
+    names = _dataset_class_names(config.dataset_directory)
     summary = {
         "format_version": 1,
         "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -433,7 +454,7 @@ def evaluate_checkpoint(
         run_directory,
         event,
     )
-    names = {0: "Pose 1", 1: "Pose 2"}
+    names = _dataset_class_names(config.dataset_directory)
     summary = {
         "format_version": 1,
         "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),

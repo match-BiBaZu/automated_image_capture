@@ -20,7 +20,11 @@ from automated_image_capture.dataset import (
     save_curation,
     verify_curated_dataset,
 )
-from automated_image_capture.training import TrainingConfig, TrainingError
+from automated_image_capture.training import (
+    TrainingConfig,
+    TrainingError,
+    _dataset_class_names,
+)
 
 
 def _write_labeled_source(root: Path) -> None:
@@ -271,6 +275,22 @@ def test_missing_test_split_holds_out_a_complete_pose(
 def test_training_config_requires_verified_dataset(tmp_path: Path) -> None:
     with pytest.raises(TrainingError, match="data.yaml"):
         TrainingConfig(tmp_path / "missing", tmp_path / "runs").validated()
+
+
+def test_training_summary_class_names_come_from_manifest(tmp_path: Path) -> None:
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps(
+            {"classes": {"0": "Pose 1", "1": "Pose 2", "2": "Pose 3", "3": "Pose 4"}}
+        ),
+        encoding="utf-8",
+    )
+
+    assert _dataset_class_names(tmp_path) == {
+        0: "Pose 1",
+        1: "Pose 2",
+        2: "Pose 3",
+        3: "Pose 4",
+    }
 
 
 def test_resized_training_dataset_preserves_labels_and_is_reused(

@@ -765,7 +765,75 @@ Unabhängiger Test: Precision 0,93386, Recall 0,94725, mAP50 0,98628 und mAP50�
 Auf allen 121 Leerbildern trat kein Fehlalarm auf. Eine zusätzliche praktische Stichprobe mit
 je einem Bild pro Klasse plus Leerbild wurde vollständig richtig klassifiziert.
 
-## 18. YOLO-Training und Performance
+## 18. Kk1a: finaler OBB- und YOLO-Lauf
+
+Die fünf Rohserien liegen unter `C:\Users\Administrator\Pictures\AutomatedImageCapture`.
+Chronologisch wurden sie wie folgt zugeordnet:
+
+```text
+Pose 1: capture_20260810_213525
+Pose 2: capture_20260810_214724
+Leer:   capture_20260810_215123
+Pose 3: capture_20260810_215358
+Pose 4: capture_20260810_220005
+```
+
+Jede Serie enthält 500 vollständige PNG/YAML-Paare: je 100 Bilder bei den Winkeln 15,5°,
+17,0°, 18,5°, 20,0° und 21,0°. Der finale OBB-Lauf und seine separat erhaltenen
+Review-Snapshots liegen hier:
+
+```text
+C:\Users\Administrator\Pictures\AutomatedImageCapture\Kk1a_OBB_20260810
+C:\Users\Administrator\Pictures\AutomatedImageCapture\Kk1a_OBB_20260810_review_snapshots
+```
+
+Er enthält 2.000 positive Bilder, 500 Leerbilder, vier Klassen und fünf Winkel. Es wurden
+keine Bilder automatisch ausgeschlossen. Alle 2.000 Positivbilder sind positionsgeführt,
+1.980 wurden durch das Bahnmodell korrigiert und nur 16 vollständig interpoliert. Die
+schwächste Ankergruppe ist Pose 4 bei 17° mit 30/100 Ankern; auch deren Review-Sheet wurde
+visuell als plausibel geprüft.
+
+Der kuratierte Datensatz lautet:
+
+```text
+C:\Users\Administrator\Pictures\AutomatedImageCapture\Kk1a_YOLO_20260810\dataset_20260810_221045
+```
+
+| Split | Winkel | Bilder | Je Pose | Leer |
+| --- | --- | ---: | ---: | ---: |
+| Train | 15,5° + 17,0° + 20,0° | 1.500 | 300 | 300 |
+| Validation | 18,5° | 500 | 100 | 100 |
+| Test | 21,0° | 500 | 100 | 100 |
+
+Training: YOLO26n-OBB, 640 Pixel, Batch 16, acht Worker, maximal 75 Epochen und Patience 15.
+Early Stopping beendete den Lauf nach 21 Epochen; beste Trainingsepoche war Epoche 6. Der
+vollständige Run liegt unter:
+
+```text
+C:\Users\Administrator\Pictures\AutomatedImageCapture\Kk1a_YOLO_20260810\runs\Kk1a_yolo26n_obb_20260810
+```
+
+Empfohlenes Modell und unveränderliche Baseline:
+
+```text
+C:\Users\Administrator\Pictures\AutomatedImageCapture\Kk1a_YOLO_20260810\Kk1a_best.pt
+C:\Users\Administrator\Pictures\AutomatedImageCapture\Kk1a_YOLO_20260810\Kk1a_best_baseline_20260810.pt
+```
+
+Beide Kopien und `weights\best.pt` besitzen SHA-256
+`033660BA5181DA2DC79E4B1D0BB725DEC098F9A4A451FB8C9290D03DF1829FE5`.
+
+Validation: Precision 0,9545, Recall 0,9493, mAP50 0,9910 und mAP50–95 0,8977.
+Unabhängiger 21°-Test: Precision 0,9425, Recall 0,9473, mAP50 0,9882 und mAP50–95 0,8602.
+Klassenweises Test-mAP50–95: Pose 1 0,6886, Pose 2 0,8895, Pose 3 0,9321 und Pose 4
+0,9308.
+
+Der Rohbild-Konfidenz-Sweep ist als `confidence_sweep.json` erhalten. Für die GUI wird `0,26`
+empfohlen: 392/400 Positivbilder korrekt, vier Pose-2-Bilder verpasst, vier Pose-4-Bilder als
+Pose 2 erkannt und 0/100 Fehlalarme auf Leerbildern. Bei 0,25 gab es noch einen Leerbild-
+Fehlalarm; höhere Schwellen verwerfen zunehmend richtige Pose-2-Bilder.
+
+## 19. YOLO-Training und Performance
 
 Das Training läuft als separater Prozess, damit Hardwareanzeige und GUI responsiv bleiben.
 Beim Stoppen wird zuerst ein geordneter Abbruch versucht; Checkpoints und Logs bleiben erhalten.
@@ -828,7 +896,11 @@ Nach jedem Training bleiben `best.pt`, Ultralytics-Plots, Validation-/Testmetrik
 klassenweise Ergebnisse, Confusion-Matrizen, Leerbild-Fehlalarmrate und Zusammenfassung
 erhalten. `.pt`-Dateien sind absichtlich in `.gitignore` und müssen separat gesichert werden.
 
-## 19. YOLO-Live-Inferenz
+Klassennamen in der Trainingszusammenfassung werden aus `dataset_manifest.json` gelesen. Eine
+frühere hart codierte Zwei-Klassen-Annahme wurde beim Kk1a-Lauf entfernt; damit erscheinen
+auch Pose 3, Pose 4 und weitere Klassen korrekt in den klassenweisen JSON-Metriken.
+
+## 20. YOLO-Live-Inferenz
 
 Das Hauptfenster kann ein trainiertes OBB-Modell auf dem jeweils neuesten Kameraframe
 ausführen. Die Inferenz läuft in einem eigenen Thread; alte Frames werden verworfen statt
@@ -846,7 +918,7 @@ Automatische Modellsuche verwendet historisch den Ordner:
 Für Ql1i sollte `D:\pictures\Ql1i\YOLO_final_20260809\Ql1i_best.pt` mit Konfidenz 0,10 im
 Hauptfenster explizit gewählt werden, solange der historische Suchpfad nicht umgestellt wurde.
 
-## 20. Was Git bewusst nicht enthält
+## 21. Was Git bewusst nicht enthält
 
 Die `.gitignore` schließt lokale, große oder reproduzierbare Artefakte aus:
 
@@ -861,18 +933,20 @@ Für den PC-Wechsel müssen daher separat gesichert werden:
 
 1. `D:\pictures\Ql1i` mit Rohbildern, OBBs, Datensätzen, Caches und Trainingsläufen.
 2. `C:\Users\Administrator\Pictures\Df1a` mit OBBs, Datensatz und Referenzmodell.
-3. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
-4. Optional QSettings/Registry-Export.
-5. Baumer Camera Explorer/GenTL-Producer-Installer.
-6. BT540-/Bluetooth-Treiber.
-7. TwinCAT ADS Runtime und die AMS-Routen.
-8. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
+3. `C:\Users\Administrator\Pictures\AutomatedImageCapture` mit Kk1a-Rohbildern, finalen
+   OBBs, Review-Snapshots, Datensatz, Cache, Trainingslauf und stabilen Modellen.
+4. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
+5. Optional QSettings/Registry-Export.
+6. Baumer Camera Explorer/GenTL-Producer-Installer.
+7. BT540-/Bluetooth-Treiber.
+8. TwinCAT ADS Runtime und die AMS-Routen.
+9. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
    bearbeitet werden soll.
-9. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
+10. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
 
 Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioniert.
 
-## 21. Checkliste für einen neuen PC
+## 22. Checkliste für einen neuen PC
 
 ### Software
 
@@ -915,14 +989,15 @@ Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioni
 
 ### Daten und Training
 
-- [ ] Ql1i- und Df1a-Bilder, OBBs, Runordner und Modelle separat auf den neuen PC kopieren.
+- [ ] Ql1i-, Df1a- und Kk1a-Bilder, OBBs, Runordner und Modelle separat auf den neuen PC
+  kopieren.
 - [ ] Pfade in OBB- und YOLO-Dialog neu auswählen.
 - [ ] „Bilder laden / aktualisieren“ ausführen.
 - [ ] Interpolierte/REVIEW-Overlays prüfen.
 - [ ] Kuratierten Datensatz erzeugen und Splitzahlen kontrollieren.
 - [ ] Erst dann Training starten.
 
-## 22. Tests und Abnahme
+## 23. Tests und Abnahme
 
 Standardprüfung:
 
@@ -934,7 +1009,7 @@ uv run ruff check .
 Stand bei Erstellung dieses Dokuments:
 
 ```text
-131 Tests bestanden, 6 Hardwaretests standardmäßig übersprungen
+132 Tests bestanden, 6 Hardwaretests standardmäßig übersprungen
 ```
 
 Hardwaretests:
@@ -955,7 +1030,7 @@ Vor einer echten Hardware-Abnahme sollten gleichzeitig geprüft werden:
 - erfolgreiche OBB-Erzeugung aus Objekt- und Leerbildserie,
 - gültiger Train-/Val-/Test-Datensatz.
 
-## 23. Bekannte Grenzen und nächste sinnvolle Arbeiten
+## 24. Bekannte Grenzen und nächste sinnvolle Arbeiten
 
 1. Die automatische OBB-Erzeugung ist bewusst konservativ. Interpolierte Bilder müssen im
    Review beurteilt werden; das System ist kein vollautomatischer Ground-Truth-Ersatz.
@@ -976,7 +1051,7 @@ Vor einer echten Hardware-Abnahme sollten gleichzeitig geprüft werden:
 8. Automatische semantische Annotation jenseits der aktuellen OBB-Differenz-/Bahnlogik ist ein
    möglicher späterer Meilenstein.
 
-## 24. Leitprinzipien für die Weiterentwicklung
+## 25. Leitprinzipien für die Weiterentwicklung
 
 - Keine Quelldaten überschreiben oder automatisch massenhaft löschen.
 - Jede Aufnahme muss reproduzierbare Metadaten besitzen.
