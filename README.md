@@ -304,6 +304,27 @@ Der erste Modellaufruf lädt die vortrainierten Gewichte, sofern sie noch nicht 
 sind. Das Projekt verwendet PyTorch mit CUDA 11.8; Batch 16 und acht Loader wurden auf der
 RTX 2000 Ada mit 8 GB VRAM getestet.
 
+## Speicherbereinigung
+
+**Speicher bereinigen …** analysiert einen ausgewählten Projektordner, ohne ihn zunächst zu
+verändern. Die Anzeige unterscheidet die logische Summe aller Pfade von der tatsächlich
+belegten Größe: Aufnahme-, OBB- und Trainingsbilder sind häufig bereits NTFS-Hardlinks und
+belegen deshalb nicht mehrfach Speicher.
+
+Die sichere Voreinstellung kodiert erkannte Projektbilder bei unveränderter Auflösung als
+einkanaliges, verlustfreies PNG mit Kompressionsstufe 3. Optional stehen eine maximale
+Kantenlänge sowie JPEG und WebP zur Verfügung. Verkleinerung und Qualitätskompression sind
+irreversibel und werden im Dialog entsprechend hervorgehoben. Die Labeling- und
+Trainingspipeline liest PNG, JPEG und WebP.
+
+Automatisch gelöscht werden nur validierte `_imgsz…`-Trainingscaches und
+Ultralytics-`*.cache`-Dateien. Exakte Duplikate werden pfaderhaltend zu Hardlinks; Roh-YAML,
+OBB-Labels, Review-Ergebnisse und Modell-Checkpoints bleiben erhalten. Nach der Analyse ist
+eine zweite ausdrückliche Bestätigung erforderlich. Der Lauf arbeitet mit temporären Dateien,
+prüft die erzeugten Bilder und Datensätze erneut und schreibt einen `cleanup_report_*.json` in
+den gewählten Ordner. Abgeschlossene und unvollständige Aufnahmesitzungen werden strikt
+unterschieden; laufende oder unterbrochene Sitzungen werden nicht verändert.
+
 ## Sicherheit
 
 Der UR-Statusmonitor verwendet `rtde_receive`. Der separate `rtde_io`-Kanal darf ausschließlich

@@ -1,6 +1,6 @@
 # Projektübergabe: Automated Image Capture
 
-Stand: 10. August 2026
+Stand: 11. August 2026
 
 Repository: `https://github.com/match-BiBaZu/automated_image_capture`
 
@@ -833,7 +833,68 @@ empfohlen: 392/400 Positivbilder korrekt, vier Pose-2-Bilder verpasst, vier Pose
 Pose 2 erkannt und 0/100 Fehlalarme auf Leerbildern. Bei 0,25 gab es noch einen Leerbild-
 Fehlalarm; höhere Schwellen verwerfen zunehmend richtige Pose-2-Bilder.
 
-## 19. YOLO-Training und Performance
+## 19. Kl1i: finaler OBB- und YOLO-Lauf
+
+Die drei Rohserien liegen unter `C:\Users\Administrator\Pictures\Kl1i`:
+
+```text
+Pose 1: capture_20260810_220517
+Pose 2: capture_20260810_220814
+Leer:   capture_20260810_221324
+```
+
+Jede Serie enthält 500 vollständige PNG/YAML-Paare, je 100 bei 15,5°, 17,0°, 18,5°,
+20,0° und 21,0°. Finale OBBs und separat erhaltene Review-Snapshots:
+
+```text
+C:\Users\Administrator\Pictures\Kl1i\Kl1i_OBB_20260811
+C:\Users\Administrator\Pictures\Kl1i\Kl1i_OBB_20260811_review_snapshots
+```
+
+Der OBB-Lauf enthält 1.000 positive Bilder und 500 Leerbilder. Es gab keine Ausschlüsse und
+keine vollständig interpolierte OBB; alle Positivbilder sind positionsgeführt und 999 Boxen
+wurden durch das Bahnmodell stabilisiert. Die schwächsten Gruppen besitzen 35/100 sichere
+Einzelanker. Deren Review-Sheets wurden ebenso wie stärkere Referenzgruppen visuell geprüft.
+
+Kuratierter Datensatz:
+
+```text
+C:\Users\Administrator\Pictures\Kl1i\Kl1i_YOLO_20260811\dataset_20260811_112136
+```
+
+| Split | Winkel | Bilder | Pose 1 | Pose 2 | Leer |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Train | 15,5° + 17,0° + 20,0° | 900 | 300 | 300 | 300 |
+| Validation | 18,5° | 300 | 100 | 100 | 100 |
+| Test | 21,0° | 300 | 100 | 100 | 100 |
+
+Das YOLO26n-OBB-Training verwendete 640 Pixel, Batch 16, acht Worker, maximal 75 Epochen und
+Patience 15. Es stoppte nach Epoche 42; beste Epoche war 27. Vollständiger Run:
+
+```text
+C:\Users\Administrator\Pictures\Kl1i\Kl1i_YOLO_20260811\runs\Kl1i_yolo26n_obb_20260811
+```
+
+Empfohlenes Modell und unveränderliche Baseline:
+
+```text
+C:\Users\Administrator\Pictures\Kl1i\Kl1i_YOLO_20260811\Kl1i_best.pt
+C:\Users\Administrator\Pictures\Kl1i\Kl1i_YOLO_20260811\Kl1i_best_baseline_20260811.pt
+```
+
+Beide Kopien und `weights\best.pt` besitzen SHA-256
+`642F646E0F7560091F4837833AFC3E9756F1A38A26ABB6D5F5FC18B26CDD0A83`.
+
+Validation: Precision 0,9982, Recall 0,9950, mAP50 0,9950 und mAP50–95 0,9769.
+Unabhängiger 21°-Test: Precision 0,9909, Recall 0,9900, mAP50 0,9940 und mAP50–95 0,9603.
+Klassenweises Test-mAP50–95: Pose 1 0,9949 und Pose 2 0,9258.
+
+Der Rohbild-Sweep ist als `confidence_sweep.json` erhalten. Für die GUI wird Konfidenz `0,25`
+empfohlen. Von 0,05 bis 0,32 bleibt das Ergebnis stabil: 199/200 Positivbilder korrekt, eine
+Pose-2-Aufnahme verpasst, keine Klassenverwechslung und 0/100 Leerbild-Fehlalarme. Ab 0,35
+wird ein weiteres positives Bild verworfen.
+
+## 20. YOLO-Training und Performance
 
 Das Training läuft als separater Prozess, damit Hardwareanzeige und GUI responsiv bleiben.
 Beim Stoppen wird zuerst ein geordneter Abbruch versucht; Checkpoints und Logs bleiben erhalten.
@@ -900,7 +961,7 @@ Klassennamen in der Trainingszusammenfassung werden aus `dataset_manifest.json` 
 frühere hart codierte Zwei-Klassen-Annahme wurde beim Kk1a-Lauf entfernt; damit erscheinen
 auch Pose 3, Pose 4 und weitere Klassen korrekt in den klassenweisen JSON-Metriken.
 
-## 20. YOLO-Live-Inferenz
+## 21. YOLO-Live-Inferenz
 
 Das Hauptfenster kann ein trainiertes OBB-Modell auf dem jeweils neuesten Kameraframe
 ausführen. Die Inferenz läuft in einem eigenen Thread; alte Frames werden verworfen statt
@@ -918,7 +979,7 @@ Automatische Modellsuche verwendet historisch den Ordner:
 Für Ql1i sollte `D:\pictures\Ql1i\YOLO_final_20260809\Ql1i_best.pt` mit Konfidenz 0,10 im
 Hauptfenster explizit gewählt werden, solange der historische Suchpfad nicht umgestellt wurde.
 
-## 21. Was Git bewusst nicht enthält
+## 22. Was Git bewusst nicht enthält
 
 Die `.gitignore` schließt lokale, große oder reproduzierbare Artefakte aus:
 
@@ -935,18 +996,20 @@ Für den PC-Wechsel müssen daher separat gesichert werden:
 2. `C:\Users\Administrator\Pictures\Df1a` mit OBBs, Datensatz und Referenzmodell.
 3. `C:\Users\Administrator\Pictures\AutomatedImageCapture` mit Kk1a-Rohbildern, finalen
    OBBs, Review-Snapshots, Datensatz, Cache, Trainingslauf und stabilen Modellen.
-4. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
-5. Optional QSettings/Registry-Export.
-6. Baumer Camera Explorer/GenTL-Producer-Installer.
-7. BT540-/Bluetooth-Treiber.
-8. TwinCAT ADS Runtime und die AMS-Routen.
-9. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
+4. `C:\Users\Administrator\Pictures\Kl1i` mit Rohbildern, finalen OBBs, Review-Snapshots,
+   Datensatz, Cache, Trainingslauf und stabilen Modellen.
+5. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
+6. Optional QSettings/Registry-Export.
+7. Baumer Camera Explorer/GenTL-Producer-Installer.
+8. BT540-/Bluetooth-Treiber.
+9. TwinCAT ADS Runtime und die AMS-Routen.
+10. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
    bearbeitet werden soll.
-10. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
+11. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
 
 Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioniert.
 
-## 22. Checkliste für einen neuen PC
+## 23. Checkliste für einen neuen PC
 
 ### Software
 
@@ -989,7 +1052,7 @@ Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioni
 
 ### Daten und Training
 
-- [ ] Ql1i-, Df1a- und Kk1a-Bilder, OBBs, Runordner und Modelle separat auf den neuen PC
+- [ ] Ql1i-, Df1a-, Kk1a- und Kl1i-Bilder, OBBs, Runordner und Modelle separat auf den neuen PC
   kopieren.
 - [ ] Pfade in OBB- und YOLO-Dialog neu auswählen.
 - [ ] „Bilder laden / aktualisieren“ ausführen.
@@ -997,7 +1060,7 @@ Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioni
 - [ ] Kuratierten Datensatz erzeugen und Splitzahlen kontrollieren.
 - [ ] Erst dann Training starten.
 
-## 23. Tests und Abnahme
+## 24. Tests und Abnahme
 
 Standardprüfung:
 
@@ -1030,7 +1093,22 @@ Vor einer echten Hardware-Abnahme sollten gleichzeitig geprüft werden:
 - erfolgreiche OBB-Erzeugung aus Objekt- und Leerbildserie,
 - gültiger Train-/Val-/Test-Datensatz.
 
-## 24. Bekannte Grenzen und nächste sinnvolle Arbeiten
+### Speicherbereinigung
+
+Das Hauptfenster enthält **Speicher bereinigen …**. Der Dialog erkennt ausschließlich
+abgeschlossene Capture-Sitzungen sowie gültige OBB- und kuratierte YOLO-Datensätze. Eine
+Nur-Analyse zeigt logische und physische Belegung, Hardlink-Gruppen, rekonstruierbare Caches,
+übersprungene Bilder und die geschätzte Einsparung. Die Standardkodierung ist Mono-PNG,
+Originalauflösung, Kompressionsstufe 3. PNG, JPEG und WebP werden von Labeling, Kuratierung und
+Trainingscache unterstützt.
+
+Erst eine separate Bestätigung ersetzt Bilder und löscht validierte `_imgsz…`- beziehungsweise
+Ultralytics-Caches endgültig. Zwischen-Checkpoints, Review-Bilder, YAML und Labels bleiben
+erhalten. Ein Journal schützt unterbrochene Läufe; ein erneuter Analyse-/Ausführungslauf
+repariert den konsistent abgeschlossenen Zwischenstand. Jeder erfolgreiche oder bewusst
+abgebrochene Lauf schreibt `cleanup_report_*.json` in den gewählten Ordner.
+
+## 25. Bekannte Grenzen und nächste sinnvolle Arbeiten
 
 1. Die automatische OBB-Erzeugung ist bewusst konservativ. Interpolierte Bilder müssen im
    Review beurteilt werden; das System ist kein vollautomatischer Ground-Truth-Ersatz.
@@ -1051,9 +1129,10 @@ Vor einer echten Hardware-Abnahme sollten gleichzeitig geprüft werden:
 8. Automatische semantische Annotation jenseits der aktuellen OBB-Differenz-/Bahnlogik ist ein
    möglicher späterer Meilenstein.
 
-## 25. Leitprinzipien für die Weiterentwicklung
+## 26. Leitprinzipien für die Weiterentwicklung
 
-- Keine Quelldaten überschreiben oder automatisch massenhaft löschen.
+- Keine Quelldaten ohne separate Analyse, Integritätsprüfung und ausdrückliche Bestätigung
+  überschreiben oder massenhaft löschen.
 - Jede Aufnahme muss reproduzierbare Metadaten besitzen.
 - Tatsächliche Messwerte klar von Sollwerten und bestätigten Befehlen unterscheiden.
 - Licht-, Band-, Kamera- und UR-Fehler getrennt behandeln.

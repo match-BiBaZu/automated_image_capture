@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QSettings
 from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtWidgets import QPushButton
 
 from automated_image_capture.acquisition import AcquisitionSettings, PreflightCheck
 from automated_image_capture.inference import InferenceDetection, InferenceFrame
@@ -81,6 +82,14 @@ def test_dashboard_renders_status_without_hardware(qtbot, tmp_path) -> None:
     assert window.config.camera_serial == "42"
     assert window.config.light_address == "AA:BB"
     assert window.config.light_2_address == "CC:DD"
+
+
+def test_dashboard_exposes_storage_cleanup_dialog(qtbot, tmp_path) -> None:
+    window = make_window(qtbot, tmp_path)
+
+    labels = {button.text() for button in window.findChildren(QPushButton)}
+
+    assert "Speicher bereinigen …" in labels
 
 
 def test_light_controls_follow_connection_state(qtbot, tmp_path) -> None:

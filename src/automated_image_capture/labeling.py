@@ -18,14 +18,7 @@ import cv2
 import numpy as np
 import yaml
 
-CAPTURE_NAME = re.compile(
-    r"^img_(?P<index>\d+)_(?:ur(?P<pose>\d+)|ura-(?P<angle>\d+))_"
-    r"(?:belt-(?P<belt>\d+)_pos-(?P<position>\d+)_(?P<direction>out|back)_)?"
-    r"(?:ramp-(?P<ramp>\d+)_)?"
-    r"p1-(?P<p1>\d+)_p2-(?P<p2>\d+)_"
-    r"(?P<exposure>auto|e\d+us)\.png$",
-    re.IGNORECASE,
-)
+from automated_image_capture.image_files import CAPTURE_NAME, iter_images
 
 
 class LabelingError(RuntimeError):
@@ -308,7 +301,7 @@ def _capture_metadata(path: Path) -> tuple[float | None, float | None, str | Non
 
 def scan_capture(directory: Path) -> dict[CaptureKey, CaptureRecord]:
     records: dict[CaptureKey, CaptureRecord] = {}
-    for path in sorted(directory.glob("*.png")):
+    for path in sorted(iter_images(directory)):
         match = CAPTURE_NAME.match(path.name)
         if match is None:
             continue

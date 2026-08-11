@@ -14,6 +14,8 @@ from typing import Literal
 import cv2
 import numpy as np
 
+from automated_image_capture.image_files import iter_images
+
 TRAIN_POSES = frozenset({155, 160, 180, 190, 210, 1155, 1200, 2155, 2200})
 VALIDATION_POSES = frozenset({170, 1170, 2170})
 TEST_POSES = frozenset({200, 1185, 2185})
@@ -144,9 +146,14 @@ def split_for_pose(pose_id: int) -> Split:
     )
 
 
-def _index_files(root: Path, directory: str, suffix: str) -> dict[str, Path]:
+def _index_files(root: Path, directory: str, suffix: str | None) -> dict[str, Path]:
     result: dict[str, Path] = {}
-    for path in (root / directory).rglob(f"*{suffix}"):
+    paths = (
+        iter_images(root / directory, recursive=True)
+        if suffix is None
+        else (root / directory).rglob(f"*{suffix}")
+    )
+    for path in paths:
         if path.name in result:
             raise DatasetError(f"Mehrdeutiger Dateiname in {root / directory}: {path.name}")
         result[path.name] = path
@@ -227,7 +234,7 @@ def _load_class_names(root: Path) -> dict[int, str]:
 
 
 def _collect_positive_records(root: Path, class_names: dict[int, str]) -> list[DatasetRecord]:
-    image_index = _index_files(root, "images", ".png")
+    image_index = _index_files(root, "images", None)
     label_index = _index_files(root, "labels", ".txt")
     records: list[DatasetRecord] = []
     with (root / "label_report.csv").open(encoding="utf-8-sig", newline="") as stream:
@@ -290,7 +297,7 @@ def _collect_positive_records(root: Path, class_names: dict[int, str]) -> list[D
 
 
 def _collect_empty_records(root: Path) -> list[DatasetRecord]:
-    image_index = _index_files(root, "images", ".png")
+    image_index = _index_files(root, "images", None)
     label_index = _index_files(root, "labels", ".txt")
     records: list[DatasetRecord] = []
     seen: set[str] = set()
@@ -667,7 +674,7 @@ def verify_curated_dataset(directory: Path) -> DatasetIntegrityResult:
     for split in ("train", "val", "test"):
         image_dir = directory / "images" / split
         label_dir = directory / "labels" / split
-        for path in image_dir.glob("*.png"):
+        for path in iter_images(image_dir):
             key = (split, path.stem)
             images[key] = path
             split_counts[split] += 1
@@ -740,7 +747,7 @@ def prepare_resized_training_dataset(
     image_paths = [
         path
         for split in ("train", "val", "test")
-        for path in sorted((source / "images" / split).glob("*.png"))
+        for path in sorted(iter_images(source / "images" / split))
     ]
     total = len(image_paths)
     for index, image_path in enumerate(image_paths, 1):
@@ -757,7 +764,12 @@ def prepare_resized_training_dataset(
                 interpolation=cv2.INTER_AREA,
             )
         target = output / "images" / split / image_path.name
-        if not cv2.imwrite(str(target), image, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+        parameters = (
+            [cv2.IMWRITE_PNG_COMPRESSION, 3]
+            if image_path.suffix.casefold() == ".png"
+            else []
+        )
+        if not cv2.imwrite(str(target), image, parameters):
             raise DatasetError(f"Trainingsbild kann nicht geschrieben werden: {target}")
         label_source = source / "labels" / split / f"{image_path.stem}.txt"
         label_target = output / "labels" / split / label_source.name

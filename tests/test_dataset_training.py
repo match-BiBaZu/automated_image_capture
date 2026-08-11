@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import pytest
 
+from automated_image_capture.cleanup import CleanupSettings, analyze_cleanup, execute_cleanup
 from automated_image_capture.dataset import (
     ALL_POSES,
     DatasetBuildConfig,
@@ -311,3 +312,42 @@ def test_resized_training_dataset_preserves_labels_and_is_reused(
     assert sample is not None and max(sample.shape[:2]) == 128
     assert not first.reused
     assert second.reused
+
+
+def test_curated_dataset_and_training_cache_accept_webp(
+    tmp_path: Path, source_dataset: Path
+) -> None:
+    dataset = build_curated_dataset(_config(tmp_path, source_dataset)).dataset_directory
+    for image_path in list((dataset / "images").rglob("*.png")):
+        image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+        assert image is not None
+        target = image_path.with_suffix(".webp")
+        assert cv2.imwrite(str(target), image, [cv2.IMWRITE_WEBP_QUALITY, 101])
+        image_path.unlink()
+
+    integrity = verify_curated_dataset(dataset)
+    resized = prepare_resized_training_dataset(dataset, 128)
+
+    assert integrity.valid
+    assert verify_curated_dataset(resized.dataset_directory).valid
+    assert list((resized.dataset_directory / "images").rglob("*.webp"))
+
+
+def test_cleanup_format_change_keeps_obb_and_curated_dataset_valid(
+    tmp_path: Path, source_dataset: Path
+) -> None:
+    curated = build_curated_dataset(_config(tmp_path, source_dataset)).dataset_directory
+    plan = analyze_cleanup(
+        CleanupSettings(tmp_path, output_format="webp_lossless", remove_caches=False)
+    )
+
+    execute_cleanup(plan)
+
+    assert collect_dataset_records(_config(tmp_path, source_dataset))
+    assert verify_curated_dataset(curated).valid
+    assert list((source_dataset / "images").rglob("*.webp"))
+    assert not list((source_dataset / "images").rglob("*.png"))
+    report_text = (source_dataset / "label_report.csv").read_text(encoding="utf-8-sig")
+    manifest_text = (curated / "dataset_manifest.json").read_text(encoding="utf-8")
+    assert ".webp" in report_text and ".png" not in report_text
+    assert ".webp" in manifest_text and ".png" not in manifest_text

@@ -47,6 +47,7 @@ from automated_image_capture.models import (
     RobotStatus,
 )
 from automated_image_capture.settings import SettingsStore
+from automated_image_capture.ui.cleanup_dialog import CleanupDialog
 from automated_image_capture.ui.labeling_dialog import LabelingDialog
 from automated_image_capture.ui.training_dialog import TrainingDialog
 from automated_image_capture.ui.widgets import (
@@ -124,17 +125,20 @@ class MainWindow(QMainWindow):
         connect_all = QPushButton("Alle verbinden")
         disconnect_all = QPushButton("Alle trennen")
         labeling_button = QPushButton("OBB-Labels …")
+        cleanup_button = QPushButton("Speicher bereinigen …")
         settings_button = QPushButton("Einstellungen …")
         training_button = QPushButton("YOLO-Training …")
         connect_all.clicked.connect(self.connect_all)
         disconnect_all.clicked.connect(self.disconnect_all)
         labeling_button.clicked.connect(self.open_labeling)
+        cleanup_button.clicked.connect(self.open_cleanup)
         training_button.clicked.connect(self.open_training)
         settings_button.clicked.connect(self.open_settings)
         toolbar.addWidget(connect_all)
         toolbar.addWidget(disconnect_all)
         toolbar.addWidget(labeling_button)
         toolbar.addWidget(training_button)
+        toolbar.addWidget(cleanup_button)
         toolbar.addStretch(1)
         safety = QLabel("UR16e: Bewegungsziele nur über den geprüften RTDE-Handshake")
         safety.setStyleSheet("color:#b45309; font-weight:600;")
@@ -650,6 +654,14 @@ class MainWindow(QMainWindow):
         self._training_dialog.show()
         self._training_dialog.raise_()
         self._training_dialog.activateWindow()
+
+    def open_cleanup(self) -> None:
+        dialog = CleanupDialog(
+            self.settings_store,
+            acquisition_running=lambda: self.acquisition.running,
+            parent=self,
+        )
+        dialog.exec()
 
     def _training_dialog_closed(self) -> None:
         if self._training_dialog is not None:

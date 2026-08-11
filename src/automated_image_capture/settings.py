@@ -452,3 +452,43 @@ class SettingsStore:
         self._settings.setValue("inference/max_fps", config.max_fps)
         self._settings.setValue("inference/device", config.device)
         self._settings.sync()
+
+    def load_cleanup(self):
+        from automated_image_capture.cleanup import CleanupSettings
+
+        return CleanupSettings(
+            root_directory=Path(
+                str(
+                    self._settings.value(
+                        "cleanup/root_directory",
+                        str(Path.home() / "Pictures"),
+                    )
+                )
+            ),
+            output_format=str(self._settings.value("cleanup/output_format", "png")),
+            max_edge=int(self._settings.value("cleanup/max_edge", 0)),
+            png_compression=int(self._settings.value("cleanup/png_compression", 3)),
+            quality=int(self._settings.value("cleanup/quality", 90)),
+            remove_caches=self._settings.value(
+                "cleanup/remove_caches", True, type=bool
+            ),
+            deduplicate=self._settings.value(
+                "cleanup/deduplicate", True, type=bool
+            ),
+        )
+
+    def save_cleanup(self, config) -> None:
+        for field_name in (
+            "root_directory",
+            "output_format",
+            "max_edge",
+            "png_compression",
+            "quality",
+            "remove_caches",
+            "deduplicate",
+        ):
+            value = getattr(config, field_name)
+            if isinstance(value, Path):
+                value = str(value)
+            self._settings.setValue(f"cleanup/{field_name}", value)
+        self._settings.sync()
