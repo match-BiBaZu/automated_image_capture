@@ -31,6 +31,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--consensus-fraction", type=float, default=0.55)
     parser.add_argument("--box-margin", type=int, default=8)
     parser.add_argument(
+        "--trim-cast-shadows",
+        action="store_true",
+        help="Schattenauslaeufer vor der OBB-Anpassung geometrisch abschneiden",
+    )
+    parser.add_argument(
         "--exclude-recommended",
         action="store_true",
         help="Von der Sichtbarkeitsprüfung eindeutig beanstandete Bilder ausschließen",
@@ -95,6 +100,7 @@ def main() -> int:
             minimum_difference=args.minimum_difference,
             consensus_fraction=args.consensus_fraction,
             box_margin_pixels=args.box_margin,
+            trim_cast_shadows=args.trim_cast_shadows,
         ),
         report_progress,
         anchor_review=review_anchors,

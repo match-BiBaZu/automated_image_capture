@@ -90,6 +90,7 @@ class LabelingConfig:
     box_margin_pixels: int = 8
     include_background_negatives: bool = True
     prefer_hardlinks: bool = True
+    trim_cast_shadows: bool = False
 
     @property
     def pose_sources(self) -> tuple[LabelSource, ...]:
@@ -147,6 +148,7 @@ class LabelingConfig:
             self.box_margin_pixels,
             self.include_background_negatives,
             self.prefer_hardlinks,
+            self.trim_cast_shadows,
         )
 
 
@@ -534,6 +536,95 @@ def _box_features(box: np.ndarray) -> tuple[float, float, float, float, float]:
         angle += math.pi / 2.0
     angle = (angle + math.pi / 2.0) % math.pi - math.pi / 2.0
     return float(center[0]), float(center[1]), major, minor, angle
+
+
+def _box_from_shadow_trimmed_mask(mask: np.ndarray, margin: int) -> np.ndarray:
+    """Fit an OBB to the full-width body while ignoring a tapered cast shadow.
+
+    The foreground/background difference often joins a soft, triangular shadow to
+    the workpiece.  Across the workpiece's major axis the plastic body keeps a
+    nearly constant transverse span, whereas the shadow tapers away.  Retaining
+    the longest run of sufficiently wide cross-sections therefore removes the
+    shadow without depending on a lighting-specific absolute threshold.
+    """
+    points = cv2.findNonZero(mask)
+    if points is None or len(points) < 4:
+        raise LabelingError("Aus dem Konsens konnte keine OBB erzeugt werden.")
+
+    coordinates = points[:, 0, :].astype(np.float32)
+    center_x, center_y, _, _, angle = _box_features(_box_from_mask(mask, 0))
+    direction = np.asarray((math.cos(angle), math.sin(angle)), dtype=np.float32)
+    normal = np.asarray((-direction[1], direction[0]), dtype=np.float32)
+    centered = coordinates - np.asarray((center_x, center_y), dtype=np.float32)
+    longitudinal = centered @ direction
+    transverse = centered @ normal
+
+    bin_width = 4.0
+    first_bin = int(math.floor(float(np.min(longitudinal)) / bin_width))
+    last_bin = int(math.ceil(float(np.max(longitudinal)) / bin_width))
+    spans = np.zeros(last_bin - first_bin + 1, dtype=np.float32)
+    bins = np.floor(longitudinal / bin_width).astype(np.int32) - first_bin
+    for index in np.unique(bins):
+        values = transverse[bins == index]
+        if len(values) >= 5:
+            spans[index] = float(np.quantile(values, 0.95) - np.quantile(values, 0.05))
+
+    spans = np.convolve(spans, np.ones(7, dtype=np.float32) / 7.0, mode="same")
+    positive_spans = spans[spans > 0]
+    if len(positive_spans) < 3:
+        raise LabelingError("Zu wenige Querschnitte für die Schattenbereinigung.")
+    reference_span = float(np.quantile(positive_spans, 0.80))
+    wide = spans >= 0.75 * reference_span
+
+    # Bridge short holes caused by slots and other openings in the plastic part.
+    for index in range(1, len(wide) - 1):
+        if wide[index]:
+            continue
+        left = wide[max(0, index - 6) : index]
+        right = wide[index + 1 : min(len(wide), index + 7)]
+        if np.any(left) and np.any(right):
+            wide[index] = True
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(np.append(wide, False)):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append((start, index - 1))
+            start = None
+    if not runs:
+        raise LabelingError("Kein vollbreiter Bauteilabschnitt gefunden.")
+
+    run_start, run_end = max(runs, key=lambda run: run[1] - run[0])
+    # A real moulded connector can be narrower than the main body. Preserve a
+    # complete short tail; a tail longer than 56 px is characteristic of the cast
+    # shadow in this paired-capture workflow and receives only a small edge pad.
+    maximum_feature_bins = int(math.ceil(56.0 / bin_width))
+    edge_pad_bins = int(math.ceil(16.0 / bin_width))
+    left_tail_bins = run_start - int(np.min(bins))
+    right_tail_bins = int(np.max(bins)) - run_end
+    left_allowance = (
+        left_tail_bins if left_tail_bins <= maximum_feature_bins else edge_pad_bins
+    )
+    right_allowance = (
+        right_tail_bins if right_tail_bins <= maximum_feature_bins else edge_pad_bins
+    )
+    keep = (
+        (bins >= run_start - left_allowance)
+        & (bins <= run_end + right_allowance)
+    )
+    retained = coordinates[keep]
+    if len(retained) < 4:
+        raise LabelingError("Zu wenige Bauteilpunkte nach der Schattenbereinigung.")
+
+    center, size, fitted_angle = cv2.minAreaRect(retained.reshape(-1, 1, 2))
+    expanded = (max(1.0, size[0] + 2 * margin), max(1.0, size[1] + 2 * margin))
+    box = _ordered_box((center, expanded, fitted_angle))
+    height, width = mask.shape
+    box[:, 0] = np.clip(box[:, 0], 0, width - 1)
+    box[:, 1] = np.clip(box[:, 1], 0, height - 1)
+    return box
 
 
 def _box_from_features(
@@ -980,7 +1071,13 @@ def build_conveyor_track(
         if measurement.foreground_area >= 500:
             try:
                 box_mask = _trim_thin_mask_protrusions(measurement.mask)
-                raw_box = _box_from_mask(box_mask, config.box_margin_pixels)
+                if config.trim_cast_shadows:
+                    raw_box = _box_from_shadow_trimmed_mask(
+                        box_mask,
+                        config.box_margin_pixels,
+                    )
+                else:
+                    raw_box = _box_from_mask(box_mask, config.box_margin_pixels)
             except LabelingError:
                 pass
         compact = SegmentationMeasurement(

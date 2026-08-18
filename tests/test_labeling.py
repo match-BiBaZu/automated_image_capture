@@ -17,6 +17,7 @@ from automated_image_capture.labeling import (
     LabelSource,
     MatchedPair,
     _labeling_worker_count,
+    _box_from_shadow_trimmed_mask,
     _parallel_map_ordered,
     _trim_thin_mask_protrusions,
     assess_obb_visibility,
@@ -405,6 +406,24 @@ def test_thin_mask_protrusion_is_trimmed_but_compact_component_is_unchanged() ->
     assert max(trimmed_size) < original_width * 0.5
     assert np.count_nonzero(trimmed) > np.count_nonzero(compact) * 0.95
     assert np.array_equal(untouched, compact)
+
+
+def test_shadow_trimmed_box_excludes_tapered_shadow_and_keeps_body() -> None:
+    mask = np.zeros((240, 480), dtype=np.uint8)
+    cv2.rectangle(mask, (210, 75), (390, 165), 255, -1)
+    shadow = np.asarray(((55, 120), (210, 75), (210, 165)), dtype=np.int32)
+    cv2.fillConvexPoly(mask, shadow, 255)
+    cv2.rectangle(mask, (390, 105), (430, 135), 255, -1)
+
+    ordinary = cv2.minAreaRect(cv2.findNonZero(mask))[1]
+    trimmed = _box_from_shadow_trimmed_mask(mask, margin=0)
+    _, _, major, minor, _ = labeling_module._box_features(trimmed)
+
+    assert major < max(ordinary) * 0.75
+    assert 220 <= major <= 280
+    assert 85 <= minor <= 100
+    assert float(np.max(trimmed[:, 0])) >= 425
+    assert float(np.min(trimmed[:, 0])) > 140
 
 
 def test_visibility_review_can_exclude_positive_but_keeps_audit_row(tmp_path: Path) -> None:

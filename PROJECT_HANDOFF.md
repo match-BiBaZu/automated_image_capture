@@ -953,6 +953,84 @@ mAP50–95 0,77186, fiel auf dem unabhängigen Testwinkel aber auf mAP50 0,6920 
 0,5189 zurück. Insbesondere Pose 1 erreichte dort nur 0,436/0,359. Dieser Lauf hat den
 Validation-Winkel überangepasst und wird nicht empfohlen.
 
+### Ql1i-Neuaufnahme vom 12. August 2026
+
+Der verbesserte Rohdatensatz liegt unter:
+
+```text
+C:\Users\Administrator\Pictures\Ql1i new
+```
+
+Er enthält je 500 Bilder der beiden Werkstücklagen und 500 passende Leerbilder, jeweils mit
+den fünf UR-Winkeln 15,5°, 17,0°, 18,5°, 20,0° und 21,0° sowie einem vollständigen
+10-×-10-Lichtraster. Der Abgleich mit den historischen Ql1i-Aufnahmen zeigte, dass die zeitlich
+erste neue Serie der historischen **Pose 2** und die zweite Serie der **Pose 1** entspricht.
+Die finale Klassenreihenfolge lautet deshalb bewusst `0 = Pose 2`, `1 = Pose 1`.
+
+Finale OBBs und Review-Bilder:
+
+```text
+C:\Users\Administrator\Pictures\Ql1i new\Ql1i_OBB_20260812_final
+C:\Users\Administrator\Pictures\Ql1i new\Ql1i_OBB_20260812_final_review_snapshots
+```
+
+Der Lauf erhielt alle 1.000 positiven und 500 leeren Bilder. 996 positive Boxen wurden mit
+der gemessenen Förderbandbahn korrigiert, 28 davon mussten zwischen sicheren Ankern
+interpoliert werden. 709 Bilder tragen einen konservativen Review-Hinweis; die zehn
+Winkel-/Klassen-Bahnübersichten wurden visuell kontrolliert. Die finale OBB-Geometrie ist für
+alle 1.500 Labeldateien exakt identisch zum zunächst mit vertauschten Anzeigenamen erzeugten
+Lauf `Ql1i_OBB_20260812`; nur Klassennamen und Dateinamen wurden korrigiert. Der erste Lauf
+bleibt zu Nachweiszwecken erhalten, soll aber nicht als finaler Datensatz ausgewählt werden.
+
+Der finale kuratierte Datensatz liegt unter:
+
+```text
+C:\Users\Administrator\Pictures\Ql1i new\Ql1i_YOLO_20260812_final\dataset_20260812_121020
+```
+
+Er enthält 1.500 Bilder und ist winkelrein aufgeteilt: Train 900 Bilder bei 15,5°, 17,0°
+und 20,0°; Validation 300 Bilder bei 18,5°; Test 300 Bilder bei 21,0°. Jeder Split enthält
+gleich viele Pose-1-, Pose-2- und Leerbilder.
+
+Das YOLO26n-OBB-Training verwendete 640 Pixel, Batch 16, acht Worker, maximal 75 Epochen und
+Patience 15. Early Stopping beendete es nach Epoche 26 und wählte Epoche 11. Der vollständige
+Trainingslauf mit Checkpoints, Plots und Auswertungen bleibt hier erhalten:
+
+```text
+C:\Users\Administrator\Pictures\Ql1i new\Ql1i_YOLO_20260812\runs\Ql1i_20260812
+```
+
+Die Trainingsbilder und Klassen-IDs dieses Laufs sind identisch zum final benannten Datensatz;
+nur die im ursprünglichen Run eingebetteten Anzeigenamen waren vertauscht. Der empfohlene
+Checkpoint wurde deshalb ohne Änderung der Gewichte mit historisch korrekten Namen gespeichert:
+
+```text
+C:\Users\Administrator\Pictures\Ql1i new\Ql1i_YOLO_20260812_final\Ql1i_best.pt
+C:\Users\Administrator\Pictures\Ql1i new\Ql1i_best_20260812.pt
+```
+
+Beide Kopien besitzen SHA-256
+`B25B0280084CA49157223870A36BCD3645108202890A455E403BA14450421BE9` und laden als
+OBB-Modell mit `0 = Pose 2`, `1 = Pose 1`.
+
+Validation: Precision 0,97309, Recall 0,99782, mAP50 0,99485 und mAP50–95 0,86961.
+Unabhängiger 21°-Test: Precision 0,98084, Recall 0,98638, mAP50 0,99490 und mAP50–95
+0,80034. Klassenweise beträgt mAP50–95 0,70340 für Pose 2 (Klassen-ID 0, im ursprünglichen
+Run noch als Pose 1 bezeichnet) und 0,89728 für Pose 1 (Klassen-ID 1, dort noch als Pose 2
+bezeichnet).
+
+Der Bild-für-Bild-Test bei der GUI-Konfidenz 0,25 ergab 100/100 korrekte Pose-1-Bilder,
+100/100 korrekte Pose-2-Bilder und 100/100 korrekte Leerbilder ohne Klassenverwechslung oder
+Fehlalarm. 14 positive Bilder erzeugen zusätzlich eine niedrigere zweite Box. Eine höhere
+Schwelle entfernt nur einen Teil dieser Zusatzboxen, verliert aber echte Treffer; deshalb ist
+0,25 für das neue Netz die empfohlene Schwelle.
+
+Der Vergleich ist deutlich besser als beim Modell vom 9. August: dessen eigener unabhängiger
+Test erreichte mAP50 0,86166 und mAP50–95 0,60046. Auf exakt den 300 neuen Testbildern erkennt
+das alte Modell bei Konfidenz 0,25 semantisch korrekt nur 43/100 Pose 1 und 90/100 Pose 2;
+das neue Modell erreicht 100/100 und 100/100. Beide Modelle erzeugen auf den 100 neuen
+Leerbildern keinen Fehlalarm.
+
 Nach jedem Training bleiben `best.pt`, Ultralytics-Plots, Validation-/Testmetriken,
 klassenweise Ergebnisse, Confusion-Matrizen, Leerbild-Fehlalarmrate und Zusammenfassung
 erhalten. `.pt`-Dateien sind absichtlich in `.gitignore` und müssen separat gesichert werden.
@@ -976,7 +1054,8 @@ Automatische Modellsuche verwendet historisch den Ordner:
 %USERPROFILE%\Pictures\Kk1_pose12_yolo26_obb\runs
 ```
 
-Für Ql1i sollte `D:\pictures\Ql1i\YOLO_final_20260809\Ql1i_best.pt` mit Konfidenz 0,10 im
+Für Ql1i sollte
+`C:\Users\Administrator\Pictures\Ql1i new\Ql1i_best_20260812.pt` mit Konfidenz 0,25 im
 Hauptfenster explizit gewählt werden, solange der historische Suchpfad nicht umgestellt wurde.
 
 ## 22. Was Git bewusst nicht enthält
@@ -998,14 +1077,16 @@ Für den PC-Wechsel müssen daher separat gesichert werden:
    OBBs, Review-Snapshots, Datensatz, Cache, Trainingslauf und stabilen Modellen.
 4. `C:\Users\Administrator\Pictures\Kl1i` mit Rohbildern, finalen OBBs, Review-Snapshots,
    Datensatz, Cache, Trainingslauf und stabilen Modellen.
-5. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
-6. Optional QSettings/Registry-Export.
-7. Baumer Camera Explorer/GenTL-Producer-Installer.
-8. BT540-/Bluetooth-Treiber.
-9. TwinCAT ADS Runtime und die AMS-Routen.
-10. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
+5. `C:\Users\Administrator\Pictures\Ql1i new` mit Rohbildern, finalen OBBs, Datensatz,
+   vollständigem Trainingslauf und dem stabilen Modell `Ql1i_best_20260812.pt`.
+6. Gewünschte `best.pt`-Modelle und komplette Trainings-Runordner.
+7. Optional QSettings/Registry-Export.
+8. Baumer Camera Explorer/GenTL-Producer-Installer.
+9. BT540-/Bluetooth-Treiber.
+10. TwinCAT ADS Runtime und die AMS-Routen.
+11. Das externe Beckhoff-/SPS-Projekt beziehungsweise `CSVSaver`, falls es auf dem neuen PC
    bearbeitet werden soll.
-11. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
+12. Ein Backup der tatsächlich auf dem UR getesteten `.urp`-/Installationsdateien.
 
 Die Dateien unter `ur_program/` und die GUI-Quellen selbst sind dagegen versioniert.
 
@@ -1112,13 +1193,14 @@ abgebrochene Lauf schreibt `cleanup_report_*.json` in den gewählten Ordner.
 
 1. Die automatische OBB-Erzeugung ist bewusst konservativ. Interpolierte Bilder müssen im
    Review beurteilt werden; das System ist kein vollautomatischer Ground-Truth-Ersatz.
-2. Ql1i besitzt nur vier Winkel und zeigt starke optische Abweichungen trotz nominell gleicher
-   Lichtbefehle. Für neue Serien mindestens ein Panel mit etwa 40 % betreiben, diffuses
-   frontales Fülllicht verwenden, 700–1000 ms Licht-Settle-Time vorsehen und Winkelabstände von
-   höchstens 1° aufnehmen. Positive und leere Serien müssen dieselbe physische Lichtsequenz
-   verwenden; 0/0 und 20/0 sollten vermieden werden.
-3. Das Ql1i-Modell ist bei Pose 1 und höheren Konfidenzschwellen noch empfindlich. Konfidenz
-   0,10 ist für den aktuellen Versuch empirisch besser als der frühere Default 0,25.
+2. Der historische Ql1i-Datensatz besitzt nur vier Winkel und zeigt starke optische
+   Abweichungen trotz nominell gleicher Lichtbefehle. Die Neuaufnahme vom 12. August besitzt
+   fünf Winkel und ein vollständiges 10-×-10-Lichtraster und ist für neue Versuche vorzuziehen.
+   Positive und leere Serien müssen weiterhin dieselbe physische Lichtsequenz verwenden.
+3. Das neue Ql1i-Modell erkennt bei Konfidenz 0,25 alle 200 positiven Testbilder, erzeugt aber
+   auf 14 davon eine zusätzliche niedrigere Box. Falls die Anwendung exakt eine Box erwartet,
+   sollte sie den höchsten Treffer verwenden, statt die Konfidenz zu erhöhen und echte Treffer
+   zu verlieren.
 4. Der automatische Live-Modellsuchpfad enthält noch den historischen Namen `Kk1`.
 5. QSettings, Netzwerk, ADS-Routen und BLE-Auswahl sind rechnerlokal und brauchen eine
    bewusstere Export-/Importfunktion, falls häufig zwischen PCs gewechselt wird.
