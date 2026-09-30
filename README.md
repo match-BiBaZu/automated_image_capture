@@ -35,6 +35,12 @@ getrennt sein. Eine Windows-Bluetooth-Kopplung ist für den BLE-Zugriff normaler
 
 ## Installation und Start
 
+Windows shortcuts and their custom icon are owned by this repository:
+after environment setup below, double-click
+`WindowsLaunchers/Verknuepfungen-installieren.cmd`.
+No BiBaZu_Big_Boi checkout is required.
+See [Windows launcher options](WindowsLaunchers/README.md).
+
 ```powershell
 uv sync --extra dev
 uv run python -m automated_image_capture
